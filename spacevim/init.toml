@@ -1,0 +1,98 @@
+#=============================================================================================
+# init.toml — Enhanced SpaceVim Configuration
+# This SpaceVim config enhances usability, developer experience, and aesthetics.
+#=============================================================================================
+
+[options]
+#------------------------------------ Core Editor Options -----------------------------------
+colorscheme = "dracula"                         # Preferred color scheme
+colorscheme_bg = "dark"                         # Use dark background for theme
+enable_guicolors = true                         # Enable true color support
+statusline_separator = "fire"                   # Customize status line separators
+statusline_iseparator = "bar"
+enable_tabline_filetype_icon = true             # Show icons in tabline
+enable_statusline_mode = true                   # Display current Vim mode in status line
+statusline_unicode = true                       # Use Unicode glyphs in UI
+buffer_index_type = 4                           # Numbered buffer tabs (relative)
+windows_index_type = 3                          # Numbered window tabs (absolute)
+guifont = "Fira Code Symbols Nerd Font:h14"     # GUI font with patched Nerd icons
+disabled_plugins = ['nerdtree']                 # Disable NERDTree (prefer fzf or defx)
+
+
+#------------------------------= Theme & Appearance Layer -----------------------------------
+[[layers]]
+name = "colorscheme"
+
+
+#------------------------= Autocomplete (Built-in Completion) -------------------------------
+[[layers]]
+name = "autocomplete"
+auto_completion_return_key_behavior = "complete"
+auto_completion_tab_key_behavior = "cycle"
+
+
+#------------------------------= Integrated Terminal Layer ----------------------------------
+[[layers]]
+name = "shell"
+default_position = "top"
+default_height = 30
+
+
+#---------------------------------- Git Integration Layer -----------------------------------
+[[layers]]
+name = "git"
+enable_gitgutter = true
+# Keybindings:
+#   SPC g A  → git Stage All
+#   SPC g s  → git status
+#   SPC g c  → commit (via fugitive)
+#   SPC g p  → push
+
+
+#------------------------------------ File Icons Layer --------------------------------------
+[[layers]]
+name = "icons"
+
+
+#----------------------------= Fuzzy Finder (fzf) Layer -------------------------------------
+[[layers]]
+name = "fzf"
+enable_fzf_alter = true
+# Keybindings:
+#   SPC p f  → find file in project
+#   SPC f f  → find file in current dir
+
+
+#------------------------------= Auto Formatting Layer --------------------------------------
+[[layers]]
+name = "format"
+enable_format_on_save = true
+# Keybindings:
+#   SPC b f  → manually format current buffer
+
+
+#--------------------= Code Navigation (Tagbar + Ctags) Layer ------------------------------
+[[layers]]
+name = "tagbar"
+enable_ctags = true
+
+
+#---------------------------- Syntax Checking Layer -----------------------------------------
+[[layers]]
+name = "syntax-checking"
+enable_syntax_highlighting = true
+# Keybindings:
+#   SPC e n  → next error
+#   SPC e p  → previous error
+#   SPC e l  → list all errors
+
+
+#------------------------------- UI Layer Enhancements ---------------------------------------
+[[layers]]
+name = "ui"
+enable_scrollbar = true
+
+
+#=============================================================================================
+#                                     End of Configuration
+#=============================================================================================

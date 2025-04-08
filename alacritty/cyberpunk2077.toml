@@ -1,0 +1,46 @@
+# ─── Cyberpunk 2077 Theme for Alacritty ───
+
+[colors.primary]
+background = '#0f0f17'  # Deep dark cyberpunk black
+foreground = '#fffcf2'  # Soft neon white for readability
+
+dim_foreground    = '#cccccc'
+bright_foreground = '#ffffff'
+
+# Cursor colors
+[colors.cursor]
+text   = '#000000'
+cursor = '#ff007f'  # Bright neon magenta
+
+# Normal colors
+[colors.normal]
+black   = '#101820'  # Darkest cyberpunk background
+red     = '#ff003c'  # Bright neon red
+green   = '#00ff99'  # Hacker neon green
+yellow  = '#ffcc00'  # Electric yellow
+blue    = '#ff007f'  # 🔥 Replacing blue with neon magenta
+magenta = '#ff22ff'  # Even brighter magenta
+cyan    = '#ff8800'  # 🔥 Replacing cyan with orange glow
+white   = '#dcdcdc'  # Soft white
+
+# Bright colors
+[colors.bright]
+black   = '#222831'  # Slightly brighter dark mode
+red     = '#ff3366'  # Hot pinkish red
+green   = '#33ff99'  # Brighter neon green
+yellow  = '#ffee55'  # More intense yellow
+blue    = '#ff0066'  # 🔥 No blue, replaced with neon pink
+magenta = '#ff22ff'  # Glowing magenta
+cyan    = '#ff5500'  # 🔥 No cyan, replaced with deep orange
+white   = '#ffffff'  # Pure bright white
+
+# Dim colors
+[colors.dim]
+black   = '#19232d'  # Slightly dimmer dark
+red     = '#992233'
+green   = '#227744'
+yellow  = '#aa8800'
+blue    = '#aa0066'  # 🔥 Darker magenta replacing blue
+magenta = '#884488'
+cyan    = '#bb4400'  # 🔥 Dimmer orange replacing cyan
+white   = '#aaaaaa'

@@ -1,0 +1,167 @@
+{
+    "liveServer.settings.donotShowInfoMsg": true,
+
+    "[html]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode"
+    },
+
+    "[javascript]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode"
+    },
+
+    "[css]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode"
+    },
+
+    "editor.minimap.enabled": false,
+    "workbench.colorTheme": "cyberpunk2077",
+    "terminal.integrated.fontFamily": "Fira Code, Symbols Nerd Font",
+    "workbench.sideBar.location": "right",
+    "workbench.iconTheme": "catppuccin-macchiato",
+
+    // Neon Cursor & Terminal
+    "workbench.colorCustomizations": {
+        "editorCursor.foreground": "#00FFFF",  // Neon Cyan Cursor
+        "terminalCursor.foreground": "#FF00FF",  // Neon Pink Terminal Cursor
+        "terminalCursor.background": "#000000"  // Black for Contrast
+    },
+
+    // Cursor Behavior
+    "editor.cursorBlinking": "phase",
+    "editor.cursorSmoothCaretAnimation": "on",
+    "editor.cursorSurroundingLines": 3,
+    "editor.renderWhitespace": "boundary",
+    "editor.fontLigatures": true,
+
+    // Cyberpunk Syntax Highlighting
+    "editor.tokenColorCustomizations": {
+        "comments": "#757575",         // Muted Gray for Comments
+        "strings": "#00FF99",          // Neon Green for Strings
+        "keywords": "#FFD700",         // Cyberpunk Yellow Keywords
+        "functions": "#FF3300",        // Bright Red-Orange for Functions
+        "variables": "#FF4500",        // Deep Orange-Red for Variables
+        "numbers": "#FFDD00",          // Neon Yellow for Numbers
+        "types": "#00FFFF",            // Electric Cyan for Types
+
+        "textMateRules": [
+            {
+                "scope": "entity.name.tag",
+                "settings": {
+                    "foreground": "#00FFFF", // Electric Cyan for HTML Tags
+                    "fontStyle": "bold"
+                }
+            },
+            {
+                "scope": "entity.name.function",
+                "settings": {
+                    "foreground": "#FF3300",  // Bright Red-Orange for Functions
+                    "fontStyle": "bold"
+                }
+            },
+            {
+                "scope": "variable.parameter",
+                "settings": {
+                    "foreground": "#FF4500",  // Deep Orange-Red for Parameters
+                    "fontStyle": "italic"
+                }
+            },
+            {
+                "scope": "keyword.operator",
+                "settings": {
+                    "foreground": "#FFD700",  // Cyberpunk Yellow for Operators
+                    "fontStyle": "bold"
+                }
+            },
+            {
+                "scope": "comment",
+                "settings": {
+                    "foreground": "#757575",  // Muted Gray for Comments
+                    "fontStyle": "italic"
+                }
+            },
+            {
+                "scope": "entity.name.type",
+                "settings": {
+                    "foreground": "#00FFFF",  // Electric Cyan for Types
+                    "fontStyle": "bold"
+                }
+            },
+            {
+                "scope": "constant.numeric",
+                "settings": {
+                    "foreground": "#FFDD00",  // Neon Yellow for Numbers
+                    "fontStyle": "bold"
+                }
+            },
+            {
+                "scope": "string",
+                "settings": {
+                    "foreground": "#00FF99",  // Neon Green for Strings
+                    "fontStyle": "italic"
+                }
+            },
+            {
+                "scope": "storage.type",
+                "settings": {
+                    "foreground": "#FFD700",  // Cyberpunk Yellow for Storage Types
+                    "fontStyle": "bold"
+                }
+            },
+            {
+                "scope": "meta.object-literal.key",
+                "settings": {
+                    "foreground": "#FF4500",  // Deep Orange for Object Keys
+                    "fontStyle": "bold"
+                }
+            },
+            {
+                "scope": [
+                    "meta.function-call",
+                    "support.function",
+                    "support.class",
+                    "support.type",
+                    "meta.class"
+                ],
+                "settings": {
+                    "foreground": "#FF3300",  // Bright Red-Orange for Function Calls, Classes, and Types
+                    "fontStyle": "bold"
+                }
+            },
+            {
+                "scope": [
+                    "meta.brace",
+                    "meta.parens",
+                    "meta.brackets"
+                ],
+                "settings": {
+                    "foreground": "#FFD700"  // Cyberpunk Yellow for Braces, Parentheses, and Brackets
+                }
+            },
+            {
+                "scope": [
+                    "variable.other",
+                    "meta.object-literal.key",
+                    "variable",
+                    "support.variable"
+                ],
+                "settings": {
+                    "foreground": "#FF4500"  // Deep Orange-Red for Variables
+                }
+            }
+        ]
+    },
+    "editor.lineHeight": 0,
+    "editor.fontSize": 15,
+    "workbench.startupEditor": "none",
+    "git.confirmSync": false,
+    "explorer.confirmDelete": false,
+    "git.openRepositoryInParentFolders": "never",
+    "git.enableSmartCommit": true,
+    "liveServer.settings.donotVerifyTags": true,
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "terminal.integrated.fontSize": 14,
+    "codeium.enableConfig": {
+        "*": true,
+        "markdown": true
+    }
+}
