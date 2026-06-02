@@ -411,6 +411,8 @@ bind n next-window          # prefix n -> next window (was unbound)
 bind p previous-window      # prefix p -> previous window (was paste-buffer; paste is on prefix ])
 bind -T root MouseDown1Status select-window -t =   # click a window name to switch (was switch-client = no-op)
 bind t new-window -c "#{pane_current_path}"        # prefix t -> new window in same dir (was clock-mode)
+bind r command-prompt -I "#W" { rename-window "%%" }            # prefix r -> rename window (was reload)
+bind R source-file ~/.tmux.conf \; display-message "tmux config reloaded"   # reload moved to prefix R
 # ------------------------------------------------------------------------------
 
 # # /!\ do not remove the following line
