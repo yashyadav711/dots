@@ -405,6 +405,13 @@ set -g @plugin 'rickstaa/tmux-notify'
 # then, use #{foo} in e.g. the 'tmux_conf_theme_status_left' or the
 # 'tmux_conf_theme_status_right' variables.
 
+# -- yash custom: simpler window nav + fix status-bar click --------------------
+# Oh My Tmux unbinds n/p and mis-binds the status click; restore the intuitive ones.
+bind n next-window          # prefix n -> next window (was unbound)
+bind p previous-window      # prefix p -> previous window (was paste-buffer; paste is on prefix ])
+bind -T root MouseDown1Status select-window -t =   # click a window name to switch (was switch-client = no-op)
+# ------------------------------------------------------------------------------
+
 # # /!\ do not remove the following line
 # EOF
 #
