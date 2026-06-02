@@ -13,9 +13,10 @@ A high-contrast, neon-infused `.tmux.conf.local` built on top of [gpakosz/.tmux]
 ## 📦 Prerequisites
 - `tmux` ≥ 3.2
 - `xclip` or `xsel` and `acpi` (for Linux clipboard and battery support)
+- `chafa` — **required for images inside tmux.** tmux can't pass kitty's graphics protocol, so image logos (e.g. `fastfetch --logo-type kitty`, `kitten icat`) won't render in a tmux pane. chafa draws them as ANSI blocks instead. (Pair with a tmux-aware shell wrapper: use `--logo-type chafa` when `$TMUX` is set, `kitty` otherwise.)
 
   ```bash
-  sudo pacman -S xclip xsel acpi
+  sudo pacman -S xclip xsel acpi chafa
   ```
 - Powerline-patched font (e.g., FiraCode Nerd Font, awesome-terminal-fonts)
 

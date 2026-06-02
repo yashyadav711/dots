@@ -4,6 +4,14 @@
 #         without any warranty.
 #         Copyright 2012— Gregory Pakosz (@gpakosz).
 
+# -- DEPENDENCY NOTE (yash) ----------------------------------------------------
+#  chafa  -> required for images inside tmux. tmux can't pass kitty's graphics
+#           protocol, so fastfetch/kitten-icat image logos won't show in a tmux
+#           pane without it. Install: sudo pacman -S chafa
+#           (shell wrapper uses `fastfetch --logo-type chafa` when $TMUX is set.)
+#  Other deps: xclip/xsel, acpi (clipboard + battery). See this folder's Readme.md.
+# ------------------------------------------------------------------------------
+
 
 # -- navigation ----------------------------------------------------------------
 
