@@ -103,12 +103,15 @@ def proc_comm(pid):
         with open(f"/proc/{pid}/comm") as f: return f.read().strip()
     except OSError: return ""
 
-# map a cwd to a human project label (basename, with ~ for home)
+# map a cwd to a human project NAME (the headline identity)
 def project_label(cwd):
     if not cwd: return "?"
-    if cwd==HOME: return "~ (home / Home-BT)"
-    base=os.path.basename(cwd.rstrip("/")) or cwd
-    return base
+    if cwd==HOME: return "Home-BT"
+    return os.path.basename(cwd.rstrip("/")) or cwd
+# the folder PATH, home-relative, shown dim next to the name
+def folder_path_disp(cwd):
+    if not cwd: return "?"
+    return ("~"+cwd[len(HOME):]) if cwd.startswith(HOME) else cwd
 
 # Walk up the process tree from `pid` to find who spawned it: the nearest ancestor
 # that is a claude session, a `python -m <module>` orchestrator, or a login shell.
@@ -383,13 +386,14 @@ def render(include_idle=False, max_idle=300):
         for line in reversed(tail_lines(jf,8192)):
             try: branch=(json.loads(line).get("gitBranch") or ""); break
             except Exception: continue
-        # ── header row: ● <folder> ................. <kind> · model · up Xh
-        # folder is the #1 thing the Pilot wants — show it home-relative, full path.
-        folder=p["cwd"] or "?"
-        folder_disp=("~"+folder[len(HOME):]) if folder.startswith(HOME) else folder
+        # ── header row: ● <PROJECT NAME> <path> ........ <kind> · model · up Xh
+        # the project/folder name is the #1 thing the Pilot wants — make it the bold
+        # headline, with the full home-relative path dim right after it.
+        name=project_label(p["cwd"])
+        path_disp=folder_path_disp(p["cwd"])
         kindname="◆ relay/agent" if p["kind"]=="print-agent" else "session"
         kindcol=MAGENTA if p["kind"]=="print-agent" else GREEN
-        left=f" {dot(age)}  {c(folder_disp,BOLD)}"
+        left=f" {dot(age)}  {c(name,BOLD)} {c(path_disp,DIM)}"
         right=f"{c(kindname,kindcol)} · {c(short_model(model) if model else '—',BLUE)} · up {fmt_age(p['age'])}{spantag}"
         L.append(row2(left,right,W))
         # ── identity + lineage (what the Pilot asked to see first) ──
