@@ -15,11 +15,39 @@ Usage:
 stdlib only. Reads /proc + ~/.claude/projects/**/*.jsonl. Cost is a rough estimate
 from public list prices, NOT billing truth. Lives in ~/Github/dots/bin (-> ~/.local/bin).
 """
-import os, sys, json, time, glob, re
+import os, sys, json, time, glob, re, subprocess
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
 PROJECTS = os.path.join(HOME, ".claude", "projects")
+
+# ── 5-hour usage window via ccusage (reads the same local *.jsonl) ────────────────
+# Authoritative for "when does the rolling rate-limit window reset" + live burn rate.
+# remainingMinutes = time left in the CURRENT 5h block (NOT quota left) — when it hits
+# 0 the window rolls over and the Max allowance resets. Cached ~30s (ccusage = node,
+# ~1s cold start) so watch mode stays cheap. Returns None if ccusage missing/no window.
+_WIN_CACHE={"t":0.0,"val":None}
+def usage_window():
+    now=time.time()
+    if now-_WIN_CACHE["t"]<30 and _WIN_CACHE["t"]:
+        return _WIN_CACHE["val"]
+    val=None
+    try:
+        out=subprocess.run(["ccusage","blocks","--json"],capture_output=True,
+                           text=True,timeout=10).stdout
+        d=json.loads(out); blocks=d.get("blocks",d) if isinstance(d,dict) else d
+        for b in (blocks if isinstance(blocks,list) else []):
+            if b.get("isActive"):
+                proj=b.get("projection",{}) or {}
+                br=b.get("burnRate",{}) or {}
+                val={"rem":proj.get("remainingMinutes"),
+                     "tpm":br.get("tokensPerMinute"),
+                     "cost":b.get("costUSD")}
+                break
+    except Exception:
+        val=None
+    _WIN_CACHE["t"]=now; _WIN_CACHE["val"]=val
+    return val
 
 # ── ansi ────────────────────────────────────────────────────────────────────────
 def c(s, code): return f"\033[{code}m{s}\033[0m"
@@ -257,6 +285,12 @@ def render(include_idle=False, max_idle=300):
     L.append(c("┌"+"─"*W+"┐",CYAN))
     L.append(box(f" {c('CLAUDE CODE',BOLD)} {c('· live overview',DIM)}"))
     L.append(box(f" {c('●',GREEN)} {len(sess)} session(s)    {c('◆',MAGENTA)} {len(agents)} background agent(s)    {c('Σ',DIM)} {total_rss:,.0f} MB RAM"))
+    win=usage_window()
+    if win and win.get("rem") is not None:
+        rem=int(win["rem"]); h,m=divmod(rem,60); rs=(f"{h}h{m:02d}m" if h else f"{m}m")
+        wcol=RED if rem<20 else YELLOW if rem<60 else GREEN
+        tpm=win.get("tpm"); burn=c(f" · {tpm/1000:.0f}k tok/min",DIM) if tpm else ""
+        L.append(box(f" {c('⧗',wcol)} {c('5h window resets in '+rs,wcol)}{burn}"))
     L.append(c("└"+"─"*W+"┘",CYAN))
 
     L.append(c(" SESSIONS",BOLD)+c("   (one block per running claude process)",DIM))
@@ -324,6 +358,7 @@ def render(include_idle=False, max_idle=300):
             L.append(label("agents" if i==0 else "",
                 f"{c(tee,GREY)} {dot(sage)} {c(aid,CYAN)} {trunc(txt,W-27)} {c(fmt_age(sage),DIM)}"))
         L.append("")    # blank line between sessions
+    L.append(c(" ⧗=time until the rolling 5h rate-limit window resets (via ccusage) — not quota remaining",DIM))
     L.append(c(" up=process uptime · convo=conversation span (resumed) · io=fresh in+out tokens",DIM))
     L.append(c(" api-eq=API-equivalent $ at list price (incl cache + sub-agents) — Pilot is on MAX flat-rate, NOT billed this",DIM))
     return "\n".join(L)
