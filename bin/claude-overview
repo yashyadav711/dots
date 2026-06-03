@@ -82,7 +82,7 @@ def _process_line(d,acc):
     if not isinstance(m,dict): return
     if t=="assistant":
         acc["resp"]+=1
-        if m.get("model"): acc["model"]=m["model"]
+        if m.get("model") and m["model"]!="<synthetic>": acc["model"]=m["model"]
         u=m.get("usage") or {}
         acc["in"]+=u.get("input_tokens",0) or 0
         acc["out"]+=u.get("output_tokens",0) or 0
@@ -280,14 +280,18 @@ def render(include_idle=False, max_idle=300):
         pin,pout,pcr,pcw=PRICING[price_key(model)]
         cost=(tin*pin+tout*pout+tcr*pcr+tcw*pcw)/1e6
         io=tin+tout
+        # "up" = how long THIS process has been alive (truthful), not the resumed-conversation calendar span.
+        # conversation calendar span shown dim as "·Xold" when it's much longer than uptime (i.e. resumed).
         sts=parse_ts(st["start"]); lts=parse_ts(st["last"])
-        dur=fmt_age((now if age<60 else (lts or now))-sts) if sts else "?"
+        span=((lts or now)-sts) if sts else 0
+        spantag=c(f" ·{fmt_age(span)} convo",DIM) if span>p["age"]+600 else ""
         branch=""
         for line in reversed(tail_lines(jf,8192)):
             try: branch=(json.loads(line).get("gitBranch") or ""); break
             except Exception: continue
-        meta=(f"{c(short_model(model),BLUE)} · {trunc(branch or '-',20)} · {st['turns']}t · {dur} · "
-              f"{fmt_tok(io)} io {c('+'+fmt_tok(tcr)+' cache',DIM)} · {c('~$%.2f'%cost,GREEN)}")
+        meta=(f"{c(short_model(model) if model else '—',BLUE)} · {trunc(branch or '-',20)} · {st['turns']}t · "
+              f"up {fmt_age(p['age'])}{spantag} · {fmt_tok(io)} io {c('+'+fmt_tok(tcr)+' cache',DIM)} · "
+              f"{c('~$%.2f'%cost,GREEN)}")
         L.append(f" {dot(age)} {c(proj,BOLD)}{tag}  {meta}{c('  %.0fMB'%p['rss'],DIM)}")
         prompt,action=last_prompt_and_action(jf)
         if prompt: L.append(c("     prompt ▸ ",DIM)+trunc(prompt,W-14))
@@ -300,7 +304,8 @@ def render(include_idle=False, max_idle=300):
             txt=f"{sact[0]} {sact[1]}" if sact else ""
             L.append(f"       {c(tee,GREY)} {dot(sage)} {c(aid,CYAN)} {trunc(txt,W-24)} {c(fmt_age(sage),DIM)}")
     L.append("")
-    L.append(c(" io=fresh in+out · cache=cache-read · t=human turns · ~$=rough LIFETIME est (list price, incl cache+subagents)",DIM))
+    L.append(c(" up=this process's uptime · convo=conversation calendar span (resumed) · t=human turns",DIM))
+    L.append(c(" io=fresh in+out · cache=cache-read (cheap) · ~$=rough LIFETIME est, list price incl cache+subagents",DIM))
     return "\n".join(L)
 
 def main():
