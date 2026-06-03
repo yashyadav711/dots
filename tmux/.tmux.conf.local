@@ -413,6 +413,12 @@ bind -T root MouseDown1Status select-window -t =   # click a window name to swit
 bind t new-window -c "#{pane_current_path}"        # prefix t -> new window in same dir (was clock-mode)
 bind r command-prompt -I "#W" { rename-window "%%" }            # prefix r -> rename window (was reload)
 bind R source-file ~/.tmux.conf \; display-message "tmux config reloaded"   # reload moved to prefix R
+
+# Bell -> 🔔 on the window tab. Claude rings BEL (Stop/Notification hooks in ~/.claude/settings.json);
+# tmux flags it as 🔔 (glyph already in window_status_format). `other` = flag only background windows,
+# so the window you're actively in never beeps/flags — you only see 🔔 on a window that wants you.
+set -g bell-action other
+setw -g monitor-bell on
 # ------------------------------------------------------------------------------
 
 # # /!\ do not remove the following line

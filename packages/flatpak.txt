@@ -1,2 +1,3 @@
 com.discordapp.Discord
 com.rtosta.zapzap
+it.mijorus.smile
