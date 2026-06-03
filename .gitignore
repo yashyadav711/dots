@@ -1,2 +1,6 @@
-dotfiles-backup.sh
-dotfiles-map.txt
+# never commit local secrets
+fish/private.fish
+**/private.fish
+*.secret
+.env
+.env.*

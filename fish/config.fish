@@ -1,22 +1,10 @@
+# CachyOS default config
+source /usr/share/cachyos-fish-config/cachyos-config.fish
+
 ###
-# Fish Shell Configuration File
+# Fish Shell Configuration File (Restored from Backup)
 # Official docs: https://fishshell.com/docs/current/index.html
-# Cookbook: https://github.com/jorgebucaran/cookbook.fish
-
-# Theme and plugin references
-# Themes: https://github.com/oh-my-fish/oh-my-fish/blob/master/docs/Themes.md
-# Plugins: 
-# - fzf: https://github.com/jethrokuan/fzf
-# - tide: https://github.com/IlanCosman/tide.git (install: fisher install IlanCosman/tide@v5)
-# - plugin-git: https://github.com/jhillyerd/plugin-git
-
-# Tool managers:
-# - fisher: https://github.com/jorgebucaran/fisher
-# - oh-my-fish: https://github.com/oh-my-fish/oh-my-fish
-# - fundle: https://github.com/danhper/fundle
 ###
-
-#set VIRTUAL_ENV_DISABLE_PROMPT "1"  # Uncomment if virtualenv prompt is undesired
 
 # Exit early if shell is not interactive
 if not status --is-interactive
@@ -49,15 +37,15 @@ end
 set -e fish_user_paths
 set -U fish_user_paths $HOME/.bin $HOME/.local/bin $HOME/Applications $fish_user_paths
 
-# Starship prompt initializer (commented out)
-#if command -sq starship
-#    starship init fish | source
-#end
+# Starship prompt initializer
+if command -sq starship
+    starship init fish | source
+end
 
 # Environment variables for editors
 set -x EDITOR vim
 set -x VISUAL vim
-#set -x TERM alacritty  # Uncomment if using Alacritty
+set -x TERM kitty
 
 # Terminal capabilities
 set TERM "xterm-256color"
@@ -224,11 +212,36 @@ set fish_pager_color_prefix white --bold --underline
 set fish_pager_color_progress brwhite --background="#00aaff"
 
 
-# Initialize Atuin (command history manager)
-atuin init fish --disable-up-arrow | source
-
 # Initialize "thefuck" for intelligent command correction
-thefuck --alias | source
+if type -q thefuck
+    thefuck --alias | source
+end
 
 # Copy a file to clipboard function
 function copy; cat $argv | xsel --clipboard; echo "📋 Copied to clipboard!"; end
+
+
+# VFrame project setup alias
+alias setupproject='bash -c "$(curl -fsSL https://raw.githubusercontent.com/yashyadav711/vframe-installer/main/setup-vframe.sh)"'
+
+# jump into HeyDaddy and resume Claude (YOLO / skip permission prompts)
+alias heydaddy='cd /home/yash/Github/heydaddy && claude --dangerously-skip-permissions --resume'
+# launch home-BT in ~ and resume (YOLO / skip permission prompts)
+alias home-bt='cd ~ && claude --dangerously-skip-permissions --resume'
+# jump into the mirror project and resume Claude (YOLO / skip permission prompts)
+alias mirror='cd /home/yash/Github/mirror && claude --dangerously-skip-permissions --resume'
+# typing /exit (slash-command muscle memory) expands to exit
+abbr -a -- /exit exit
+
+set -gx PATH ~/.npm-global/bin $PATH
+
+# tmux-aware fastfetch logo (overrides HyDE's kitty-only alias in conf.d/hyde.fish).
+# tmux can't pass kitty's graphics protocol, so use chafa (ANSI blocks) inside tmux;
+# use the full kitty image in raw kitty. `command` avoids recursing into this function.
+function fastfetch
+    if set -q TMUX
+        command fastfetch --logo-type chafa $argv
+    else
+        command fastfetch --logo-type kitty $argv
+    end
+end
