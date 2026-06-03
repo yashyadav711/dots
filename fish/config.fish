@@ -233,6 +233,10 @@ alias mirror='cd /home/yash/Github/mirror && claude --dangerously-skip-permissio
 # typing /exit (slash-command muscle memory) expands to exit
 abbr -a -- /exit exit
 
+# live overview of every running Claude Code session/agent + what each is doing
+# `claudes` = one-shot snapshot, `claudes -w` = live refresh (script in dots/bin -> ~/.local/bin)
+alias claudes='claude-overview'
+
 set -gx PATH ~/.npm-global/bin $PATH
 
 # tmux-aware fastfetch logo (overrides HyDE's kitty-only alias in conf.d/hyde.fish).

@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""
+claude-overview — live view of every Claude Code session/agent running on this machine.
+
+Shows, for each running `claude` process: which project, git branch, how long it's
+been alive, RAM, and — read live from its transcript — what it is doing RIGHT NOW
+(current tool call / last message). Also surfaces sub-agents (Task/sidechain agents)
+and background `--print` agents.
+
+Usage:
+  claude-overview            one-shot snapshot
+  claude-overview -w [secs]  live, refresh every <secs> (default 2) — q/Ctrl-C to quit
+  claude-overview -a         also list idle sessions (transcript untouched > 5 min)
+
+Lives in ~/Github/dots/bin (symlinked to ~/.local/bin). No deps beyond stdlib.
+"""
+import os, sys, json, time, glob, pwd
+
+HOME = os.path.expanduser("~")
+PROJECTS = os.path.join(HOME, ".claude", "projects")
+
+# ── ansi ──────────────────────────────────────────────────────────────────────
+def c(s, code): return f"\033[{code}m{s}\033[0m"
+BOLD="1"; DIM="2"; RED="31"; GREEN="32"; YELLOW="33"; BLUE="34"; MAGENTA="35"; CYAN="36"; GREY="90"
+def clear(): sys.stdout.write("\033[2J\033[H")
+
+# ── process discovery (/proc) ───────────────────────────────────────────────────
+def read_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline","rb") as f:
+            return f.read().split(b"\0")
+    except OSError: return []
+
+def proc_cwd(pid):
+    try: return os.readlink(f"/proc/{pid}/cwd")
+    except OSError: return None
+
+def proc_rss_mb(pid):
+    try:
+        with open(f"/proc/{pid}/statm") as f:
+            pages = int(f.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE") / (1024*1024)
+    except (OSError, IndexError, ValueError): return 0.0
+
+def proc_age_s(pid):
+    try:
+        st = os.stat(f"/proc/{pid}")
+        return max(0, time.time() - st.st_ctime)
+    except OSError: return 0
+
+def find_claude_procs():
+    """Real `claude` CLI processes (not the helper shells/tool subprocesses)."""
+    procs = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit(): continue
+        argv = read_cmdline(entry)
+        if not argv: continue
+        parts = [a.decode("utf-8","replace") for a in argv if a]
+        if not parts: continue
+        exe = os.path.basename(parts[0])
+        # the claude CLI launches as argv[0] == "claude"; skip shells that merely mention it
+        if exe != "claude": continue
+        kind = "print-agent" if "--print" in parts or "-p" in parts else "session"
+        procs.append({
+            "pid": int(entry), "argv": parts, "kind": kind,
+            "cwd": proc_cwd(int(entry)), "rss": proc_rss_mb(int(entry)),
+            "age": proc_age_s(int(entry)),
+        })
+    return procs
+
+# ── transcript reading ──────────────────────────────────────────────────────────
+def munge(path):  # cwd -> project dir name claude uses
+    return path.replace("/","-")
+
+def tail_lines(path, maxbytes=131072):
+    """Last chunk of a (possibly huge) jsonl, as decoded lines."""
+    try:
+        sz = os.path.getsize(path)
+        with open(path,"rb") as f:
+            if sz > maxbytes: f.seek(sz - maxbytes)
+            data = f.read()
+        return data.decode("utf-8","replace").splitlines()
+    except OSError: return []
+
+def last_event(path):
+    """Walk backward to the last line that carries a real message; summarize it."""
+    for line in reversed(tail_lines(path)):
+        line=line.strip()
+        if not line: continue
+        try: d=json.loads(line)
+        except ValueError: continue
+        if d.get("type") not in ("assistant","user"): continue
+        return d
+    return None
+
+def summarize(d):
+    """Return (icon, short text) describing what's happening."""
+    t=d.get("type"); m=d.get("message",{})
+    content = m.get("content") if isinstance(m,dict) else None
+    if isinstance(content,str):
+        txt=content.strip().replace("\n"," ")
+        if t=="user": return ("👤", "prompt: "+txt[:70])
+        return ("💬", txt[:74])
+    if isinstance(content,list):
+        # prefer the most telling item
+        for ci in content:
+            if isinstance(ci,dict) and ci.get("type")=="tool_use":
+                name=ci.get("name","tool"); inp=ci.get("input",{})
+                hint=""
+                if isinstance(inp,dict):
+                    for k in ("command","file_path","pattern","description","prompt","url","query"):
+                        if inp.get(k): hint=str(inp[k]).replace("\n"," ")[:54]; break
+                return ("🔧", f"{name}: {hint}" if hint else name)
+        for ci in content:
+            if isinstance(ci,dict) and ci.get("type")=="text" and ci.get("text","").strip():
+                return ("💬", ci["text"].strip().replace("\n"," ")[:74])
+        for ci in content:
+            if isinstance(ci,dict) and ci.get("type")=="tool_result":
+                body=ci.get("content")
+                s = body if isinstance(body,str) else json.dumps(body)[:1] and str(body)
+                return ("⏳", "got result, thinking…")
+    return ("·","")
+
+def status_dot(age):
+    if age < 15:  return c("●",GREEN), c("working", GREEN)
+    if age < 120: return c("●",YELLOW), c(f"{int(age)}s ago", YELLOW)
+    return c("○",GREY), c(f"idle {fmt_age(age)}", GREY)
+
+def fmt_age(s):
+    s=int(s)
+    if s<60: return f"{s}s"
+    if s<3600: return f"{s//60}m"
+    return f"{s//3600}h{(s%3600)//60}m"
+
+def short(p, n=22):
+    b=os.path.basename(p.rstrip("/")) if p else "?"
+    return b[:n]
+
+# ── transcript index per project ─────────────────────────────────────────────────
+def active_transcripts(max_idle, include_idle):
+    """All session+subagent transcripts, newest activity first."""
+    out=[]
+    now=time.time()
+    for jf in glob.glob(os.path.join(PROJECTS,"*","**","*.jsonl"), recursive=True) + \
+              glob.glob(os.path.join(PROJECTS,"*","*.jsonl")):
+        try: mt=os.path.getmtime(jf)
+        except OSError: continue
+        age=now-mt
+        if not include_idle and age>max_idle: continue
+        out.append((age, jf))
+    # dedup + sort
+    seen=set(); uniq=[]
+    for age,jf in sorted(out):
+        if jf in seen: continue
+        seen.add(jf); uniq.append((age,jf))
+    return uniq
+
+def project_of(jf):
+    # .../projects/<munged-cwd>/...  -> readable project name
+    rel=os.path.relpath(jf, PROJECTS)
+    top=rel.split(os.sep)[0]
+    home=munge(HOME)                 # e.g. -home-yash
+    ghpfx=home+"-Github-"            # e.g. -home-yash-Github-
+    if top.startswith(ghpfx):   return top[len(ghpfx):]
+    if top==home:               return "~"
+    if top.startswith(home+"-"):return top[len(home)+1:]
+    return top.lstrip("-") or top
+
+def is_subagent(jf):
+    return f"{os.sep}subagents{os.sep}" in jf or os.path.basename(jf).startswith("agent-")
+
+# ── render ────────────────────────────────────────────────────────────────────────
+def render(include_idle=False, max_idle=300):
+    procs=find_claude_procs()
+    sessions=[p for p in procs if p["kind"]=="session"]
+    agents=[p for p in procs if p["kind"]=="print-agent"]
+    total_rss=sum(p["rss"] for p in procs)
+
+    W=72
+    lines=[]
+    def boxrow(inner):
+        return c("│",CYAN)+pad_visible(inner,W)+c("│",CYAN)
+    lines.append(c("┌"+"─"*W+"┐", CYAN))
+    lines.append(boxrow(f" {c('CLAUDE CODE',BOLD)} {c('· live overview',DIM)}"))
+    summ=(f" {c('●',GREEN)} {len(sessions)} session(s)    "
+          f"{c('◆',MAGENTA)} {len(agents)} background agent(s)    "
+          f"{c('Σ',DIM)} {total_rss:,.0f} MB RAM")
+    lines.append(boxrow(summ))
+    lines.append(c("└"+"─"*W+"┘", CYAN))
+
+    # process table
+    if procs:
+        lines.append(c(" PROCESSES",BOLD))
+        lines.append(c(f"  {'PID':>7}  {'KIND':<12} {'PROJECT':<20} {'UP':>6} {'RAM':>8}",DIM))
+        for p in sorted(procs,key=lambda x:(x["kind"],-x["age"])):
+            kindc = c(p["kind"],MAGENTA if p["kind"]=="print-agent" else GREEN)
+            proj = short(p["cwd"],20)
+            lines.append(f"  {p['pid']:>7}  {pad_visible(kindc,12)} {proj:<20} "
+                         f"{fmt_age(p['age']):>6} {p['rss']:>6,.0f}MB")
+
+    # activity table (from transcripts)
+    acts=active_transcripts(max_idle, include_idle)
+    lines.append("")
+    hdr = " LIVE ACTIVITY" + ("" if include_idle else c(f"   (active < {fmt_age(max_idle)}; -a for all)",DIM))
+    lines.append(c(hdr,BOLD))
+    if not acts:
+        lines.append(c("  (no recent transcript activity)",DIM))
+    else:
+        lines.append(c(f"  {'':1} {'PROJECT':<16} {'KIND':<9} {'BRANCH':<14} {'AGE':>5}  DOING",DIM))
+        for age,jf in acts[:18]:
+            ev=last_event(jf)
+            dot,_=status_dot(age)
+            proj=project_of(jf)[:16]
+            kind = c("subagent",CYAN) if is_subagent(jf) else "session"
+            branch=""; icon=""; doing=""
+            if ev:
+                branch=(ev.get("gitBranch") or "")[:14]
+                icon,doing=summarize(ev)
+            line=(f"  {dot} {proj:<16} {pad_visible(kind,9)} {branch:<14} "
+                  f"{fmt_age(age):>5}  {icon} {doing}")
+            lines.append(line)
+    return "\n".join(lines)
+
+# visible-length helpers (ignore ANSI)
+import re
+_ansi=re.compile(r"\033\[[0-9;]*m")
+def len_visible(s): return len(_ansi.sub("",s))
+def pad_visible(s,width):
+    pad=width-len_visible(s)
+    return s+" "*max(0,pad)
+
+def main():
+    args=sys.argv[1:]
+    watch=False; interval=2.0; include_idle=False
+    i=0
+    while i<len(args):
+        a=args[i]
+        if a in ("-w","--watch"):
+            watch=True
+            if i+1<len(args) and args[i+1].replace(".","",1).isdigit():
+                interval=float(args[i+1]); i+=1
+        elif a in ("-a","--all"): include_idle=True
+        elif a in ("-h","--help"): print(__doc__); return
+        i+=1
+    if not watch:
+        print(render(include_idle)); return
+    try:
+        while True:
+            clear()
+            print(render(include_idle))
+            print(c(f"\n  refreshing every {interval:g}s — Ctrl-C to quit",DIM))
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print(); return
+
+if __name__=="__main__":
+    main()
