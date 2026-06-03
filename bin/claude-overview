@@ -29,25 +29,32 @@ PROJECTS = os.path.join(HOME, ".claude", "projects")
 _WIN_CACHE={"t":0.0,"val":None}
 def usage_window():
     now=time.time()
-    if now-_WIN_CACHE["t"]<30 and _WIN_CACHE["t"]:
+    if now-_WIN_CACHE["t"]<30 and _WIN_CACHE["val"] is not None:
         return _WIN_CACHE["val"]
     val=None
     try:
-        out=subprocess.run(["ccusage","blocks","--json"],capture_output=True,
-                           text=True,timeout=10).stdout
+        out=subprocess.run(["ccusage","blocks","--active","--json"],capture_output=True,
+                           text=True,timeout=25).stdout
         d=json.loads(out); blocks=d.get("blocks",d) if isinstance(d,dict) else d
         for b in (blocks if isinstance(blocks,list) else []):
             if b.get("isActive"):
                 proj=b.get("projection",{}) or {}
                 br=b.get("burnRate",{}) or {}
+                tc=b.get("tokenCounts",{}) or {}
                 val={"rem":proj.get("remainingMinutes"),
                      "tpm":br.get("tokensPerMinute"),
+                     "used":b.get("totalTokens"),
+                     "proj":proj.get("totalTokens"),
                      "cost":b.get("costUSD")}
                 break
     except Exception:
         val=None
-    _WIN_CACHE["t"]=now; _WIN_CACHE["val"]=val
-    return val
+    if val is not None:
+        _WIN_CACHE["t"]=now; _WIN_CACHE["val"]=val
+        return val
+    # call failed/slow this tick — keep showing the last good value rather than
+    # blinking the line out; only force a fresh retry (don't extend the 30s hold).
+    return _WIN_CACHE["val"]
 
 # ── ansi ────────────────────────────────────────────────────────────────────────
 def c(s, code): return f"\033[{code}m{s}\033[0m"
@@ -84,6 +91,46 @@ def proc_rss_mb(pid):
 def proc_age_s(pid):
     try: return max(0,time.time()-os.stat(f"/proc/{pid}").st_ctime)
     except OSError: return 0
+def proc_ppid(pid):
+    # /proc/<pid>/stat: "pid (comm) state ppid ..." — comm can hold spaces/parens,
+    # so split on the LAST ')' then take field index 1 (ppid) of the remainder.
+    try:
+        with open(f"/proc/{pid}/stat") as f: s=f.read()
+        return int(s[s.rfind(")")+2:].split()[1])
+    except (OSError,IndexError,ValueError): return None
+def proc_comm(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as f: return f.read().strip()
+    except OSError: return ""
+
+# map a cwd to a human project label (basename, with ~ for home)
+def project_label(cwd):
+    if not cwd: return "?"
+    if cwd==HOME: return "~ (home / Home-BT)"
+    base=os.path.basename(cwd.rstrip("/")) or cwd
+    return base
+
+# Walk up the process tree from `pid` to find who spawned it: the nearest ancestor
+# that is a claude session, a `python -m <module>` orchestrator, or a login shell.
+# Returns (label, cwd) describing the creator, or None for a top-level user session.
+def creator_of(pid):
+    seen=0; cur=proc_ppid(pid)
+    while cur and cur>1 and seen<8:
+        seen+=1
+        argv=[a.decode("utf-8","replace") for a in read_cmdline(cur) if a]
+        comm=proc_comm(cur); cwd=proc_cwd(cur)
+        base=os.path.basename(argv[0]) if argv else comm
+        if base=="claude":
+            who="Home-BT" if cwd==HOME else f"{project_label(cwd)} BT"
+            return (f"{who} (claude session pid {cur})", cwd)
+        if base in ("python","python3") and "-m" in argv:
+            mod=argv[argv.index("-m")+1] if argv.index("-m")+1<len(argv) else "?"
+            return (f"{project_label(cwd)} · python -m {mod}", cwd)
+        if base in ("fish","bash","zsh","sh","login","kitty","tmux","tmux: server"):
+            return None   # spawned directly by the Pilot at a terminal
+        cur=proc_ppid(cur)
+    return None
+
 def find_claude_procs():
     procs=[]
     for e in os.listdir("/proc"):
@@ -94,8 +141,10 @@ def find_claude_procs():
         if not parts or os.path.basename(parts[0])!="claude": continue
         kind="print-agent" if ("--print" in parts or "-p" in parts) else "session"
         pid=int(e)
+        creator=creator_of(pid)
         procs.append({"pid":pid,"kind":kind,"cwd":proc_cwd(pid),
-                      "rss":proc_rss_mb(pid),"age":proc_age_s(pid)})
+                      "rss":proc_rss_mb(pid),"age":proc_age_s(pid),
+                      "creator":creator})
     return procs
 
 # ── transcript scanning (incremental, cached across watch refreshes) ────────────────
