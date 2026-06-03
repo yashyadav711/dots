@@ -419,6 +419,19 @@ bind R source-file ~/.tmux.conf \; display-message "tmux config reloaded"   # re
 # so the window you're actively in never beeps/flags — you only see 🔔 on a window that wants you.
 set -g bell-action other
 setw -g monitor-bell on
+
+# Mouse-select -> system clipboard (Wayland). Two problems this fixes:
+#  1) `mouse on` makes a drag select into tmux's OWN buffer, not the terminal's.
+#  2) Oh-My-Tmux's copy path shells out to xclip/xsel (X11) — this box only has
+#     wl-copy (Wayland), so tmux copies died in the internal buffer.
+# Now: drag-select in a pane auto-copies to the Wayland clipboard via wl-copy and
+# clears the selection. `y` in copy-mode does the same. Paste anywhere with Ctrl+V.
+# (Still works: hold Shift while dragging to bypass tmux for kitty-native selection.)
+bind -T copy-mode    MouseDragEnd1Pane send -X copy-pipe-and-cancel "wl-copy"
+bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel "wl-copy"
+bind -T copy-mode    y send -X copy-pipe-and-cancel "wl-copy"
+bind -T copy-mode-vi y send -X copy-pipe-and-cancel "wl-copy"
+set -g set-clipboard on
 # ------------------------------------------------------------------------------
 
 # # /!\ do not remove the following line
