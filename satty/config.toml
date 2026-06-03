@@ -1,0 +1,53 @@
+# satty — iOS-Markup-style screenshot annotator (Home-BT managed; tracked in ~/Github/dots)
+# Flow: Super+P -> drag region -> this editor opens -> mark up -> Enter (copy+save+exit)
+
+[general]
+# Open the editor filling the screen, like the iOS markup sheet.
+fullscreen = true
+
+# Start with the pen in hand, exactly like tapping a screenshot on iOS.
+initial-tool = "brush"
+
+# Rounded shape corners feel softer / iOS-like.
+corner-roundness = 12
+
+# Copy to the Wayland clipboard (Ctrl+V anywhere). HyDE also passes this in.
+copy-command = "wl-copy"
+
+# Enter = "Done": copy to clipboard, write the PNG, and close. One key, like iOS.
+actions-on-enter = ["save-to-clipboard", "save-to-file", "exit"]
+
+# Escape = throw it away and close (iOS "Delete Screenshot").
+actions-on-escape = ["exit"]
+
+# The toolbar copy button also copies+saves+exits.
+actions-on-right-click = []
+
+# Where saved shots land (HyDE overrides this with -o, but set a sane default).
+output-filename = "~/Pictures/Screenshots/%y%m%d_%Hh%Mm%Ss_screenshot.png"
+
+# Show the toolbars on open (iOS shows its tools immediately).
+default-hide-toolbars = false
+
+# Block-style highlighter (iOS-like solid marker); freehand on Ctrl.
+primary-highlighter = "block"
+
+# Keep the desktop notification when a shot is saved.
+disable-notifications = false
+
+[font]
+family = "JetBrainsMono Nerd Font"
+
+# A clean, iOS-ish accent palette for pens/shapes.
+[color-palette]
+palette = [
+  "#FF3B30",
+  "#FF9500",
+  "#FFCC00",
+  "#34C759",
+  "#007AFF",
+  "#5856D6",
+  "#AF52DE",
+  "#000000",
+  "#FFFFFF",
+]
