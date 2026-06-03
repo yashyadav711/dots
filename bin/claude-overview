@@ -303,9 +303,10 @@ def render(include_idle=False, max_idle=300):
         L.append(row2(left,right,W))
         # ── detail rows (aligned labels)
         prompt,action=last_prompt_and_action(jf)
-        if prompt and not prompt.lstrip().startswith("<"):       # skip noisy task/system tags
+        showprompt = prompt and not prompt.lstrip().startswith("<")   # skip noisy task/system tags
+        if showprompt:
             L.append(label("prompt",trunc(prompt,W-12)))
-        if action:
+        if action and not (action[0]=="👤" and showprompt):           # don't echo the prompt as "now"
             L.append(label("now",f"{action[0]} {trunc(action[1],W-14)}"))
         L.append(label("stats",
             f"{st['turns']} turns · {fmt_tok(io)} io · {c(money(cost),GREEN)} · {p['rss']:.0f}MB · {branch or '-'}"))
@@ -319,8 +320,8 @@ def render(include_idle=False, max_idle=300):
             L.append(label("agents" if i==0 else "",
                 f"{c(tee,GREY)} {dot(sage)} {c(aid,CYAN)} {trunc(txt,W-27)} {c(fmt_age(sage),DIM)}"))
         L.append("")    # blank line between sessions
-    L.append(c(" up=this process's uptime · convo=conversation calendar span (resumed) · t=human turns",DIM))
-    L.append(c(" io=fresh in+out · cache=cache-read (cheap) · ~$=rough LIFETIME est, list price incl cache+subagents",DIM))
+    L.append(c(" up=process uptime · convo=conversation span (resumed) · io=fresh in+out tokens",DIM))
+    L.append(c(" ~$=rough lifetime cost estimate (list price, incl cache + sub-agents) — not a bill",DIM))
     return "\n".join(L)
 
 def main():
