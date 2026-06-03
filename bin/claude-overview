@@ -383,12 +383,21 @@ def render(include_idle=False, max_idle=300):
         for line in reversed(tail_lines(jf,8192)):
             try: branch=(json.loads(line).get("gitBranch") or ""); break
             except Exception: continue
-        # ── header row: ● project ......................... model · up Xh
-        bgtag=c("◆ bg · ",MAGENTA) if p["kind"]=="print-agent" else ""
-        left=f" {dot(age)}  {c(proj,BOLD)}"
-        right=f"{bgtag}{c(short_model(model) if model else '—',BLUE)} · up {fmt_age(p['age'])}{spantag}"
+        # ── header row: ● <folder> ................. <kind> · model · up Xh
+        # folder is the #1 thing the Pilot wants — show it home-relative, full path.
+        folder=p["cwd"] or "?"
+        folder_disp=("~"+folder[len(HOME):]) if folder.startswith(HOME) else folder
+        kindname="◆ relay/agent" if p["kind"]=="print-agent" else "session"
+        kindcol=MAGENTA if p["kind"]=="print-agent" else GREEN
+        left=f" {dot(age)}  {c(folder_disp,BOLD)}"
+        right=f"{c(kindname,kindcol)} · {c(short_model(model) if model else '—',BLUE)} · up {fmt_age(p['age'])}{spantag}"
         L.append(row2(left,right,W))
-        # ── detail rows (aligned labels)
+        # ── identity + lineage (what the Pilot asked to see first) ──
+        sid=os.path.basename(jf)[:-6]   # strip .jsonl → session uuid
+        L.append(label("id",f"{c(sid[:8],CYAN)} · pid {p['pid']} · branch {branch or '-'}"))
+        cr=p.get("creator")
+        L.append(label("from", cr[0] if cr else c("you — started at a terminal",DIM)))
+        # ── activity ──
         prompt,action=last_prompt_and_action(jf)
         showprompt = prompt and not prompt.lstrip().startswith("<")   # skip noisy task/system tags
         if showprompt:
@@ -396,7 +405,7 @@ def render(include_idle=False, max_idle=300):
         if action and not (action[0]=="👤" and showprompt):           # don't echo the prompt as "now"
             L.append(label("now",f"{action[0]} {trunc(action[1],W-14)}"))
         L.append(label("stats",
-            f"{st['turns']} turns · {fmt_tok(io)} io · {c(money(cost)+' api-eq',GREEN)} · {p['rss']:.0f}MB · {branch or '-'}"))
+            f"{st['turns']} turns · {fmt_tok(io)} io · {p['rss']:.0f}MB"))
         # ── agent tree
         live=subs if include_idle else [s for s in subs if s[0]<max_idle]
         for i,(sage,sf) in enumerate(live):
@@ -407,9 +416,9 @@ def render(include_idle=False, max_idle=300):
             L.append(label("agents" if i==0 else "",
                 f"{c(tee,GREY)} {dot(sage)} {c(aid,CYAN)} {trunc(txt,W-27)} {c(fmt_age(sage),DIM)}"))
         L.append("")    # blank line between sessions
+    L.append(c(" id=session uuid · pid · git branch    from=who spawned it (BT/project, or you)",DIM))
     L.append(c(" ⧗=time until the rolling 5h rate-limit window resets (via ccusage) — not quota remaining",DIM))
     L.append(c(" up=process uptime · convo=conversation span (resumed) · io=fresh in+out tokens",DIM))
-    L.append(c(" api-eq=API-equivalent $ at list price (incl cache + sub-agents) — Pilot is on MAX flat-rate, NOT billed this",DIM))
     return "\n".join(L)
 
 def main():
