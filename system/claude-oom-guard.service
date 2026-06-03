@@ -1,0 +1,14 @@
+[Unit]
+Description=Kill the idlest Claude session under memory pressure (keeps this 7.5 GiB laptop from livelock-freezing when sessions run unattended)
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/claude-oom-guard
+Restart=always
+RestartSec=5
+# the guard itself must never be an OOM target
+OOMScoreAdjust=-800
+
+[Install]
+WantedBy=default.target

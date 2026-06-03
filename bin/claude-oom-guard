@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""claude-oom-guard — keep this 7.5 GiB laptop alive when Claude sessions run unattended.
+
+The freeze pattern: several `claude` sessions keep working autonomously when the
+Pilot leaves (retrying, spawning subagents, compacting context = loading the whole
+transcript into RAM). earlyoom protects them and prefers Firefox — but once Firefox
+is gone the only hogs left are the protected Claudes, earlyoom has nothing safe to
+kill, and the box livelock-freezes.
+
+This guard fills that gap. It watches MemAvailable; when it crosses a line it kills
+the *idlest* Claude session — the one whose transcript hasn't been written to in a
+while (genuinely idle, not the one mid-task) — instead of the fattest. The killed
+session is recoverable with `claude --resume`. earlyoom still handles Firefox first;
+this only fires when Claudes are the problem.
+
+Pure stdlib. Run as a user systemd service (claude-oom-guard.service). Tunables below.
+Log: ~/.local/state/claude-oom-guard.log
+"""
+import os, re, time, signal, glob, pathlib, sys
+
+# ---- tunables ----------------------------------------------------------------
+INTERVAL      = 15      # seconds between checks
+WARN_PCT      = 12.0    # MemAvailable% below this -> kill the idlest *idle* Claude
+CRIT_PCT      = 7.0     # below this -> kill the idlest Claude even if recently active
+MIN_IDLE_WARN = 90      # at WARN level, only kill a Claude idle >= this many seconds
+COOLDOWN      = 45      # seconds to wait after a kill before acting again
+PROJECTS      = os.path.expanduser("~/.claude/projects")
+STATE_LOG     = os.path.expanduser("~/.local/state/claude-oom-guard.log")
+# ------------------------------------------------------------------------------
+
+def log(msg):
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
+    try:
+        os.makedirs(os.path.dirname(STATE_LOG), exist_ok=True)
+        with open(STATE_LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    print(line, flush=True)
+
+def mem_available_pct():
+    total = avail = None
+    with open("/proc/meminfo") as f:
+        for ln in f:
+            if ln.startswith("MemTotal:"):     total = int(ln.split()[1])
+            elif ln.startswith("MemAvailable:"): avail = int(ln.split()[1])
+            if total and avail: break
+    if not total:
+        return 100.0
+    return 100.0 * avail / total
+
+def claude_main_procs():
+    """Return [(pid, cwd, rss_kb)] for main `claude` session processes (not -p/print agents)."""
+    out = []
+    for d in glob.glob("/proc/[0-9]*"):
+        pid = os.path.basename(d)
+        try:
+            with open(f"{d}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+            argv = [a.decode("utf-8", "replace") for a in argv if a]
+            if not argv:
+                continue
+            base = os.path.basename(argv[0])
+            # main interactive session: argv[0] is `claude`; skip one-shot `-p/--print` agents
+            if base != "claude":
+                continue
+            if any(a in ("-p", "--print") for a in argv):
+                continue
+            cwd = os.readlink(f"{d}/cwd")
+            rss = 0
+            with open(f"{d}/statm") as f:
+                rss = int(f.read().split()[1]) * (os.sysconf("SC_PAGE_SIZE") // 1024)
+            out.append((int(pid), cwd, rss))
+        except (OSError, ValueError, ProcessLookupError):
+            continue
+    return out
+
+def newest_transcript_mtime(cwd):
+    """Most recent transcript mtime for the session running in `cwd` (munged project dir)."""
+    munged = cwd.replace("/", "-")
+    pdir = os.path.join(PROJECTS, munged)
+    best = 0.0
+    try:
+        for jf in glob.glob(os.path.join(pdir, "*.jsonl")):
+            try:
+                m = os.path.getmtime(jf)
+                if m > best:
+                    best = m
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return best
+
+def pick_victim(procs, now, require_idle):
+    """Pick the Claude whose transcript is stalest (most idle). Returns (pid, cwd, idle_s, rss)."""
+    ranked = []
+    for pid, cwd, rss in procs:
+        mt = newest_transcript_mtime(cwd)
+        idle = (now - mt) if mt else 1e9   # no transcript found -> treat as very idle
+        ranked.append((idle, pid, cwd, rss))
+    if not ranked:
+        return None
+    ranked.sort(reverse=True)   # most idle first
+    idle, pid, cwd, rss = ranked[0]
+    if require_idle is not None and idle < require_idle:
+        return None
+    return (pid, cwd, idle, rss)
+
+def notify(title, body):
+    try:
+        os.spawnlp(os.P_NOWAIT, "notify-send", "notify-send", "-a", "claude-oom-guard",
+                   "-u", "critical", "-i", "dialog-warning", title, body)
+    except OSError:
+        pass
+
+def main():
+    log(f"started (warn<{WARN_PCT}% crit<{CRIT_PCT}% interval {INTERVAL}s)")
+    last_kill = 0.0
+    while True:
+        try:
+            pct = mem_available_pct()
+            now = time.time()
+            if pct < WARN_PCT and (now - last_kill) > COOLDOWN:
+                procs = claude_main_procs()
+                if len(procs) >= 1:
+                    crit = pct < CRIT_PCT
+                    require_idle = None if crit else MIN_IDLE_WARN
+                    victim = pick_victim(procs, now, require_idle)
+                    if victim:
+                        pid, cwd, idle, rss = victim
+                        proj = os.path.basename(cwd) or cwd
+                        reason = "CRIT" if crit else "warn"
+                        log(f"[{reason}] mem {pct:.1f}% — killing idlest claude pid {pid} "
+                            f"({proj}, idle {int(idle)}s, {rss//1024}MB)")
+                        notify("Claude session stopped to save RAM",
+                               f"Killed the idlest session ({proj}, idle {int(idle//60)}m). "
+                               f"Resume with: claude --resume")
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                            last_kill = now
+                        except ProcessLookupError:
+                            pass
+                    elif crit:
+                        log(f"[CRIT] mem {pct:.1f}% but no killable claude found")
+        except Exception as e:  # never let the guard die silently
+            log(f"error: {e!r}")
+        time.sleep(INTERVAL)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
