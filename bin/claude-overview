@@ -205,6 +205,13 @@ def project_of_top(top):
     if top.startswith(home+"-"): return top[len(home)+1:]
     return top.lstrip("-") or top
 def trunc(s,n): return s if len(s)<=n else s[:n-1]+"…"
+def row2(left,right,width):           # left-aligned + right-aligned to width (ANSI-aware)
+    gap=width-len_visible(left)-len_visible(right)
+    return left+" "*max(1,gap)+right
+def label(lbl,text,lblcolor=DIM):     # aligned dim label + content
+    return c("    "+lbl.ljust(7),lblcolor)+text
+def money(cost):
+    return ("~$%.0f"%cost) if cost>=10 else ("~$%.2f"%cost)
 
 # ── model of a project/session ──────────────────────────────────────────────────────
 def newest_transcripts_by_project():
@@ -289,21 +296,29 @@ def render(include_idle=False, max_idle=300):
         for line in reversed(tail_lines(jf,8192)):
             try: branch=(json.loads(line).get("gitBranch") or ""); break
             except Exception: continue
-        meta=(f"{c(short_model(model) if model else '—',BLUE)} · {trunc(branch or '-',20)} · {st['turns']}t · "
-              f"up {fmt_age(p['age'])}{spantag} · {fmt_tok(io)} io {c('+'+fmt_tok(tcr)+' cache',DIM)} · "
-              f"{c('~$%.2f'%cost,GREEN)}")
-        L.append(f" {dot(age)} {c(proj,BOLD)}{tag}  {meta}{c('  %.0fMB'%p['rss'],DIM)}")
+        # ── header row: ● project ......................... model · up Xh
+        bgtag=c("◆ bg · ",MAGENTA) if p["kind"]=="print-agent" else ""
+        left=f" {dot(age)}  {c(proj,BOLD)}"
+        right=f"{bgtag}{c(short_model(model) if model else '—',BLUE)} · up {fmt_age(p['age'])}{spantag}"
+        L.append(row2(left,right,W))
+        # ── detail rows (aligned labels)
         prompt,action=last_prompt_and_action(jf)
-        if prompt: L.append(c("     prompt ▸ ",DIM)+trunc(prompt,W-14))
-        if action: L.append(c("     now    ▸ ",DIM)+f"{action[0]} {trunc(action[1],W-16)}")
+        if prompt and not prompt.lstrip().startswith("<"):       # skip noisy task/system tags
+            L.append(label("prompt",trunc(prompt,W-12)))
+        if action:
+            L.append(label("now",f"{action[0]} {trunc(action[1],W-14)}"))
+        L.append(label("stats",
+            f"{st['turns']} turns · {fmt_tok(io)} io · {c(money(cost),GREEN)} · {p['rss']:.0f}MB · {branch or '-'}"))
+        # ── agent tree
         live=subs if include_idle else [s for s in subs if s[0]<max_idle]
         for i,(sage,sf) in enumerate(live):
-            tee="└─" if i==len(live)-1 else "├─"
+            tee="└" if i==len(live)-1 else "├"
             _,sact=last_prompt_and_action(sf)
             aid=os.path.basename(sf).replace("agent-","")[:8]
             txt=f"{sact[0]} {sact[1]}" if sact else ""
-            L.append(f"       {c(tee,GREY)} {dot(sage)} {c(aid,CYAN)} {trunc(txt,W-24)} {c(fmt_age(sage),DIM)}")
-    L.append("")
+            L.append(label("agents" if i==0 else "",
+                f"{c(tee,GREY)} {dot(sage)} {c(aid,CYAN)} {trunc(txt,W-27)} {c(fmt_age(sage),DIM)}"))
+        L.append("")    # blank line between sessions
     L.append(c(" up=this process's uptime · convo=conversation calendar span (resumed) · t=human turns",DIM))
     L.append(c(" io=fresh in+out · cache=cache-read (cheap) · ~$=rough LIFETIME est, list price incl cache+subagents",DIM))
     return "\n".join(L)
