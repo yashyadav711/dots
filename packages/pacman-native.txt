@@ -199,6 +199,7 @@ remmina
 ripgrep
 ristretto
 rofi
+rofimoji
 rsync
 s-nail
 satty
@@ -245,6 +246,7 @@ wl-clipboard
 wlogout
 wofi
 wpa_supplicant
+wtype
 xcursor-hackneyed-dark
 xdg-desktop-portal-gtk
 xdg-desktop-portal-hyprland
