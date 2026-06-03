@@ -427,10 +427,13 @@ setw -g monitor-bell on
 # Now: drag-select in a pane auto-copies to the Wayland clipboard via wl-copy and
 # clears the selection. `y` in copy-mode does the same. Paste anywhere with Ctrl+V.
 # (Still works: hold Shift while dragging to bypass tmux for kitty-native selection.)
-bind -T copy-mode    MouseDragEnd1Pane send -X copy-pipe-and-cancel "wl-copy"
-bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel "wl-copy"
-bind -T copy-mode    y send -X copy-pipe-and-cancel "wl-copy"
-bind -T copy-mode-vi y send -X copy-pipe-and-cancel "wl-copy"
+# copy to BOTH the clipboard (Ctrl+V) and the primary selection (middle-click).
+# capture stdin once then write it to both — a plain `wl-copy; wl-copy --primary`
+# would feed the 2nd command empty stdin (the 1st already drained the pipe).
+bind -T copy-mode    MouseDragEnd1Pane send -X copy-pipe-and-cancel "bash -c 'd=$(cat); printf %s \"$d\" | wl-copy; printf %s \"$d\" | wl-copy --primary'"
+bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel "bash -c 'd=$(cat); printf %s \"$d\" | wl-copy; printf %s \"$d\" | wl-copy --primary'"
+bind -T copy-mode    y send -X copy-pipe-and-cancel "bash -c 'd=$(cat); printf %s \"$d\" | wl-copy; printf %s \"$d\" | wl-copy --primary'"
+bind -T copy-mode-vi y send -X copy-pipe-and-cancel "bash -c 'd=$(cat); printf %s \"$d\" | wl-copy; printf %s \"$d\" | wl-copy --primary'"
 set -g set-clipboard on
 # ------------------------------------------------------------------------------
 
