@@ -30,8 +30,12 @@ def len_visible(s): return len(_ansi.sub("",s))
 def pad_visible(s,width):
     return s+" "*max(0,width-len_visible(s))
 
-# rough public list prices per 1M tokens: (input, output, cache_read, cache_write)
-PRICING={"opus":(15.0,75.0,1.50,18.75),"sonnet":(3.0,15.0,0.30,3.75),"haiku":(0.80,4.0,0.08,1.0)}
+# public API list prices per 1M tokens: (input, output, cache_read, cache_write_5m)
+# source: platform.claude.com/docs/.../pricing — verified 2026-06-03 (PM-BT research).
+# NOTE: the Pilot is on a Claude MAX subscription (flat ~$200/mo), NOT API billing — so
+# the $ figure below is "API-equivalent" (what this token volume WOULD cost at API rates),
+# not an actual charge. Token volume is the real signal; dollars are a reference only.
+PRICING={"opus":(5.0,25.0,0.50,6.25),"sonnet":(3.0,15.0,0.30,3.75),"haiku":(1.0,5.0,0.10,1.25)}
 def price_key(model):
     m=(model or "").lower()
     return "opus" if "opus" in m else "sonnet" if "sonnet" in m else "haiku" if "haiku" in m else "opus"
@@ -309,7 +313,7 @@ def render(include_idle=False, max_idle=300):
         if action and not (action[0]=="👤" and showprompt):           # don't echo the prompt as "now"
             L.append(label("now",f"{action[0]} {trunc(action[1],W-14)}"))
         L.append(label("stats",
-            f"{st['turns']} turns · {fmt_tok(io)} io · {c(money(cost),GREEN)} · {p['rss']:.0f}MB · {branch or '-'}"))
+            f"{st['turns']} turns · {fmt_tok(io)} io · {c(money(cost)+' api-eq',GREEN)} · {p['rss']:.0f}MB · {branch or '-'}"))
         # ── agent tree
         live=subs if include_idle else [s for s in subs if s[0]<max_idle]
         for i,(sage,sf) in enumerate(live):
@@ -321,7 +325,7 @@ def render(include_idle=False, max_idle=300):
                 f"{c(tee,GREY)} {dot(sage)} {c(aid,CYAN)} {trunc(txt,W-27)} {c(fmt_age(sage),DIM)}"))
         L.append("")    # blank line between sessions
     L.append(c(" up=process uptime · convo=conversation span (resumed) · io=fresh in+out tokens",DIM))
-    L.append(c(" ~$=rough lifetime cost estimate (list price, incl cache + sub-agents) — not a bill",DIM))
+    L.append(c(" api-eq=API-equivalent $ at list price (incl cache + sub-agents) — Pilot is on MAX flat-rate, NOT billed this",DIM))
     return "\n".join(L)
 
 def main():
