@@ -1,0 +1,5 @@
+iptables-nft
+notion-app-electron
+swww
+xfce4-datetime-plugin
+xfwm4-themes
