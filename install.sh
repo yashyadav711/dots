@@ -46,6 +46,7 @@ link tmux/.tmux.conf.local            "$HOME/.tmux.conf.local"
 
 echo "==> [4/4] System config (apply manually with sudo)"
 echo "  earlyoom (anti-freeze OOM daemon):  sudo cp $DOTS/system/earlyoom.conf /etc/default/earlyoom && sudo systemctl enable --now earlyoom"
+echo "  faillock (looser sudo lockout):     sudo install -m644 $DOTS/system/faillock.conf /etc/security/faillock.conf"
 
 cat <<'NOTE'
 
