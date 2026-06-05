@@ -226,12 +226,12 @@ alias setupproject='bash -c "$(curl -fsSL https://raw.githubusercontent.com/yash
 
 # jump into HeyDaddy and resume Claude (YOLO / skip permission prompts)
 alias heydaddy='cd /home/yash/Github/heydaddy && claude --dangerously-skip-permissions --resume'
-# launch home-BT in ~ and resume (YOLO / skip permission prompts)
-alias home-bt='cd ~ && claude --dangerously-skip-permissions --resume'
+# launch Envy in ~ and resume (YOLO / skip permission prompts)
+alias envy='cd ~ && claude --dangerously-skip-permissions --resume'
 # jump into the mirror project and resume Claude (YOLO / skip permission prompts)
 alias mirror='cd /home/yash/Github/mirror && claude --dangerously-skip-permissions --resume'
-# jump into the product-manager project (PM-BT) and resume Claude (YOLO / skip permission prompts)
-alias PM-BT='cd /home/yash/Github/product-manager && claude --dangerously-skip-permissions --resume'
+# jump into the product-manager project (PM) and resume Claude (YOLO / skip permission prompts)
+alias pm='cd /home/yash/Github/product-manager && claude --dangerously-skip-permissions --resume'
 # typing /exit (slash-command muscle memory) expands to exit
 abbr -a -- /exit exit
 
