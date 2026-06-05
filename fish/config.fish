@@ -251,3 +251,7 @@ function fastfetch
         command fastfetch --logo-type kitty $argv
     end
 end
+
+
+# Added by Antigravity CLI installer
+set -gx PATH "/home/yash/.local/bin" $PATH
