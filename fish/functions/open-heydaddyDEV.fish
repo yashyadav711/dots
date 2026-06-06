@@ -2,6 +2,7 @@ function open-heydaddyDEV
     set -l HD /home/yash/Github/heydaddy
     set -l BLOG /tmp/hd-backend-local.log
     set -l FLOG /tmp/hd-frontend-local.log
+    set -l SLOG /tmp/hd-supabase-start.log
 
     function _hd_kill
         pkill -f "uvicorn backend.main" 2>/dev/null
@@ -17,7 +18,6 @@ function open-heydaddyDEV
     end
 
     function _hd_port_up
-        # matches ":8000" anywhere in ss output (covers 0.0.0.0:8000, :::8000, etc.)
         ss -tln 2>/dev/null | grep -q ":$argv[1]"
     end
 
@@ -39,8 +39,9 @@ function open-heydaddyDEV
         echo "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         set_color normal
         echo ""
-        printf "    Backend  :8000   "; _hd_dot 8000; echo ""
-        printf "    Frontend :3000   "; _hd_dot 3000; echo ""
+        printf "    Backend   :8000   "; _hd_dot 8000; echo ""
+        printf "    Frontend  :3000   "; _hd_dot 3000; echo ""
+        printf "    Supabase  :54321  "; _hd_dot 54321; echo ""
         echo ""
         set_color brblack
         echo "  ─────────────────────────────────────"
@@ -50,9 +51,10 @@ function open-heydaddyDEV
         echo "    3)  Errors only        (q to return)"
         echo "    4)  Peek last 40 lines (both logs)"
         echo "    5)  Open browser  →  :3000"
-        echo "    6)  Restart servers"
-        echo "    7)  Stop servers"
-        echo "    8)  Exit  (servers keep running)"
+        echo "    6)  Restart app servers"
+        echo "    7)  Start Supabase"
+        echo "    8)  Stop servers"
+        echo "    9)  Exit  (servers keep running)"
         set_color brblack
         echo "  ─────────────────────────────────────"
         set_color normal
@@ -91,20 +93,29 @@ function open-heydaddyDEV
                 set_color green; echo "  Opened → http://localhost:3000"; set_color normal
                 sleep 1
             case 6
-                set_color yellow; echo "  Restarting..."; set_color normal
+                set_color yellow; echo "  Restarting app servers..."; set_color normal
                 _hd_kill
                 _hd_start
                 set_color cyan; echo "  Starting... (waiting 4s)"; set_color normal
                 sleep 4
             case 7
-                _hd_kill
-                set_color green; echo "  Stopped."; set_color normal
-                return
+                if _hd_port_up 54321
+                    set_color green; echo "  Supabase already running on :54321"; set_color normal
+                else
+                    set_color yellow; echo "  Starting Supabase... (this takes ~60s)"; set_color normal
+                    fish -c "cd $HD; supabase start 2>&1 | tee $SLOG" &
+                    set_color cyan; echo "  Running in background — check status in a few seconds (menu refreshes)"; set_color normal
+                    sleep 5
+                end
             case 8
+                _hd_kill
+                set_color green; echo "  App servers stopped. (Supabase keeps running — use 'supabase stop' to kill it)"; set_color normal
+                return
+            case 9
                 set_color green; echo "  Bye — servers at :3000 / :8000."; set_color normal
                 return
             case '*'
-                set_color brred; echo "  Enter 1–8."; set_color normal
+                set_color brred; echo "  Enter 1–9."; set_color normal
                 sleep 0.3
         end
     end
