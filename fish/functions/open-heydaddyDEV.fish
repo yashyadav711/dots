@@ -13,7 +13,7 @@ function open-heydaddyDEV
     function _hd_start --inherit-variable HD --inherit-variable BLOG --inherit-variable FLOG
         printf '' >$BLOG
         printf '' >$FLOG
-        fish -c "cd $HD; env FRONTEND_URL=http://localhost:3000 $HD/.venv/bin/python -m uvicorn backend.main:app --reload --port 8000 >>$BLOG 2>&1" &
+        fish -c "cd $HD; env FRONTEND_URL=http://localhost:3000 $HD/.venv/bin/python -m uvicorn backend.main:app --reload --reload-dir $HD/backend --reload-dir $HD/config --port 8000 >>$BLOG 2>&1" &
         fish -c "cd $HD/frontend; npm run dev >>$FLOG 2>&1" &
     end
 
@@ -103,7 +103,7 @@ function open-heydaddyDEV
                 set_color yellow; echo "  Starting backend only..."; set_color normal
                 pkill -f "uvicorn backend.main" 2>/dev/null; sleep 0.3
                 printf '' >$BLOG
-                fish -c "cd $HD; env FRONTEND_URL=http://localhost:3000 $HD/.venv/bin/python -m uvicorn backend.main:app --reload --port 8000 >>$BLOG 2>&1" &
+                fish -c "cd $HD; env FRONTEND_URL=http://localhost:3000 $HD/.venv/bin/python -m uvicorn backend.main:app --reload --reload-dir $HD/backend --reload-dir $HD/config --port 8000 >>$BLOG 2>&1" &
                 set_color cyan; echo "  Backend starting... (waiting 4s, then check logs with 1 if still STOPPED)"; set_color normal
                 sleep 4
             case 8
