@@ -24,12 +24,13 @@ function open-heydaddyDEV
         set -l max $argv[2]
         set -l i 0
         while test $i -lt $max
-            if ss -tln 2>/dev/null | grep -q ":$port"
+            set -l result (ss -tln 2>/dev/null | grep ":$port")
+            if test -n "$result"
                 return 0
             end
             printf "."
             sleep 1
-            set i (math $i + 1)
+            set i (math "$i + 1")
         end
         return 1
     end
@@ -77,8 +78,8 @@ function open-heydaddyDEV
 
     function _hd_boot --inherit-variable HD --inherit-variable BLOG --inherit-variable FLOG
         _hd_start
-        printf "  Waiting for backend"
-        if _hd_wait_port 8000 20
+        printf "  Waiting for backend (schema check ~20s on cloud Supabase)"
+        if _hd_wait_port 8000 45
             echo ""
             set_color green; echo "  ✅ Backend up"; set_color normal
         else
