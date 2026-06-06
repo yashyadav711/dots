@@ -51,10 +51,11 @@ function open-heydaddyDEV
         echo "    3)  Errors only        (q to return)"
         echo "    4)  Peek last 40 lines (both logs)"
         echo "    5)  Open browser  →  :3000"
-        echo "    6)  Restart app servers"
-        echo "    7)  Start Supabase"
-        echo "    8)  Stop servers"
-        echo "    9)  Exit  (servers keep running)"
+        echo "    6)  Restart app servers (backend + frontend)"
+        echo "    7)  Start backend only"
+        echo "    8)  Start Supabase"
+        echo "    9)  Stop servers"
+        echo "    0)  Exit  (servers keep running)"
         set_color brblack
         echo "  ─────────────────────────────────────"
         set_color normal
@@ -99,19 +100,26 @@ function open-heydaddyDEV
                 set_color cyan; echo "  Starting... (waiting 4s)"; set_color normal
                 sleep 4
             case 7
+                set_color yellow; echo "  Starting backend only..."; set_color normal
+                pkill -f "uvicorn backend.main" 2>/dev/null; sleep 0.3
+                printf '' >$BLOG
+                fish -c "cd $HD; env FRONTEND_URL=http://localhost:3000 $HD/.venv/bin/python -m uvicorn backend.main:app --reload --port 8000 >>$BLOG 2>&1" &
+                set_color cyan; echo "  Backend starting... (waiting 4s, then check logs with 1 if still STOPPED)"; set_color normal
+                sleep 4
+            case 8
                 if _hd_port_up 54321
                     set_color green; echo "  Supabase already running on :54321"; set_color normal
                 else
                     set_color yellow; echo "  Starting Supabase... (this takes ~60s)"; set_color normal
                     fish -c "cd $HD; supabase start 2>&1 | tee $SLOG" &
-                    set_color cyan; echo "  Running in background — check status in a few seconds (menu refreshes)"; set_color normal
+                    set_color cyan; echo "  Running in background — check status in a few seconds"; set_color normal
                     sleep 5
                 end
-            case 8
+            case 9
                 _hd_kill
                 set_color green; echo "  App servers stopped. (Supabase keeps running — use 'supabase stop' to kill it)"; set_color normal
                 return
-            case 9
+            case 0
                 set_color green; echo "  Bye — servers at :3000 / :8000."; set_color normal
                 return
             case '*'
