@@ -4,10 +4,8 @@ function open-heydaddyDEV
     set -l FLOG /tmp/hd-frontend-local.log
 
     function _hd_kill
-        set -l bp (lsof -ti:8000 2>/dev/null)
-        set -l fp (lsof -ti:3000 2>/dev/null)
-        test (count $bp) -gt 0; and kill $bp 2>/dev/null
-        test (count $fp) -gt 0; and kill $fp 2>/dev/null
+        pkill -f "uvicorn backend.main" 2>/dev/null
+        pkill -f "next dev" 2>/dev/null
         sleep 0.5
     end
 
