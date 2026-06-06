@@ -17,7 +17,8 @@ function open-heydaddyDEV
     end
 
     function _hd_port_up
-        ss -tln 2>/dev/null | grep -q ":$argv[1] "
+        # matches ":8000" anywhere in ss output (covers 0.0.0.0:8000, :::8000, etc.)
+        ss -tln 2>/dev/null | grep -q ":$argv[1]"
     end
 
     function _hd_dot
@@ -44,9 +45,9 @@ function open-heydaddyDEV
         set_color brblack
         echo "  ─────────────────────────────────────"
         set_color normal
-        echo "    1)  Backend logs       (live tail)"
-        echo "    2)  Frontend logs      (live tail)"
-        echo "    3)  Errors only        (live tail)"
+        echo "    1)  Backend logs       (q to return)"
+        echo "    2)  Frontend logs      (q to return)"
+        echo "    3)  Errors only        (q to return)"
         echo "    4)  Peek last 40 lines (both logs)"
         echo "    5)  Open browser  →  :3000"
         echo "    6)  Restart servers"
@@ -69,14 +70,14 @@ function open-heydaddyDEV
         echo ""
         switch $choice
             case 1
-                set_color yellow; echo "  Backend logs — Ctrl+C to return to menu"; set_color normal; echo ""
-                tail -f $BLOG
+                set_color yellow; echo "  Backend logs — press q to return to menu"; set_color normal; echo ""
+                less -R +F $BLOG
             case 2
-                set_color yellow; echo "  Frontend logs — Ctrl+C to return to menu"; set_color normal; echo ""
-                tail -f $FLOG
+                set_color yellow; echo "  Frontend logs — press q to return to menu"; set_color normal; echo ""
+                less -R +F $FLOG
             case 3
-                set_color yellow; echo "  Errors/warnings — Ctrl+C to return"; set_color normal; echo ""
-                tail -f $BLOG | grep --line-buffered -i "error\|exception\|traceback\|warn\|fail"
+                set_color yellow; echo "  Errors/warnings — press q to return"; set_color normal; echo ""
+                grep -i "error\|exception\|traceback\|warn\|fail" $BLOG | less -R
             case 4
                 set_color cyan; echo "  ── Backend (last 40) ──────────────────"; set_color normal
                 tail -40 $BLOG
