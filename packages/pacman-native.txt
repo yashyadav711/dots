@@ -6,6 +6,7 @@ alsa-utils
 ark
 arp-scan
 awesome-terminal-fonts
+awww
 ayugram-desktop
 base
 base-devel
@@ -17,6 +18,7 @@ bluez-hid2hci
 bluez-libs
 bluez-obex
 bluez-utils
+brave-bin
 brightnessctl
 btop
 btrfs-assistant
@@ -44,6 +46,7 @@ chafa
 chaotic-keyring
 chaotic-mirrorlist
 chwd
+claude-desktop-bin
 cliphist
 code
 cpupower
@@ -75,6 +78,7 @@ file-roller
 firefox
 flatpak
 fsarchiver
+fuse2
 galculator
 garcon
 git
@@ -97,6 +101,7 @@ gvfs-mtp
 gvfs-nfs
 gvfs-smb
 hdparm
+htop
 hwdetect
 hwinfo
 hypridle
@@ -108,6 +113,7 @@ inetutils
 intel-media-driver
 intel-media-sdk
 intel-ucode
+iptables
 iwd
 jfsutils
 kde-cli-tools
@@ -160,6 +166,7 @@ npm
 nss-mdns
 nwg-displays
 nwg-look
+obsidian
 octopi
 opencl-mesa
 openssh
@@ -237,6 +244,7 @@ vim
 vlc-plugins-all
 vulkan-intel
 waybar
+wev
 wget
 which
 wireless-regdb
