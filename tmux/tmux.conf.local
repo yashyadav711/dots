@@ -417,8 +417,11 @@ bind R source-file ~/.tmux.conf \; display-message "tmux config reloaded"   # re
 # Bell -> 🔔 on the window tab. Claude rings BEL (Stop/Notification hooks in ~/.claude/settings.json);
 # tmux flags it as 🔔 (glyph already in window_status_format). `other` = flag only background windows,
 # so the window you're actively in never beeps/flags — you only see 🔔 on a window that wants you.
-set -g bell-action other
+set -g bell-action any
 setw -g monitor-bell on
+set -g visual-bell off
+setw -g monitor-activity on
+set -g visual-activity both
 
 # Mouse-select -> system clipboard (Wayland). Two problems this fixes:
 #  1) `mouse on` makes a drag select into tmux's OWN buffer, not the terminal's.
