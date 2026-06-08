@@ -281,15 +281,20 @@ function fish_greeting
             set -l dirty (git -C "$path" status --porcelain 2>/dev/null | wc -l | string trim)
             test -z "$branch"; and set branch "?"
             test -z "$hash"; and set hash "---"
-            set msg (string sub -l 42 "$msg")
+            set branch (string sub -l 18 "$branch")
+            set msg (string sub -l 35 "$msg")
 
-            if test "$dirty" -gt 0
-                set -l dot "$cr●$cn"
+            set -l dot
+            if test "$dirty" -gt 0 2>/dev/null
+                set dot "$cr●$cn"
             else
-                set -l dot "$cg○$cn"
+                set dot "$cg○$cn"
             end
 
-            echo "$cb  │$cn  $cl$label$cn $dot  $cy$branch$cn  $cg$hash$cn  $msg"
+            printf "%s  │%s  %s%-9s%s %s%s%-18s%s  %s%s%s  %s\n" \
+                "$cb" "$cn" "$cl" "$label" "$cn" \
+                "$dot" "$cy" "$branch" "$cn" \
+                "$cg" "$hash" "$cn" "$msg"
         end
     end
 
