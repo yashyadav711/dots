@@ -255,6 +255,11 @@ end
 # Added by Antigravity CLI installer
 set -gx PATH "/home/yash/.local/bin" $PATH
 
+# Gemini wrapper — always loads ~/Github/gemini/GEMINI.md as context
+function gemini
+    command gemini --include-directories /home/yash/Github/gemini $argv
+end
+
 # NHQ startup greeting — fastfetch + git status of all three repos
 function fish_greeting
     fastfetch
