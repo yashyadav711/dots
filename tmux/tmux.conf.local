@@ -417,7 +417,11 @@ bind p previous-window      # prefix p -> previous window (was paste-buffer; pas
 bind -T root MouseDown1Status select-window -t =   # click a window name to switch (was switch-client = no-op)
 bind t new-window -c "#{pane_current_path}"        # prefix t -> new window in same dir (was clock-mode)
 bind r command-prompt -I "#W" { rename-window "%%" }            # prefix r -> rename window (was reload)
-bind T run-shell '~/.config/tmux/new-named-window.sh'          # prefix T -> new window with auto-name
+unbind N
+bind N run-shell '~/.config/tmux/new-named-window.sh'
+unbind ,
+bind , previous-window
+bind . next-window
 bind R source-file ~/.tmux.conf \; display-message "tmux config reloaded"   # reload moved to prefix R
 
 # Bell -> 🔔 on the window tab. Claude rings BEL (Stop/Notification hooks in ~/.claude/settings.json);
