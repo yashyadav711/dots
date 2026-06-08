@@ -50,8 +50,7 @@ set -x TERM kitty
 # Terminal capabilities
 set TERM "xterm-256color"
 
-# Disable default greeting message
-set fish_greeting
+# Greeting defined as function below — NHQ block fires on shell start
 
 # Prevent path compression in prompt
 set fish_prompt_pwd_dir_length 0
@@ -255,3 +254,45 @@ end
 
 # Added by Antigravity CLI installer
 set -gx PATH "/home/yash/.local/bin" $PATH
+
+# NHQ startup greeting — fastfetch + git status of all three repos
+function fish_greeting
+    fastfetch
+    echo ""
+
+    set -l cb (set_color brmagenta)
+    set -l cl (set_color --bold brcyan)
+    set -l cy (set_color bryellow)
+    set -l cg (set_color brgreen)
+    set -l cr (set_color brred)
+    set -l cn (set_color normal)
+
+    echo "$cb  ╭─── NetrunnersHQ ─────────────────────────────────────╮$cn"
+
+    for entry in "HeyDaddy |/home/yash/Github/heydaddy" "Mirror   |/home/yash/Github/mirror" "PM       |/home/yash/Github/product-manager"
+        set -l parts (string split "|" $entry)
+        set -l label $parts[1]
+        set -l path $parts[2]
+
+        if test -d "$path"
+            set -l branch (git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null)
+            set -l hash (git -C "$path" log -1 --format="%h" 2>/dev/null)
+            set -l msg (git -C "$path" log -1 --format="%s" 2>/dev/null)
+            set -l dirty (git -C "$path" status --porcelain 2>/dev/null | wc -l | string trim)
+            test -z "$branch"; and set branch "?"
+            test -z "$hash"; and set hash "---"
+            set msg (string sub -l 42 "$msg")
+
+            if test "$dirty" -gt 0
+                set -l dot "$cr●$cn"
+            else
+                set -l dot "$cg○$cn"
+            end
+
+            echo "$cb  │$cn  $cl$label$cn $dot  $cy$branch$cn  $cg$hash$cn  $msg"
+        end
+    end
+
+    echo "$cb  ╰──────────────────────────────────────────────────────╯$cn"
+    echo ""
+end
