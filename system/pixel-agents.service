@@ -1,0 +1,16 @@
+[Unit]
+Description=Pixel Agents — Claude Code visual dashboard (port 2077)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/yash/Github/pixel-agents-standalone
+ExecStart=/usr/bin/node /home/yash/Github/pixel-agents-standalone/dist/server.js
+Environment=PORT=2077
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
