@@ -47,6 +47,9 @@ set -x EDITOR vim
 set -x VISUAL vim
 set -x TERM kitty
 
+# Antigravity CLI — route through rotator proxy
+set -gx AGY_ENDPOINT http://localhost:51200
+
 # Terminal capabilities
 set TERM "xterm-256color"
 
