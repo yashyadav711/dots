@@ -1,0 +1,18 @@
+[Unit]
+Description=pi-antigravity-rotator proxy server
+Documentation=https://github.com/tuxevil/pi-antigravity-rotator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Github/pi-antigravity-rotator
+ExecStart=/usr/bin/npm start
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pi-antigravity-rotator
+
+[Install]
+WantedBy=default.target
