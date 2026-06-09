@@ -233,7 +233,7 @@ alias envy='cd ~ && claude --dangerously-skip-permissions --resume'
 # jump into the mirror project and resume Claude (YOLO / skip permission prompts)
 alias mirror='cd /home/yash/Github/mirror && claude --dangerously-skip-permissions --resume'
 # jump into the product-manager project (PM) and resume Claude (YOLO / skip permission prompts)
-alias pm='cd /home/yash/Github/product-manager && claude --dangerously-skip-permissions --resume'
+alias pm='cd ~/Github/product-manager && claude --model sonnet --name PM --dangerously-skip-permissions'
 # typing /exit (slash-command muscle memory) expands to exit
 abbr -a -- /exit exit
 
