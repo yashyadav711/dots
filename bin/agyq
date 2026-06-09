@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""agyq — live per-account quota view from pi-antigravity-rotator."""
+import json, sys, urllib.request, datetime
+
+URL = "http://localhost:51200/api/status"
+MODELS = ["claude-opus-4-6-thinking", "gemini-3.1-pro", "gemini-3.5-flash"]
+GRN, YLW, RED, DIM, RST, BOLD = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m", "\033[1m"
+
+def qbar(pct):
+    if pct is None:
+        return f"{DIM}─────  n/a{RST}"
+    p = int(pct)
+    filled = min(5, p // 20)
+    bar = "▓" * filled + "░" * (5 - filled)
+    col = GRN if p >= 80 else (YLW if p >= 50 else RED)
+    return f"{col}{bar} {p:3}%{RST}"
+
+try:
+    data = json.loads(urllib.request.urlopen(URL, timeout=3).read())
+except Exception as e:
+    sys.exit(f"[agyq] Cannot reach rotator at {URL}: {e}")
+
+routing = data.get("routingDiagnostics", {})
+sel = {m: routing[m]["selectedEmail"] for m in MODELS if m in routing}
+health = data.get("routingHealth", {})
+uptime_min = int(data.get("uptime", 0) / 1000 / 60)
+now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+W = 72
+
+hcol = GRN if health.get("state") == "healthy" else YLW
+print(f"{'─' * W}")
+print(f"  {BOLD}agy rotator{RST}  v{data['version']}  port:{data['proxyPort']}  "
+      f"uptime:{uptime_min}m  health:{hcol}{health.get('state','?')}{RST}")
+print(f"  ready:{health.get('readyCount',0)}/{health.get('availableCount',0)}  "
+      f"total-req:{data.get('totalRequestsAllAccounts',0)}  @ {now}")
+print(f"{'─' * W}")
+print(f"  {'Account':<16}  {'Claude':^10}  {'G3.1Pro':^10}  {'G3.5Flash':^10}  {'Req':>4}  St  Selected")
+print(f"{'─' * W}")
+
+for acc in data["accounts"]:
+    label  = acc["label"]
+    status = acc["status"]
+    reqs   = acc["totalRequests"]
+    qmap   = {q["modelKey"]: q["percentRemaining"] for q in acc.get("quota", [])}
+
+    c_q  = qmap.get("claude-opus-4-6-thinking")
+    g1_q = qmap.get("gemini-3.1-pro")
+    gf_q = qmap.get("gemini-3.5-flash")
+
+    tags = []
+    if sel.get("claude-opus-4-6-thinking") == acc["email"]: tags.append("C")
+    if sel.get("gemini-3.1-pro")           == acc["email"]: tags.append("G")
+    if sel.get("gemini-3.5-flash")         == acc["email"]: tags.append("F")
+    sel_str   = ",".join(tags) if tags else ""
+    stat_icon = f"{GRN}✓{RST}" if status == "ready" else f"{YLW}⏸{RST}"
+
+    print(f"  {label:<16}  ", end="")
+    print(qbar(c_q),  end="  ")
+    print(qbar(g1_q), end="  ")
+    print(qbar(gf_q), end="  ")
+    print(f"{reqs:>4}  {stat_icon}  {sel_str}")
+
+print(f"{'─' * W}")
+csel = sel.get("claude-opus-4-6-thinking", "?").split("@")[0]
+gsel = sel.get("gemini-3.1-pro", "?").split("@")[0]
+fsel = sel.get("gemini-3.5-flash", "?").split("@")[0]
+print(f"  Active:  Claude→{csel}  G3Pro→{gsel}  G3Flash→{fsel}")
+print(f"{'─' * W}")

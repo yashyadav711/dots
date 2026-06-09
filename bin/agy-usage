@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""agy-usage — analyse per-account quota trends from usage-history.csv."""
+import csv, os, sys, datetime, urllib.request, json
+
+CSV_PATH = os.path.expanduser("~/.pi-antigravity-rotator/usage-history.csv")
+GRN, YLW, RED, DIM, RST, BOLD = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m", "\033[1m"
+
+def qcol(v):
+    try:
+        p = float(v)
+        return (GRN if p >= 80 else (YLW if p >= 50 else RED)) + f"{p:5.0f}%" + RST
+    except (TypeError, ValueError):
+        return f"{DIM}  n/a{RST}"
+
+def trend(first, last):
+    try:
+        d = float(last) - float(first)
+        return (GRN if d >= 0 else RED) + f"{d:+.0f}%" + RST
+    except (TypeError, ValueError):
+        return f"{DIM} n/a{RST}"
+
+if not os.path.exists(CSV_PATH):
+    print("[agy-usage] No history file yet — timer has not run or rotator was unreachable.")
+    print(f"  Expected: {CSV_PATH}")
+    sys.exit(0)
+
+rows = []
+with open(CSV_PATH) as f:
+    for row in csv.DictReader(f):
+        rows.append(row)
+
+if not rows:
+    print("[agy-usage] History CSV is empty.")
+    sys.exit(0)
+
+first_by, last_by = {}, {}
+for row in rows:
+    e = row["email"]
+    if e not in first_by:
+        first_by[e] = row
+    last_by[e] = row
+
+timestamps = sorted(set(r["timestamp"] for r in rows))
+n_snaps    = len(timestamps)
+span_start = timestamps[0]
+span_end   = timestamps[-1]
+
+print(f"\n{BOLD}agy usage history{RST}  ·  {n_snaps} snapshot{'s' if n_snaps != 1 else ''}  "
+      f"·  {span_start}  →  {span_end}\n")
+
+W = 84
+print(f"{'─' * W}")
+print(f"  {'Account':<16}  {'Reqs':>4}  {'Claude':>7}  {'G3Pro':>7}  {'G3Flash':>8}  "
+      f"{'ΔClaude':>9}  {'ΔG3Pro':>8}  {'ΔG3Flash':>10}")
+print(f"{'─' * W}")
+
+for email in sorted(last_by):
+    label = email.split("@")[0]
+    first = first_by[email]
+    last  = last_by[email]
+    reqs  = last.get("total_requests", "?")
+    c  = last.get("quota_claude", "")
+    g1 = last.get("quota_gemini_pro", "")
+    gf = last.get("quota_gemini_flash", "")
+    dc  = trend(first.get("quota_claude", ""),        c)
+    dg1 = trend(first.get("quota_gemini_pro", ""),   g1)
+    dgf = trend(first.get("quota_gemini_flash", ""), gf)
+
+    print(f"  {label:<16}  {reqs:>4}  {qcol(c)}  {qcol(g1)}  {qcol(gf)}  "
+          f"  {dc}    {dg1}    {dgf}")
+
+print(f"{'─' * W}")
+print(f"  {DIM}Δ = quota change since first snapshot  "
+      f"(positive = reset/refilled, negative = consumed){RST}\n")
+
+# Also pull live current total from rotator for reference
+try:
+    live = json.loads(urllib.request.urlopen("http://localhost:51200/api/status", timeout=2).read())
+    print(f"  Live total-req: {live.get('totalRequestsAllAccounts', '?')}  "
+          f"(rotator uptime: {int(live.get('uptime',0)/1000/60)}m)")
+except Exception:
+    pass

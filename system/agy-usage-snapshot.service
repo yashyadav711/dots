@@ -1,0 +1,11 @@
+[Unit]
+Description=agy usage snapshot — append per-account quota row to usage-history.csv
+After=pi-antigravity-rotator.service
+Requires=pi-antigravity-rotator.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/yash/.local/bin/agy-snapshot
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agy-usage-snapshot
