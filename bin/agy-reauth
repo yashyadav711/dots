@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""
+agy-reauth: Re-authenticate agy to a rotator account with fresh Claude quota.
+
+Usage:
+  agy-reauth [email]   # reauth to specific account (or best-quota one)
+  agy-reauth --check   # print current agy token expiry
+  agy-reauth --best    # print which account has best Claude quota
+"""
+
+import sys
+import json
+import urllib.request
+import urllib.error
+import datetime
+import os
+
+AGY_TOKEN_PATH = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
+ROTATOR_ACCOUNTS_PATH = os.path.expanduser("~/.pi-antigravity-rotator/accounts.json")
+ROTATOR_STATUS_URL = "http://localhost:51200/api/status"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+CLIENT_ID = "REDACTED-OAUTH-CLIENT-ID"
+CLIENT_SECRET = "REDACTED-OAUTH-CLIENT-SECRET"
+
+
+def read_accounts():
+    with open(ROTATOR_ACCOUNTS_PATH) as f:
+        data = json.load(f)
+    return {a["email"]: a["refreshToken"] for a in data.get("accounts", [])}
+
+
+def get_rotator_quota():
+    try:
+        with urllib.request.urlopen(ROTATOR_STATUS_URL, timeout=5) as resp:
+            status = json.loads(resp.read())
+        model = "claude-opus-4-6-thinking"
+        diag = status.get("routingDiagnostics", {}).get(model, {})
+        return {a["email"]: (a.get("quota") or 0) for a in diag.get("accounts", [])}
+    except Exception:
+        return {}
+
+
+def refresh_access_token(refresh_tok):
+    payload = json.dumps({
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "refresh_token": refresh_tok,
+        "grant_type": "refresh_token",
+    }).encode()
+    req = urllib.request.Request(
+        TOKEN_URL, data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def write_agy_token(access_token, refresh_tok, expires_in):
+    expiry_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=expires_in - 30)
+    local_tz = datetime.datetime.now().astimezone().tzinfo
+    expiry_local = expiry_dt.astimezone(local_tz)
+    expiry_str = expiry_local.strftime("%Y-%m-%dT%H:%M:%S.") + "000000000"
+    offset = expiry_local.strftime("%z")  # e.g. +0530
+    if len(offset) == 5:
+        expiry_str += offset[:3] + ":" + offset[3:]  # +05:30
+    else:
+        expiry_str += offset
+    token_data = {
+        "token": {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "refresh_token": refresh_tok,
+            "expiry": expiry_str,
+        },
+        "auth_method": "consumer",
+    }
+    with open(AGY_TOKEN_PATH, "w") as f:
+        json.dump(token_data, f)
+    os.chmod(AGY_TOKEN_PATH, 0o600)
+
+
+def pick_best_account(accounts, quota_map):
+    candidates = [(quota_map.get(e, 100), e, rt) for e, rt in accounts.items()]
+    candidates.sort(reverse=True)
+    for quota, email, rt in candidates:
+        if quota > 10:
+            return email, rt
+    return (candidates[0][1], candidates[0][2]) if candidates else (None, None)
+
+
+def main():
+    args = sys.argv[1:]
+    accounts = read_accounts()
+    quota_map = get_rotator_quota()
+
+    if "--check" in args:
+        try:
+            with open(AGY_TOKEN_PATH) as f:
+                data = json.load(f)
+            print(f"agy token expiry: {data.get('token', {}).get('expiry', 'unknown')}")
+        except Exception as e:
+            print(f"Cannot read agy token: {e}")
+        return
+
+    if "--best" in args:
+        email, _ = pick_best_account(accounts, quota_map)
+        print(f"Best account: {email} (Claude quota: {quota_map.get(email, '?')!s}%)")
+        return
+
+    target_email = next((a for a in args if "@" in a), None)
+    if target_email:
+        if target_email not in accounts:
+            print(f"Error: {target_email} not in rotator accounts", file=sys.stderr)
+            sys.exit(1)
+        email, rt = target_email, accounts[target_email]
+    else:
+        email, rt = pick_best_account(accounts, quota_map)
+        if not email:
+            print("Error: no accounts available", file=sys.stderr)
+            sys.exit(1)
+
+    print(f"Re-authing agy to: {email} (Claude quota: {quota_map.get(email, '?')!s}%)", file=sys.stderr)
+
+    try:
+        tok_resp = refresh_access_token(rt)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        print(f"Token refresh failed: {e.code} {body}", file=sys.stderr)
+        sys.exit(1)
+
+    access_tok = tok_resp.get("access_token")
+    expires_in = tok_resp.get("expires_in", 3600)
+
+    if not access_tok:
+        print(f"No access_token in response: {tok_resp}", file=sys.stderr)
+        sys.exit(1)
+
+    write_agy_token(access_tok, rt, expires_in)
+    print(f"OK: agy re-authed to {email} (expires in {expires_in}s)", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

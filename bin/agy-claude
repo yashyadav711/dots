@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# agy-claude: wrapper around agy for Claude model calls.
+# Detects quota-exhaustion (empty output + 429 in log), re-auths to a fresh
+# rotator account, and retries once. Transparent passthrough otherwise.
+#
+# Usage: same as agy -- all args forwarded
+#   agy-claude --model "Claude Sonnet 4.6 (Thinking)" -p "..."
+#   agy-claude --dangerously-skip-permissions -p "do X"
+
+set -euo pipefail
+
+AGY_LOG_DIR="$HOME/.gemini/antigravity-cli/log"
+REAUTH="$HOME/.local/bin/agy-reauth"
+
+run_agy() {
+    agy "$@"
+}
+
+latest_log() {
+    ls -t "$AGY_LOG_DIR"/cli-*.log 2>/dev/null | head -1
+}
+
+has_429_in_log() {
+    local log_before="$1"
+    # Find any log newer than the marker, check for 429
+    local newest
+    newest=$(latest_log)
+    if [[ -z "$newest" ]]; then return 1; fi
+    # Check logs written after we started
+    grep -q "RESOURCE_EXHAUSTED\|quota reached\|code 429" "$newest" 2>/dev/null
+}
+
+# Run once, capture output
+output=$(run_agy "$@" 2>&1)
+exit_code=$?
+
+# If we got output, we're done
+if [[ -n "${output// /}" ]]; then
+    printf "%s" "$output"
+    exit $exit_code
+fi
+
+# Empty output — check if it's a 429
+if has_429_in_log; then
+    echo "[agy-claude] Quota exhausted — rotating account and retrying..." >&2
+    "$REAUTH" >&2
+    # Retry once
+    output=$(run_agy "$@" 2>&1)
+    exit_code=$?
+    printf "%s" "$output"
+    exit $exit_code
+fi
+
+# Empty but no 429 — pass through (might be a valid empty response or other error)
+exit $exit_code
