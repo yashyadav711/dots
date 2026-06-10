@@ -5,7 +5,7 @@ input=$(cat 2>/dev/null)
 cwd=$(echo "$input" | jq -r '.cwd // empty' 2>/dev/null)
 proj=$(basename "$cwd")
 case "$proj" in
-  product-manager) name="PM";       em="🎯" ;;
+  product-manager) name="PM";       em="🧠" ;;
   heydaddy)        name="HeyDaddy"; em="💜" ;;
   mirror)          name="Mirror";   em="📸" ;;
   envy)            name="Envy";     em="💻" ;;
