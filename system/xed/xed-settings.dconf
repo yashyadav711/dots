@@ -1,0 +1,32 @@
+[plugins]
+active-plugins=['time', 'spell', 'sort', 'modelines', 'filebrowser', 'docinfo']
+
+[plugins/filebrowser/on-load]
+root='file:///'
+tree-view=true
+virtual-root='file:///home/yash'
+
+[preferences/editor]
+auto-save=false
+auto-save-interval=uint32 1
+bracket-matching=false
+display-line-numbers=false
+display-right-margin=false
+draw-whitespace=false
+editor-font='JetBrainsMono Nerd Font 14'
+highlight-current-line=true
+prefer-dark-theme=true
+scheme='catppuccin-mocha'
+use-default-font=false
+
+[preferences/ui]
+minimap-visible=false
+statusbar-visible=true
+toolbar-visible=false
+
+[state/window]
+bottom-panel-size=140
+side-panel-active-page=827629879
+side-panel-size=200
+size=(939, 1016)
+state=43908
