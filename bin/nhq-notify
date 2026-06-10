@@ -24,6 +24,7 @@ case "$TYPE" in
   warden)    FR="#eba0ac"; IC="dialog-error";             T=15000 ;;  # ⚠️ system/fleet anomaly
   deadline)  FR="#89dceb"; IC="x-office-calendar";        T=12000 ;;  # 📅 deadline approaching
   secret)    FR="#b4befe"; IC="dialog-password";          T=10000 ;;  # 🔐 secret clipboard
+  reply)     FR="#74c7ec"; IC="dialog-information";        T=6000  ;;  # 💬 Claude replied (per-agent, Stop hook)
   *)         FR="#cdd6f4"; IC="dialog-information";        T=8000  ;;  # default / info
 esac
 
