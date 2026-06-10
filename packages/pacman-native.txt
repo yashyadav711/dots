@@ -191,6 +191,7 @@ pv
 python
 python-defusedxml
 python-packaging
+python-pandas
 python-pip
 qt5-graphicaleffects
 qt5-imageformats
@@ -206,6 +207,7 @@ remmina
 ripgrep
 ristretto
 rofi
+rofi-calc
 rofimoji
 rsync
 s-nail
@@ -219,6 +221,7 @@ sof-firmware
 starship
 sublime-text-4
 sudo
+syncthing
 sysfsutils
 texinfo
 thunar
@@ -243,6 +246,7 @@ uwsm
 vim
 vlc-plugins-all
 vulkan-intel
+walker
 waybar
 wev
 wget
