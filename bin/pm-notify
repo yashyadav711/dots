@@ -1,0 +1,6 @@
+#!/bin/bash
+# Thin wrapper — routes through the unified nhq-notify (needs-you type, red frame).
+# Kept as its own command because replies.md + many call sites reference `pm-notify`.
+TITLE="${1:-🔴 PM needs you}"
+BODY="${2:-Check PM terminal}"
+exec "$HOME/.local/bin/nhq-notify" needs-you "$TITLE" "$BODY"

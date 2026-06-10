@@ -1,0 +1,39 @@
+#!/bin/bash
+# nhq-notify <type> <title> <body> — unified NetrunnersHQ desktop notifier.
+#
+# Consistent house style: a small "Claude Code" app label, then a BIG WHITE bold
+# headline + detail in the BODY (dunst only renders Pango markup in the body, not the
+# summary — putting text there avoids leaked <span> tags). Frame color is per-type
+# (Catppuccin Mocha). Inline markup + dunst color hints survive HyDE dunstrc regen,
+# so this needs no dunstrc edits.
+#
+# Usage:  nhq-notify needs-you "🔴 PM needs you" "Gate 3 test · Mirror merge"
+#         nhq-notify deploy    "🚀 Shipped"       "HeyDaddy PR #42 → prod"
+
+TYPE="${1:-info}"
+TITLE="${2:-NHQ}"
+BODY="${3:-}"
+
+case "$TYPE" in
+  needs-you) FR="#f38ba8"; IC="dialog-information";       T=12000 ;;  # 🔴 action needed
+  blocked)   FR="#fab387"; IC="dialog-warning";           T=8000  ;;  # 🛑 guard blocked
+  done)      FR="#a6e3a1"; IC="emblem-default";           T=6000  ;;  # ✅ task/relay finished
+  deploy)    FR="#89b4fa"; IC="emblem-shared";            T=10000 ;;  # 🚀 shipped / merged
+  julian)    FR="#cba6f7"; IC="mail-message-new";         T=15000 ;;  # 💬 Julian message
+  quota)     FR="#f9e2af"; IC="utilities-system-monitor"; T=10000 ;;  # 📊 usage / quota
+  warden)    FR="#eba0ac"; IC="dialog-error";             T=15000 ;;  # ⚠️ system/fleet anomaly
+  deadline)  FR="#89dceb"; IC="x-office-calendar";        T=12000 ;;  # 📅 deadline approaching
+  secret)    FR="#b4befe"; IC="dialog-password";          T=10000 ;;  # 🔐 secret clipboard
+  *)         FR="#cdd6f4"; IC="dialog-information";        T=8000  ;;  # default / info
+esac
+
+if [ -n "$BODY" ]; then
+  MSG="<span size='200%' foreground='#ffffff'><b>$TITLE</b>
+$BODY</span>"
+else
+  MSG="<span size='200%' foreground='#ffffff'><b>$TITLE</b></span>"
+fi
+
+notify-send "Claude Code" "$MSG" \
+  --urgency=normal --expire-time="$T" \
+  --hint string:frcolor:"$FR" -i "$IC"
