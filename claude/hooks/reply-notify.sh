@@ -9,6 +9,7 @@ case "$proj" in
   heydaddy)        name="HeyDaddy"; em="💜" ;;
   mirror)          name="Mirror";   em="📸" ;;
   envy)            name="Envy";     em="💻" ;;
+  grok-chatter)    exit 0 ;;        # Yash: no per-reply ping for grok-chatter
   *)               name="$proj";    em="💬" ;;
 esac
 exec "$HOME/.local/bin/nhq-notify" reply "$em $name replied"
