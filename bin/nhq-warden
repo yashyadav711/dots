@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""nhq-warden — persistent machine watchdog for the HP Envy 13 (NetrunnersHQ).
+
+Watches every 30 s:
+  - Swap: alert when SwapFree < 1 GiB  (swap used > ~6.5 GiB)
+  - RAM:  alert when MemAvailable < 400 MiB
+  - OOM:  detect claude-oom-guard kills via its log
+  - Disk: alert when / usage > 90%
+  - Zombies: alert when zombie count >= 5
+
+Alerts go to nhq-notify warden. Cooldown: 900 s (15 min) per alert type.
+Log: ~/.local/state/nhq-warden.log
+"""
+import os, time, shutil, glob, subprocess
+
+INTERVAL   = 30    # seconds between polls
+COOLDOWN   = 900   # seconds between repeated alerts of the same type
+
+SWAP_FREE_MIB_WARN = 1024        # alert when SwapFree < this
+RAM_AVAIL_MIB_WARN = 400         # alert when MemAvailable < this
+DISK_USED_PCT_WARN = 90          # alert when / usage % > this
+ZOMBIE_WARN        = 5           # alert when zombie count >= this
+
+OOM_LOG   = os.path.expanduser("~/.local/state/claude-oom-guard.log")
+STATE_LOG = os.path.expanduser("~/.local/state/nhq-warden.log")
+NOTIFY    = os.path.expanduser("~/.local/bin/nhq-notify")
+
+_last_alert: dict[str, float] = {}
+_oom_log_pos = 0
+
+
+def log(msg: str) -> None:
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
+    try:
+        os.makedirs(os.path.dirname(STATE_LOG), exist_ok=True)
+        with open(STATE_LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    print(line, flush=True)
+
+
+def alert(key: str, title: str, body: str) -> None:
+    now = time.time()
+    if now - _last_alert.get(key, 0) < COOLDOWN:
+        return
+    _last_alert[key] = now
+    log(f"ALERT [{key}] {title}: {body}")
+    try:
+        subprocess.Popen([NOTIFY, "warden", title, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def meminfo() -> dict[str, int]:
+    d: dict[str, int] = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 2:
+                d[parts[0].rstrip(":")] = int(parts[1])
+    return d
+
+
+def disk_used_pct(path: str = "/") -> float:
+    try:
+        st = shutil.disk_usage(path)
+        return 100.0 * st.used / st.total
+    except OSError:
+        return 0.0
+
+
+def zombie_count() -> int:
+    count = 0
+    try:
+        for d in glob.glob("/proc/[0-9]*/stat"):
+            try:
+                with open(d) as f:
+                    if f.read().split()[2] == "Z":
+                        count += 1
+            except (OSError, IndexError):
+                pass
+    except OSError:
+        pass
+    return count
+
+
+def check_oom_log() -> None:
+    global _oom_log_pos
+    if not os.path.exists(OOM_LOG):
+        return
+    try:
+        with open(OOM_LOG) as f:
+            f.seek(_oom_log_pos)
+            new = f.read()
+            _oom_log_pos = f.tell()
+        for line in new.splitlines():
+            if "killing idlest claude" in line.lower() or "[warn]" in line or "[crit]" in line:
+                alert("oom-kill", "⚠️ OOM Guard killed a Claude session",
+                      line.strip()[-120:])
+    except OSError:
+        pass
+
+
+def check_all() -> None:
+    mem = meminfo()
+
+    swap_free_mib = mem.get("SwapFree", 0) // 1024
+    swap_total_mib = mem.get("SwapTotal", 1) // 1024
+    swap_used_mib = swap_total_mib - swap_free_mib
+    if swap_free_mib < SWAP_FREE_MIB_WARN:
+        alert("swap",
+              "⚠️ Swap critically low",
+              f"Free: {swap_free_mib} MiB / {swap_total_mib} MiB  (used {swap_used_mib} MiB)")
+
+    ram_avail_mib = mem.get("MemAvailable", 999999) // 1024
+    if ram_avail_mib < RAM_AVAIL_MIB_WARN:
+        alert("ram",
+              "⚠️ RAM critically low",
+              f"Available: {ram_avail_mib} MiB")
+
+    disk_pct = disk_used_pct("/")
+    if disk_pct > DISK_USED_PCT_WARN:
+        alert("disk",
+              "⚠️ Disk almost full",
+              f"/ at {disk_pct:.1f}% used")
+
+    z = zombie_count()
+    if z >= ZOMBIE_WARN:
+        alert("zombie",
+              "⚠️ Zombie processes accumulating",
+              f"{z} zombie processes detected")
+
+    check_oom_log()
+
+
+def main() -> None:
+    log(f"started — swap<{SWAP_FREE_MIB_WARN}MiB free, RAM<{RAM_AVAIL_MIB_WARN}MiB avail, "
+        f"disk>{DISK_USED_PCT_WARN}%, zombie>={ZOMBIE_WARN}, cooldown {COOLDOWN}s")
+    # seed oom log position so we don't re-alert on old kills
+    global _oom_log_pos
+    if os.path.exists(OOM_LOG):
+        try:
+            _oom_log_pos = os.path.getsize(OOM_LOG)
+        except OSError:
+            pass
+    while True:
+        try:
+            check_all()
+        except Exception as e:
+            log(f"error: {e!r}")
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

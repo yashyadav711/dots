@@ -1,0 +1,13 @@
+[Unit]
+Description=NHQ Warden — persistent machine watchdog (swap/RAM/disk/OOM/zombie)
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nhq-warden
+Restart=always
+RestartSec=10
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=default.target
