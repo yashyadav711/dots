@@ -6,12 +6,12 @@ Watches every 30 s:
   - RAM:  alert when MemAvailable < 400 MiB
   - OOM:  detect claude-oom-guard kills via its log
   - Disk: alert when / usage > 90%
-  - Zombies: alert when zombie count >= 5
+  - Zombies: alert when zombie count >= 5 sustained across 2+ consecutive checks (not transient spike)
 
 Alerts go to nhq-notify warden. Cooldown: 900 s (15 min) per alert type.
 Log: ~/.local/state/nhq-warden.log
 """
-import os, time, shutil, glob, subprocess
+import os, time, shutil, glob, subprocess, signal
 
 INTERVAL   = 30    # seconds between polls
 COOLDOWN   = 900   # seconds between repeated alerts of the same type
@@ -27,6 +27,7 @@ NOTIFY    = os.path.expanduser("~/.local/bin/nhq-notify")
 
 _last_alert: dict[str, float] = {}
 _oom_log_pos = 0
+_zombie_consecutive = 0  # consecutive checks with zombie count >= ZOMBIE_WARN
 
 
 def log(msg: str) -> None:
@@ -127,17 +128,23 @@ def check_all() -> None:
               f"/ at {disk_pct:.1f}% used")
 
     z = zombie_count()
+    global _zombie_consecutive
     if z >= ZOMBIE_WARN:
-        alert("zombie",
-              "⚠️ Zombie processes accumulating",
-              f"{z} zombie processes detected")
+        _zombie_consecutive += 1
+        if _zombie_consecutive >= 2:
+            alert("zombie",
+                  "⚠️ Zombie processes accumulating",
+                  f"{z} zombie processes detected (sustained {_zombie_consecutive} checks)")
+    else:
+        _zombie_consecutive = 0
 
     check_oom_log()
 
 
 def main() -> None:
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # auto-reap nhq-notify children; prevents zombie accumulation
     log(f"started — swap<{SWAP_FREE_MIB_WARN}MiB free, RAM<{RAM_AVAIL_MIB_WARN}MiB avail, "
-        f"disk>{DISK_USED_PCT_WARN}%, zombie>={ZOMBIE_WARN}, cooldown {COOLDOWN}s")
+        f"disk>{DISK_USED_PCT_WARN}%, zombie>={ZOMBIE_WARN} (sustained 2+), cooldown {COOLDOWN}s")
     # seed oom log position so we don't re-alert on old kills
     global _oom_log_pos
     if os.path.exists(OOM_LOG):

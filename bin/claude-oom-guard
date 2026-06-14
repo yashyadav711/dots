@@ -115,6 +115,7 @@ def notify(title, body):
         pass
 
 def main():
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # auto-reap notify-send children; prevents zombie accumulation
     log(f"started (warn<{WARN_PCT}% crit<{CRIT_PCT}% interval {INTERVAL}s)")
     last_kill = 0.0
     while True:
