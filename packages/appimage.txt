@@ -1,0 +1,8 @@
+# AppImages — manually downloaded to ~/Applications/
+# To restore: download the latest release and chmod +x, then desktop entry from dots
+#
+# Kun v0.2.11 (DeepSeek GUI / local AI agent desktop)
+# Source: https://github.com/KunAgent/Kun/releases
+# Install: curl -L <latest .AppImage URL> -o ~/Applications/Kun.AppImage && chmod +x ~/Applications/Kun.AppImage
+# Desktop entry: see appimage/kun.desktop below (symlinked to ~/.local/share/applications/)
+# License: PolyForm Noncommercial (personal use only)

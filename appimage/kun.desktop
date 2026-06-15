@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Kun
+Comment=Local AI Agent Desktop Workbench (DeepSeek GUI)
+Exec=/home/yash/Applications/Kun.AppImage --no-sandbox
+Icon=kun
+Terminal=false
+Type=Application
+Categories=Utility;Development;
+StartupWMClass=Kun

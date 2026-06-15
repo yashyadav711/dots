@@ -66,6 +66,8 @@ cat <<'NOTE'
         git clone git@github.com:yashyadav711/home-bt ~/Github/home-bt
         ln -s ~/Github/home-bt/CLAUDE.md ~/CLAUDE.md
         mkdir -p ~/.claude && ln -s ~/Github/home-bt/store ~/.claude/bt
+  • AppImages (~/Applications/): see packages/appimage.txt — download each and chmod +x.
+        Desktop entries live in dots/appimage/ — link: ln -sfn $DOTS/appimage/kun.desktop ~/.local/share/applications/kun.desktop
   • Log out / reboot to apply Hyprland + shell changes.
 ───────────────────────────────────────────────────────────────
 NOTE
