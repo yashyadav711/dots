@@ -21,7 +21,7 @@ latest_log() {
 }
 
 has_429_in_log() {
-    local log_before="$1"
+    local log_before="${1:-}"
     # Find any log newer than the marker, check for 429
     local newest
     newest=$(latest_log)
