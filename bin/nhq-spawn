@@ -114,7 +114,7 @@ for _ in $(seq 1 60); do
   esac
 done
 # Settle so the TUI is ready to accept input
-sleep 2
+sleep 3
 
 if [[ "$booted" -eq 0 ]]; then
   echo "nhq-spawn: warning — claude pane didn't look booted; sending task anyway." >&2
@@ -123,8 +123,18 @@ fi
 # Send the task as a single literal line, then Enter (0.3s apart so the TUI
 # registers the paste before submit)
 tmux send-keys -t "$SESSION" -l -- "$MESSAGE"
-sleep 0.3
+sleep 0.4
 tmux send-keys -t "$SESSION" Enter
+
+# CONFIRM-SUBMIT: on a RAM-loaded boot the TUI can be slow to wire up its input
+# widget, so the first Enter sometimes lands as a no-op (the task sits typed-but-
+# unsubmitted). Use the reliable v2 state detector: if claude doesn't go RUNNING
+# shortly, the message is still in the box — re-press Enter until it submits.
+for _ in 1 2 3 4 5 6; do
+  sleep 2
+  [[ "$(nhq_session_state "$SESSION")" == "RUNNING" ]] && break
+  tmux send-keys -t "$SESSION" Enter
+done
 
 echo "spawned: $SESSION  (agent=$AGENT  repo=$REPO)"
 echo "  watch:  tmux attach -t $SESSION"
