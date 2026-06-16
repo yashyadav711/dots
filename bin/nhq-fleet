@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# nhq-fleet — dashboard of every live NHQ fleet agent.
+#
+# Lists each `fleet-*` tmux session: name, repo, whether its pane is working
+# (claude/node/python/git running = WORKING, else IDLE/done), and the tail of
+# the most-recently-touched file in that repo's ai/ dir (the agent's progress).
+#
+# Usage: nhq-fleet
+set -euo pipefail
+
+repo_for_agent() {
+  case "${1:-}" in
+    heydaddy) echo "$HOME/Github/heydaddy" ;;
+    mirror)   echo "$HOME/Github/mirror" ;;
+    envy)     echo "$HOME/Github/envy" ;;
+    director) echo "$HOME/Github/product-manager" ;;
+    *)        echo "" ;;
+  esac
+}
+
+mapfile -t SESSIONS < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^fleet-' || true)
+
+if [[ "${#SESSIONS[@]}" -eq 0 ]]; then
+  echo "🛰  NHQ FLEET — no live fleet sessions."
+  exit 0
+fi
+
+echo "🛰  NHQ FLEET — ${#SESSIONS[@]} live session(s)"
+echo "──────────────────────────────────────────────────────────────"
+
+for S in "${SESSIONS[@]}"; do
+  # session name: fleet-<agent>-<slug...>
+  AGENT=$(printf '%s' "$S" | cut -d- -f2)
+  REPO=$(repo_for_agent "$AGENT")
+
+  CMD=$(tmux display-message -p -t "$S" '#{pane_current_command}' 2>/dev/null || echo "?")
+  case "$CMD" in
+    claude|node|python|python3|git|npm|npx|cargo|go) STATE="🟡 WORKING ($CMD)" ;;
+    *)                                               STATE="⚪ IDLE/done ($CMD)" ;;
+  esac
+
+  printf '%s\n' "$S"
+  printf '   repo:   %s\n' "${REPO:-<unknown agent: $AGENT>}"
+  printf '   state:  %s\n' "$STATE"
+
+  # Tail the most-recently-modified file in the repo's ai/ dir, if any
+  if [[ -n "$REPO" && -d "$REPO/ai" ]]; then
+    PROG=$(ls -t "$REPO/ai"/*.md 2>/dev/null | head -1 || true)
+    if [[ -n "$PROG" ]]; then
+      printf '   progress (%s):\n' "$(basename "$PROG")"
+      tail -n 4 "$PROG" 2>/dev/null | sed 's/^/     │ /'
+    fi
+  fi
+  echo "──────────────────────────────────────────────────────────────"
+done

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# nhq-tell <session> "<message>" — message a running fleet agent mid-task.
+#
+# Types the message into the live claude TUI via tmux send-keys (literal), then
+# presses Enter. This is how Director/Yash redirect an agent without killing it.
+#
+# Usage: nhq-tell fleet-heydaddy-add-retry "actually, cap retries at 3"
+set -euo pipefail
+
+SESSION="${1:-}"
+MESSAGE="${2:-}"
+
+if [[ -z "$SESSION" || -z "$MESSAGE" ]]; then
+  echo "usage: nhq-tell <session> \"<message>\"" >&2
+  exit 1
+fi
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  echo "nhq-tell: no such session: $SESSION" >&2
+  echo "  live sessions: $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^fleet-' | paste -sd', ' -)" >&2
+  exit 1
+fi
+
+tmux send-keys -t "$SESSION" -l -- "$MESSAGE"
+sleep 0.3
+tmux send-keys -t "$SESSION" Enter
+
+echo "sent to $SESSION: $MESSAGE"

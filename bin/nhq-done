@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# nhq-done <agent> "<result>" — THE CALLBACK that closes the fleet loop.
+#
+# An agent runs this when it finishes (or is blocked). It:
+#   1. Appends a timestamped, structured entry to Director's fleet inbox
+#      (~/Github/product-manager/ai/fleet-inbox.md — created if missing).
+#   2. Fires a desktop toast so Yash gets pinged immediately.
+# Director reads the inbox on next session start and chains the next task.
+#
+# Usage: nhq-done heydaddy "Done: added retry cap on branch feat/upload-retry. No push."
+set -euo pipefail
+
+AGENT="${1:-}"
+RESULT="${2:-}"
+
+if [[ -z "$AGENT" || -z "$RESULT" ]]; then
+  echo "usage: nhq-done <agent> \"<one-paragraph result>\"" >&2
+  exit 1
+fi
+
+INBOX="$HOME/Github/product-manager/ai/fleet-inbox.md"
+NOTIFY="$HOME/.local/bin/nhq-notify"
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Ensure the inbox exists with a header
+if [[ ! -f "$INBOX" ]]; then
+  mkdir -p "$(dirname "$INBOX")"
+  {
+    echo "# NHQ Fleet Inbox"
+    echo
+    echo "Callbacks from autonomous fleet agents (\`nhq-done\`). Newest entries appended at the bottom."
+    echo "Director: read on session start, then chain the next task."
+    echo
+  } > "$INBOX"
+fi
+
+# Append the structured entry
+{
+  echo "## ${TS} — ${AGENT}"
+  echo "${RESULT}"
+  echo
+} >> "$INBOX"
+
+# Desktop toast (best-effort — never fail the callback if notify is missing)
+if [[ -x "$NOTIFY" ]]; then
+  BODY="${RESULT:0:140}"
+  "$NOTIFY" done "Fleet: ${AGENT} finished" "$BODY" || true
+fi
+
+echo "nhq-done: logged ${AGENT} callback to $INBOX"

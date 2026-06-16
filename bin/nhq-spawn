@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# nhq-spawn <agent> "<task>" — spawn an autonomous, talkable NHQ fleet agent.
+#
+# Launches an INTERACTIVE `claude --dangerously-skip-permissions` inside a tmux
+# session living in the agent's repo dir, then sends the task plus the standard
+# FLEET PROTOCOL footer. The agent stays talkable (nhq-tell) and reports back to
+# Director when finished (nhq-done — baked into the footer).
+#
+# Rides Yash's existing Claude subscription via the `claude` CLI. NO API key.
+#
+# Usage: nhq-spawn heydaddy "Add retry logic to the upload queue"
+set -euo pipefail
+
+AGENT="${1:-}"
+TASK="${2:-}"
+
+if [[ -z "$AGENT" || -z "$TASK" ]]; then
+  echo "usage: nhq-spawn <heydaddy|mirror|envy|director> \"<task>\"" >&2
+  exit 1
+fi
+
+# Map agent -> repo dir
+case "$AGENT" in
+  heydaddy) REPO="$HOME/Github/heydaddy" ;;
+  mirror)   REPO="$HOME/Github/mirror" ;;
+  envy)     REPO="$HOME/Github/envy" ;;
+  director) REPO="$HOME/Github/product-manager" ;;
+  *)
+    echo "nhq-spawn: unknown agent '$AGENT' (want heydaddy|mirror|envy|director)" >&2
+    exit 1
+    ;;
+esac
+
+if [[ ! -d "$REPO" ]]; then
+  echo "nhq-spawn: repo dir not found: $REPO" >&2
+  exit 1
+fi
+
+CLAUDE_BIN="$HOME/.local/bin/claude"
+if [[ ! -x "$CLAUDE_BIN" ]]; then
+  echo "nhq-spawn: claude CLI not found at $CLAUDE_BIN" >&2
+  exit 1
+fi
+
+# Short slug from the task for the session name
+SLUG=$(printf '%s' "$TASK" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' \
+  | sed 's/--*/-/g; s/^-//; s/-$//' | cut -c1-24)
+SLUG="${SLUG:-task}"
+SESSION="fleet-${AGENT}-${SLUG}"
+
+# If a session by this exact name already exists, suffix with a counter
+BASE="$SESSION"; N=2
+while tmux has-session -t "$SESSION" 2>/dev/null; do
+  SESSION="${BASE}-${N}"; N=$((N + 1))
+done
+
+# Standard FLEET PROTOCOL footer (agent name baked in for the callback)
+FOOTER="--- FLEET PROTOCOL: You are an autonomous NHQ fleet agent. BRANCHES ONLY — no push, no merge, no deploy unless Yash explicitly says so. Surgical changes; flag Protocol-3 (auth/payments/PII/security), don't silently commit it. Keep a live progress file in this repo's ai/ dir. WHEN YOU FINISH (or are blocked), you MUST run: nhq-done ${AGENT} \"<one-paragraph result: what you did / blocked-on / branch>\" — this reports back to Director. Do not end silently."
+
+MESSAGE="${TASK} ${FOOTER}"
+
+# Launch interactive claude in a detached tmux session, in the repo dir
+tmux new-session -d -s "$SESSION" -c "$REPO" "$CLAUDE_BIN --dangerously-skip-permissions"
+
+# Wait for claude (node) to boot before sending the task. Poll the pane's
+# current command until it's no longer a bare shell, capped at ~30s.
+booted=0
+for _ in $(seq 1 60); do
+  cmd=$(tmux display-message -p -t "$SESSION" '#{pane_current_command}' 2>/dev/null || echo "")
+  case "$cmd" in
+    fish|bash|sh|zsh|"") sleep 0.5 ;;
+    *) booted=1; break ;;
+  esac
+done
+# Settle so the TUI is ready to accept input
+sleep 2
+
+if [[ "$booted" -eq 0 ]]; then
+  echo "nhq-spawn: warning — claude pane didn't look booted; sending task anyway." >&2
+fi
+
+# Send the task as a single literal line, then Enter (0.3s apart so the TUI
+# registers the paste before submit)
+tmux send-keys -t "$SESSION" -l -- "$MESSAGE"
+sleep 0.3
+tmux send-keys -t "$SESSION" Enter
+
+echo "spawned: $SESSION  (agent=$AGENT  repo=$REPO)"
+echo "  watch:  tmux attach -t $SESSION"
+echo "  talk:   nhq-tell $SESSION '<msg>'"
