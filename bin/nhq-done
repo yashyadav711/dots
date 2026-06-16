@@ -2,9 +2,12 @@
 # nhq-done <agent> "<result>" — THE CALLBACK that closes the fleet loop.
 #
 # An agent runs this when it finishes (or is blocked). It:
-#   1. Appends a timestamped, structured entry to Director's fleet inbox
+#   1. Drops a per-session done-marker (~/.nhq-fleet/<session>.done) holding the
+#      report — the signal `nhq-await` blocks on. This is the v2 return path that
+#      lets Director get a real completion notification instead of polling.
+#   2. Appends a timestamped, structured entry to Director's fleet inbox
 #      (~/Github/product-manager/ai/fleet-inbox.md — created if missing).
-#   2. Fires a desktop toast so Yash gets pinged immediately.
+#   3. Fires a desktop toast so Yash gets pinged immediately.
 # Director reads the inbox on next session start and chains the next task.
 #
 # Usage: nhq-done heydaddy "Done: added retry cap on branch feat/upload-retry. No push."
@@ -20,7 +23,24 @@ fi
 
 INBOX="$HOME/Github/product-manager/ai/fleet-inbox.md"
 NOTIFY="$HOME/.local/bin/nhq-notify"
+STATE_DIR="${NHQ_STATE_DIR:-$HOME/.nhq-fleet}"
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# 1. Per-session done-marker — the signal nhq-await watches. The agent runs this
+#    from INSIDE its own fleet tmux session, so resolve the session name from the
+#    ambient tmux env. (Falls back to fleet-<agent> if not in a tmux pane, e.g. a
+#    direct CLI call.) Marker holds the timestamp + full report so nhq-await can
+#    print it verbatim.
+SESSION=""
+if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+  SESSION=$(tmux display-message -p '#S' 2>/dev/null || true)
+fi
+[[ "$SESSION" != fleet-* ]] && SESSION="fleet-${AGENT}"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+{
+  echo "## ${TS} — ${AGENT} (${SESSION})"
+  echo "${RESULT}"
+} > "$STATE_DIR/${SESSION}.done" 2>/dev/null || true
 
 # Ensure the inbox exists with a header
 if [[ ! -f "$INBOX" ]]; then
@@ -34,17 +54,17 @@ if [[ ! -f "$INBOX" ]]; then
   } > "$INBOX"
 fi
 
-# Append the structured entry
+# 2. Append the structured entry to the shared inbox
 {
-  echo "## ${TS} — ${AGENT}"
+  echo "## ${TS} — ${AGENT} (${SESSION})"
   echo "${RESULT}"
   echo
 } >> "$INBOX"
 
-# Desktop toast (best-effort — never fail the callback if notify is missing)
+# 3. Desktop toast (best-effort — never fail the callback if notify is missing)
 if [[ -x "$NOTIFY" ]]; then
   BODY="${RESULT:0:140}"
   "$NOTIFY" done "Fleet: ${AGENT} finished" "$BODY" || true
 fi
 
-echo "nhq-done: logged ${AGENT} callback to $INBOX"
+echo "nhq-done: logged ${AGENT} callback (marker: $STATE_DIR/${SESSION}.done, inbox: $INBOX)"

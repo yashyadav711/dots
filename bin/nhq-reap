@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# nhq-reap — RAM-aware reaper for idle fleet sessions (7.5GB laptop).
+#
+# Walks every fleet-* tmux session and applies the idle policy:
+#   • RUNNING (claude busy)  → never kill; refresh its activity clock.
+#   • IDLE   (claude alive at prompt) → if idle longer than NHQ_IDLE_KILL_MIN
+#                                       (default 20 min) since last activity, kill it.
+#   • DEAD   (dropped to fish / gone) → kill immediately (it's just holding a pane).
+#
+# "Activity" = a spawn / nhq-tell, or any reap pass that observed it RUNNING. So a
+# long-working agent stays alive; one that's been idle-at-prompt with no nhq-tell
+# for 20 min gets retired to free its claude's RAM. Goal: talkable when active,
+# zero idle RAM cost when not.
+#
+# No daemon required: nhq-fleet runs a reap pass opportunistically every time it's
+# invoked. For hands-off reaping, install the optional systemd user timer (see
+# FLEET-KIT.md). Safe to run anytime; --dry-run just reports.
+#
+# Usage: nhq-reap [--dry-run]
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+# shellcheck source=/dev/null
+source "$(dirname "$SELF")/nhq-lib.sh"
+
+DRY=0
+[[ "${1:-}" == "--dry-run" ]] && DRY=1
+
+KILL="$HOME/.local/bin/nhq-kill"
+IDLE_LIMIT=$(( NHQ_IDLE_KILL_MIN * 60 ))
+
+reaped=0
+while IFS= read -r S; do
+  [[ -z "$S" ]] && continue
+  state="$(nhq_session_state "$S")"
+  case "$state" in
+    RUNNING)
+      nhq_touch_activity "$S"   # still working — keep it off the chopping block
+      ;;
+    IDLE)
+      idle=$(nhq_idle_seconds "$S")
+      if [[ "$idle" -ge "$IDLE_LIMIT" ]]; then
+        echo "reap: $S — IDLE ${idle}s ≥ ${IDLE_LIMIT}s → kill"
+        [[ "$DRY" -eq 0 ]] && "$KILL" "$S" >/dev/null 2>&1 || true
+        reaped=$((reaped + 1))
+      fi
+      ;;
+    DEAD)
+      echo "reap: $S — DEAD (no claude) → kill"
+      [[ "$DRY" -eq 0 ]] && "$KILL" "$S" >/dev/null 2>&1 || true
+      reaped=$((reaped + 1))
+      ;;
+  esac
+done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^fleet-' || true)
+
+[[ "$reaped" -eq 0 ]] && exit 0
+note=""; [[ "$DRY" -eq 1 ]] && note=" (dry-run — nothing killed)"
+echo "nhq-reap: ${reaped} session(s) reaped${note}"

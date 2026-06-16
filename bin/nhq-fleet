@@ -1,17 +1,31 @@
 #!/usr/bin/env bash
 # nhq-fleet — dashboard of every live NHQ fleet agent.
 #
-# Lists each `fleet-*` tmux session: name, repo, whether its pane is working
-# (claude/node/python/git running = WORKING, else IDLE/done), and the tail of
-# the most-recently-touched file in that repo's ai/ dir (the agent's progress).
+# Lists each `fleet-*` tmux session: name, repo, true state, and the tail of the
+# most-recently-touched file in that repo's ai/ dir (the agent's progress).
 #
-# Usage: nhq-fleet
+# State (v2 — fixed): 🟢 RUNNING (claude busy) / ⚪ IDLE (claude alive at its
+# prompt, awaiting nhq-tell) / ⚫ DEAD (no claude / at fish). Detected by the
+# shared nhq-lib (process-tree + pane content), NOT pane_current_command — which
+# falsely reports `fish` while claude is mid-task (the v1 bug this fixes).
+#
+# Usage: nhq-fleet [--no-reap]
 set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+# shellcheck source=/dev/null
+source "$(dirname "$SELF")/nhq-lib.sh"
 
 # Real agent name (canonical) is resolved by the shared nhq-agent-name helper so
 # the dashboard matches the Stop-hook reply toast and survives multi-word agents
 # (product-manager) and dashed slugs — never a naive `cut -d-` fragment.
 RESOLVER="$HOME/.local/bin/nhq-agent-name"
+
+# Opportunistic RAM-aware reap pass (no daemon needed): retire idle/dead sessions
+# whenever the dashboard is viewed. Skip with --no-reap.
+if [[ "${1:-}" != "--no-reap" && -x "$HOME/.local/bin/nhq-reap" ]]; then
+  "$HOME/.local/bin/nhq-reap" >/dev/null 2>&1 || true
+fi
 
 repo_for_agent() {
   case "${1:-}" in
@@ -39,11 +53,7 @@ for S in "${SESSIONS[@]}"; do
   [[ -x "$RESOLVER" ]] && AGENT=$("$RESOLVER" --session "$S" 2>/dev/null)
   REPO=$(repo_for_agent "$AGENT")
 
-  CMD=$(tmux display-message -p -t "$S" '#{pane_current_command}' 2>/dev/null || echo "?")
-  case "$CMD" in
-    claude|node|python|python3|git|npm|npx|cargo|go) STATE="🟡 WORKING ($CMD)" ;;
-    *)                                               STATE="⚪ IDLE/done ($CMD)" ;;
-  esac
+  STATE="$(nhq_state_badge "$(nhq_session_state "$S")")"
 
   printf '%s\n' "$S"
   printf '   agent:  %s\n' "${AGENT:-<unresolved>}"

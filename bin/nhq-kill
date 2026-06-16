@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# nhq-kill <session|agent> — cleanly retire fleet session(s).
+#
+# Kills the tmux session(s) and removes their state files (done-marker +
+# activity). Accepts either an exact session name (kills just that one) or a bare
+# agent name like `heydaddy` (kills ALL its fleet-<agent>* sessions). Frees RAM by
+# stopping the underlying claude process.
+#
+# Usage: nhq-kill fleet-heydaddy-add-retry
+#        nhq-kill heydaddy          # all heydaddy fleet sessions
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+# shellcheck source=/dev/null
+source "$(dirname "$SELF")/nhq-lib.sh"
+
+ARG="${1:-}"
+if [[ -z "$ARG" ]]; then
+  echo "usage: nhq-kill <session|agent>" >&2
+  exit 1
+fi
+
+# Resolve the target session list.
+TARGETS=()
+if tmux has-session -t "$ARG" 2>/dev/null; then
+  TARGETS=("$ARG")                       # exact session name
+else
+  # Treat as an agent name → all its fleet sessions.
+  while IFS= read -r s; do
+    [[ -n "$s" ]] && TARGETS+=("$s")
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -E "^fleet-${ARG}(-|\$)" || true)
+fi
+
+if [[ "${#TARGETS[@]}" -eq 0 ]]; then
+  echo "nhq-kill: no live session matches '$ARG'" >&2
+  # Still clean up any orphaned state files keyed by the exact name.
+  rm -f "$(nhq_marker "$ARG")" "$(nhq_activity "$ARG")" 2>/dev/null || true
+  exit 1
+fi
+
+for S in "${TARGETS[@]}"; do
+  tmux kill-session -t "$S" 2>/dev/null || true
+  rm -f "$(nhq_marker "$S")" "$(nhq_activity "$S")" 2>/dev/null || true
+  echo "nhq-kill: retired $S (session killed, state cleaned)"
+done

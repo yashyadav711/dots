@@ -7,6 +7,10 @@
 # Usage: nhq-tell fleet-heydaddy-add-retry "actually, cap retries at 3"
 set -euo pipefail
 
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+# shellcheck source=/dev/null
+source "$(dirname "$SELF")/nhq-lib.sh"
+
 SESSION="${1:-}"
 MESSAGE="${2:-}"
 
@@ -24,5 +28,8 @@ fi
 tmux send-keys -t "$SESSION" -l -- "$MESSAGE"
 sleep 0.3
 tmux send-keys -t "$SESSION" Enter
+
+# Talking to a session counts as activity — keep the reaper off its back.
+nhq_touch_activity "$SESSION"
 
 echo "sent to $SESSION: $MESSAGE"
