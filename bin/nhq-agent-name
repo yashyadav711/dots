@@ -68,7 +68,10 @@ else
   # Context query (the Stop-hook path): resolve the agent working in DIR.
   # 1. ambient tmux session — catches a fleet agent whose cwd wandered into a
   #    non-repo subdir (the `bin/` bug): cwd→no repo name, but the session knows.
-  if command -v tmux >/dev/null 2>&1; then
+  #    Gated on $TMUX so it fires only when the CALLER is genuinely inside a pane;
+  #    without it, tmux would report the server's last-active session even for a
+  #    plain-terminal caller, leaking a fleet name into an unrelated run.
+  if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
     name="$(from_session "$(tmux display-message -p '#S' 2>/dev/null || true)")"
   fi
   # 2. git repo root of DIR → repo basename.
