@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# nhq-agent-name — resolve the REAL NHQ agent name for a given context.
+#
+# The bug this fixes: deriving an agent from a bare directory basename gives
+# garbage when a session ends in a non-repo subdir (e.g. a `bin/` dir → "bin").
+# Both the Stop-hook reply toast and `nhq-fleet` now route through here so they
+# show the actual agent, never a path fragment.
+#
+# Resolution order, most authoritative first:
+#   1. --session fleet-<agent>-<slug>   → <agent>            (explicit)
+#   2. ambient tmux session, if fleet-<agent>-*              (the running session)
+#   3. git repo root of --dir (default $PWD), mapped by repo path
+#   4. --dir is $HOME                   → Envy               (laptop-operator runs from ~)
+# Each step only accepts a KNOWN NHQ agent; unknown tokens are skipped, never
+# emitted. Prints the canonical name (HeyDaddy|Mirror|Envy|Director) to stdout,
+# or "" if the context can't be resolved — the caller decides the fallback.
+# It never prints a junk basename.
+#
+# Usage:
+#   nhq-agent-name [--dir DIR] [--session SESSION]
+set -euo pipefail
+
+DIR=""; SESSION=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dir)     DIR="${2:-}"; shift 2 ;;
+    --session) SESSION="${2:-}"; shift 2 ;;
+    *)         shift ;;
+  esac
+done
+[[ -z "$DIR" ]] && DIR="$PWD"
+
+# Map a known agent token / repo basename (case-insensitive) → canonical name.
+# Anything not a real NHQ agent returns "" so it can never leak as a name.
+canon() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    heydaddy)                     printf 'HeyDaddy' ;;
+    mirror)                       printf 'Mirror' ;;
+    envy)                         printf 'Envy' ;;
+    director|pm|product-manager)  printf 'Director' ;;
+    *)                            printf '' ;;
+  esac
+}
+
+# A fleet session is fleet-<agent>-<slug>; <slug> may itself contain dashes, so
+# match the agent as the KNOWN token right after "fleet-" (prefix match), not by
+# splitting on dashes (which breaks on "product-manager" and multi-word slugs).
+from_session() {
+  local s="${1:-}"
+  [[ "$s" == fleet-* ]] || return 0
+  case "${s#fleet-}" in
+    heydaddy|heydaddy-*)                                   canon heydaddy ;;
+    mirror|mirror-*)                                       canon mirror ;;
+    envy|envy-*)                                           canon envy ;;
+    director|director-*|product-manager|product-manager-*) canon director ;;
+    *)                                                     printf '' ;;
+  esac
+}
+
+name=""
+
+if [[ -n "$SESSION" ]]; then
+  # Authoritative query: "who is THIS session?" — resolve from the name only and
+  # stop. No ambient/dir fallback, so an unresolved session prints "" (the caller,
+  # e.g. nhq-fleet, must not silently borrow whichever session it happens to run in).
+  name="$(from_session "$SESSION")"
+else
+  # Context query (the Stop-hook path): resolve the agent working in DIR.
+  # 1. ambient tmux session — catches a fleet agent whose cwd wandered into a
+  #    non-repo subdir (the `bin/` bug): cwd→no repo name, but the session knows.
+  if command -v tmux >/dev/null 2>&1; then
+    name="$(from_session "$(tmux display-message -p '#S' 2>/dev/null || true)")"
+  fi
+  # 2. git repo root of DIR → repo basename.
+  if [[ -z "$name" ]]; then
+    root="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+    [[ -n "$root" ]] && name="$(canon "$(basename "$root")")"
+  fi
+  # 3. Envy is the laptop operator — she runs from $HOME, which is not a git repo.
+  [[ -z "$name" && "$DIR" == "$HOME" ]] && name="Envy"
+fi
+
+printf '%s' "$name"

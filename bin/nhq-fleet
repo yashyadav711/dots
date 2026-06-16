@@ -8,12 +8,17 @@
 # Usage: nhq-fleet
 set -euo pipefail
 
+# Real agent name (canonical) is resolved by the shared nhq-agent-name helper so
+# the dashboard matches the Stop-hook reply toast and survives multi-word agents
+# (product-manager) and dashed slugs — never a naive `cut -d-` fragment.
+RESOLVER="$HOME/.local/bin/nhq-agent-name"
+
 repo_for_agent() {
   case "${1:-}" in
-    heydaddy) echo "$HOME/Github/heydaddy" ;;
-    mirror)   echo "$HOME/Github/mirror" ;;
-    envy)     echo "$HOME/Github/envy" ;;
-    director) echo "$HOME/Github/product-manager" ;;
+    HeyDaddy) echo "$HOME/Github/heydaddy" ;;
+    Mirror)   echo "$HOME/Github/mirror" ;;
+    Envy)     echo "$HOME/Github/envy" ;;
+    Director) echo "$HOME/Github/product-manager" ;;
     *)        echo "" ;;
   esac
 }
@@ -29,8 +34,9 @@ echo "🛰  NHQ FLEET — ${#SESSIONS[@]} live session(s)"
 echo "──────────────────────────────────────────────────────────────"
 
 for S in "${SESSIONS[@]}"; do
-  # session name: fleet-<agent>-<slug...>
-  AGENT=$(printf '%s' "$S" | cut -d- -f2)
+  # session name: fleet-<agent>-<slug...> — resolve the REAL agent, not a fragment
+  AGENT=""
+  [[ -x "$RESOLVER" ]] && AGENT=$("$RESOLVER" --session "$S" 2>/dev/null)
   REPO=$(repo_for_agent "$AGENT")
 
   CMD=$(tmux display-message -p -t "$S" '#{pane_current_command}' 2>/dev/null || echo "?")
@@ -40,7 +46,8 @@ for S in "${SESSIONS[@]}"; do
   esac
 
   printf '%s\n' "$S"
-  printf '   repo:   %s\n' "${REPO:-<unknown agent: $AGENT>}"
+  printf '   agent:  %s\n' "${AGENT:-<unresolved>}"
+  printf '   repo:   %s\n' "${REPO:-<unknown — non-standard session name>}"
   printf '   state:  %s\n' "$STATE"
 
   # Tail the most-recently-modified file in the repo's ai/ dir, if any
