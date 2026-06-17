@@ -52,7 +52,7 @@ if [[ ! -x "$CLAUDE_BIN" ]]; then
 fi
 
 # Standard FLEET PROTOCOL footer (agent name baked in for the callback)
-FOOTER="--- FLEET PROTOCOL: You are an autonomous NHQ fleet agent. BRANCHES ONLY — no push, no merge, no deploy unless Yash explicitly says so. Surgical changes; flag Protocol-3 (auth/payments/PII/security), don't silently commit it. Keep a live progress file in this repo's ai/ dir. WHEN YOU FINISH (or are blocked), you MUST run: nhq-done ${AGENT} \"<one-paragraph result: what you did / blocked-on / branch>\" — this reports back to Director. Do not end silently."
+FOOTER="--- FLEET PROTOCOL: You are an autonomous NHQ fleet agent. BRANCHES ONLY — no push, no merge, no deploy unless Yash explicitly says so. Surgical changes; flag Protocol-3 (auth/payments/PII/security), don't silently commit it. Keep a live progress file in this repo's ai/ dir. MANDATORY LAST STEP — your task is NOT complete until you do this: when you finish (or are blocked), you MUST run: nhq-done ${AGENT} \"<one-paragraph result: what you did / blocked-on / branch>\". This is the ONLY way your result reaches Director — there is no other return path. If you finish and go idle WITHOUT calling nhq-done, you have silently failed to report, no matter how good the work was. Do not end the task by any other means; calling nhq-done is the final action, every time."
 
 MESSAGE="${TASK} ${FOOTER}"
 
