@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# nhq-fleet-selftest — proves the two Fleet Kit notify-back hardening fixes:
+#   Bug 1  nhq-await must NOT false-fire on a stale/leftover marker, but MUST fire
+#          on a marker written after (or in the re-arm hand-off just before) arm.
+#   Bug 2  nhq-reap must SPARE an idle session whose repo has uncommitted work or
+#          recent activity, while still reaping a clean+quiet repo.
+#
+# Hermetic: runs entirely against a throwaway $NHQ_STATE_DIR and temp git repos.
+# tmux-dependent subtests self-skip if tmux is unavailable.
+#
+# Usage: nhq-fleet-selftest        (exits non-zero if any assertion fails)
+set -uo pipefail
+
+BIN="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"; tmux kill-session -t fleet-selftest-fresh 2>/dev/null || true' EXIT
+
+export NHQ_STATE_DIR="$TMP/state"
+mkdir -p "$NHQ_STATE_DIR"
+
+pass=0; fail=0
+ok() { echo "  PASS: $1"; pass=$((pass + 1)); }
+no() { echo "  FAIL: $1"; fail=$((fail + 1)); }
+status_of() { grep -o 'NHQ-AWAIT-STATUS: .*' <<<"$1" | tail -1; }
+
+echo "── Bug 1: nhq-await stale-marker handling ──────────────────────────────"
+
+# 1a. A stale leftover marker (10 min old) on a session that no longer exists must
+#     NOT print REPORTED — under the bug it returned exit 0 / REPORTED immediately.
+S1="fleet-selftest-stale"
+M1="$NHQ_STATE_DIR/${S1}.done"
+echo "## leftover report from a prior run" > "$M1"
+touch -d "10 minutes ago" "$M1"
+out="$("$BIN/nhq-await" "$S1" --timeout 2 --poll 1 2>&1 || true)"
+if grep -q "NHQ-AWAIT-STATUS: REPORTED" <<<"$out"; then
+  no "stale marker false-fired REPORTED"
+else
+  ok "stale marker did not false-fire ($(status_of "$out"))"
+fi
+
+# 1b. A FRESH marker written after arm must fire REPORTED. Needs a live session so
+#     await doesn't GONE-exit first; a dummy tmux session (sleep) satisfies the
+#     has-session check. Self-skips if tmux is unavailable.
+if command -v tmux >/dev/null 2>&1; then
+  S2="fleet-selftest-fresh"
+  M2="$NHQ_STATE_DIR/${S2}.done"
+  rm -f "$M2"
+  tmux kill-session -t "$S2" 2>/dev/null || true
+  tmux new-session -d -s "$S2" "sleep 60" 2>/dev/null || true
+  ( sleep 1; echo "## fresh report for THIS task" > "$M2" ) &
+  out="$("$BIN/nhq-await" "$S2" --timeout 6 --poll 1 2>&1 || true)"
+  tmux kill-session -t "$S2" 2>/dev/null || true
+  if grep -q "NHQ-AWAIT-STATUS: REPORTED" <<<"$out"; then
+    ok "fresh marker fired REPORTED"
+  else
+    no "fresh marker did NOT fire ($(status_of "$out"))"
+  fi
+else
+  echo "  SKIP: 1b fresh-marker fire (tmux unavailable)"
+fi
+
+echo "── Bug 2: nhq-reap work-loss guard ─────────────────────────────────────"
+
+# Expose the reap helpers without walking live tmux sessions (source guard).
+# shellcheck source=/dev/null
+source "$BIN/nhq-reap"
+set +e   # nhq-reap sets -e on source; the harness tolerates assertion failures
+
+git_quiet() { git -C "$1" -c user.email=t@t -c user.name=t -c commit.gpgsign=false "${@:2}" >/dev/null 2>&1; }
+
+# 2a. Uncommitted work => protected (spared).
+RD="$TMP/dirty"; git init -q "$RD"; echo "work in progress" > "$RD/file.txt"
+if reason="$(nhq_reap_protected "$RD")"; then
+  ok "uncommitted tree => SPARED ($reason)"
+else
+  no "uncommitted tree was NOT spared"
+fi
+
+# 2b. Clean + quiet (old) repo => reapable (not protected).
+RC="$TMP/clean"; git init -q "$RC"; echo committed > "$RC/file.txt"
+git_quiet "$RC" add -A; git_quiet "$RC" commit -m init
+# backdate everything outside .git past the recency window
+find "$RC" -path '*/.git' -prune -o -print0 2>/dev/null | xargs -0 touch -d "30 minutes ago" 2>/dev/null
+if reason="$(nhq_reap_protected "$RC")"; then
+  no "clean+old tree was wrongly spared ($reason)"
+else
+  ok "clean+old tree => reapable"
+fi
+
+# 2c. Clean but recently modified => protected (spared).
+RR="$TMP/recent"; git init -q "$RR"; echo committed > "$RR/file.txt"
+git_quiet "$RR" add -A; git_quiet "$RR" commit -m init
+touch "$RR/file.txt"   # fresh mtime => within recency window
+if reason="$(nhq_reap_protected "$RR")"; then
+  ok "clean+recent tree => SPARED ($reason)"
+else
+  no "clean+recent tree was NOT spared"
+fi
+
+# 2d. Unknown/unmappable session => repo "" => not protected (idle policy applies).
+if [[ -z "$(nhq_session_repo "fleet-bogusagent-x")" ]]; then
+  ok "unknown agent maps to empty repo (idle policy applies)"
+else
+  no "unknown agent unexpectedly mapped to a repo"
+fi
+
+echo "────────────────────────────────────────────────────────────────────────"
+echo "nhq-fleet-selftest: ${pass} passed, ${fail} failed"
+[[ "$fail" -eq 0 ]]

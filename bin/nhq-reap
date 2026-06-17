@@ -16,6 +16,12 @@
 # invoked. For hands-off reaping, install the optional systemd user timer (see
 # FLEET-KIT.md). Safe to run anytime; --dry-run just reports.
 #
+# Work-loss guard (the "reaped a session with uncommitted work" bug): an IDLE
+# session past the idle limit is SPARED if its repo has uncommitted changes or was
+# modified within the recency window — either means in-flight work we must not kill.
+# DEAD sessions are still reaped (claude is already gone; the working tree is left
+# untouched on disk), and RUNNING sessions are never touched.
+#
 # Usage: nhq-reap [--dry-run]
 set -euo pipefail
 
@@ -23,36 +29,83 @@ SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
 # shellcheck source=/dev/null
 source "$(dirname "$SELF")/nhq-lib.sh"
 
-DRY=0
-[[ "${1:-}" == "--dry-run" ]] && DRY=1
-
 KILL="$HOME/.local/bin/nhq-kill"
 IDLE_LIMIT=$(( NHQ_IDLE_KILL_MIN * 60 ))
 
-reaped=0
-while IFS= read -r S; do
-  [[ -z "$S" ]] && continue
-  state="$(nhq_session_state "$S")"
-  case "$state" in
-    RUNNING)
-      nhq_touch_activity "$S"   # still working — keep it off the chopping block
-      ;;
-    IDLE)
-      idle=$(nhq_idle_seconds "$S")
-      if [[ "$idle" -ge "$IDLE_LIMIT" ]]; then
-        echo "reap: $S — IDLE ${idle}s ≥ ${IDLE_LIMIT}s → kill"
+# Minutes of recent repo modification that spares an idle session from reaping.
+NHQ_REAP_RECENT_MIN="${NHQ_REAP_RECENT_MIN:-10}"
+
+# Map a fleet session name (fleet-<agent>-<slug>) to its repo dir — same mapping
+# nhq-spawn uses. Echoes "" for an unknown/unmappable agent.
+nhq_session_repo() {
+  local s="${1:-}" agent
+  agent=$(printf '%s' "$s" | sed -E 's/^fleet-([a-z0-9]+).*/\1/')
+  case "$agent" in
+    heydaddy) echo "$HOME/Github/heydaddy" ;;
+    mirror)   echo "$HOME/Github/mirror" ;;
+    envy)     echo "$HOME/Github/envy" ;;
+    director) echo "$HOME/Github/product-manager" ;;
+    *)        echo "" ;;
+  esac
+}
+
+# Should an otherwise-reapable IDLE session be SPARED? Echoes the reason and returns
+# 0 (protected) if the repo has uncommitted work OR was modified within the recency
+# window; returns 1 (not protected) otherwise. An unknown/missing repo can't be
+# assessed for work → not protected (fall back to the idle policy).
+nhq_reap_protected() {
+  local repo="${1:-}"
+  [[ -z "$repo" || ! -d "$repo" ]] && return 1
+  if [[ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]]; then
+    echo "uncommitted changes in $repo"; return 0
+  fi
+  if [[ -n "$(find "$repo" -path '*/.git' -prune -o -type f \
+              -newermt "-${NHQ_REAP_RECENT_MIN} minutes" -print -quit 2>/dev/null)" ]]; then
+    echo "repo modified within ${NHQ_REAP_RECENT_MIN}m: $repo"; return 0
+  fi
+  return 1
+}
+
+nhq_reap_run() {
+  local DRY=0
+  [[ "${1:-}" == "--dry-run" ]] && DRY=1
+
+  local reaped=0 S state idle repo reason
+  while IFS= read -r S; do
+    [[ -z "$S" ]] && continue
+    state="$(nhq_session_state "$S")"
+    case "$state" in
+      RUNNING)
+        nhq_touch_activity "$S"   # still working — keep it off the chopping block
+        ;;
+      IDLE)
+        idle=$(nhq_idle_seconds "$S")
+        if [[ "$idle" -ge "$IDLE_LIMIT" ]]; then
+          repo="$(nhq_session_repo "$S")"
+          if reason="$(nhq_reap_protected "$repo")"; then
+            echo "skip-reap: $S — IDLE ${idle}s but SPARED ($reason)"
+          else
+            echo "reap: $S — IDLE ${idle}s ≥ ${IDLE_LIMIT}s → kill"
+            [[ "$DRY" -eq 0 ]] && "$KILL" "$S" >/dev/null 2>&1 || true
+            reaped=$((reaped + 1))
+          fi
+        fi
+        ;;
+      DEAD)
+        echo "reap: $S — DEAD (no claude) → kill"
         [[ "$DRY" -eq 0 ]] && "$KILL" "$S" >/dev/null 2>&1 || true
         reaped=$((reaped + 1))
-      fi
-      ;;
-    DEAD)
-      echo "reap: $S — DEAD (no claude) → kill"
-      [[ "$DRY" -eq 0 ]] && "$KILL" "$S" >/dev/null 2>&1 || true
-      reaped=$((reaped + 1))
-      ;;
-  esac
-done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^fleet-' || true)
+        ;;
+    esac
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^fleet-' || true)
 
-[[ "$reaped" -eq 0 ]] && exit 0
-note=""; [[ "$DRY" -eq 1 ]] && note=" (dry-run — nothing killed)"
-echo "nhq-reap: ${reaped} session(s) reaped${note}"
+  [[ "$reaped" -eq 0 ]] && return 0
+  local note=""; [[ "$DRY" -eq 1 ]] && note=" (dry-run — nothing killed)"
+  echo "nhq-reap: ${reaped} session(s) reaped${note}"
+}
+
+# Run a reap pass only when executed directly; sourcing exposes the helpers (for the
+# selftest harness) without walking live tmux sessions.
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+  nhq_reap_run "${1:-}"
+fi
