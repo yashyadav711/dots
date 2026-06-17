@@ -10,7 +10,7 @@ Local agent-fleet layer around the `claude` CLI. Rides Yash's Claude subscriptio
 |---|---|
 | `nhq-spawn <agent> "<task>"` | Spawn (or **reuse**) a `fleet-<agent>` tmux session running interactive `claude`, send the task + FLEET PROTOCOL footer. Prints `watch:`/`talk:`/`await:` lines. |
 | `nhq-tell <session> "<msg>"` | Send a message into a live session (mid-task redirect). Bumps the activity clock. |
-| `nhq-await <session> [--timeout S]` | **Block until the agent reports**, print the report, exit 0. Director's missing return path. Timeout → exit 124. |
+| `nhq-await <session> [--timeout S] [--watch]` | **Block until the agent reports**, print the report, exit 0. Director's missing return path. A still-running poll exits **0** with `STILL-RUNNING` (re-arm — NOT a failure); only a crashed session exits 3 (`GONE`). `--watch` = detached poller that survives the 10-min harness cap. |
 | `nhq-done <agent> "<result>"` | THE CALLBACK an agent runs when finished: drops a per-session done-marker (the `nhq-await` signal) + appends to Director's inbox + desktop toast. |
 | `nhq-fleet [--no-reap]` | Dashboard of all `fleet-*` sessions with true state. Runs an opportunistic reap pass unless `--no-reap`. |
 | `nhq-kill <session\|agent>` | Retire a session (kill tmux + clean state files). Agent name kills all its sessions. |
@@ -33,6 +33,47 @@ nhq-await fleet-heydaddy-add-retry-cap-to-t   # blocks; prints the report; exits
 The agent, when done, runs `nhq-done heydaddy "..."` (baked into its footer). That
 drops `~/.nhq-fleet/<session>.done`, which `nhq-await` is watching — it unblocks,
 prints the report, exits 0, and Director's harness fires the notification.
+
+### Long tasks vs the 10-min harness cap (the "everything shows FAILED" fix)
+
+The harness caps a background Bash command at **600000ms (10 min)**. A Fleet task can
+run 30–45 min. The old `nhq-await` defaulted to a 25-min timeout, so the harness
+SIGTERM-killed the watcher at 10 min — and a killed bg process renders as a **FAILED
+card** even though the agent was succeeding underneath. That is why "a lot of tasks
+showed FAILED" — the *watchers* failed, not the work.
+
+`nhq-await` now treats a still-running poll as a clean re-arm signal, never a failure.
+Parse the final `NHQ-AWAIT-STATUS:` line (and exit code) to route:
+
+| Final line | Exit | Meaning | Director does |
+|---|---|---|---|
+| `NHQ-AWAIT-STATUS: REPORTED` | 0 | agent ran nhq-done; report printed | fire completion notification |
+| `NHQ-AWAIT-STATUS: STILL-RUNNING` | 0 | own-timeout (9 min) or hard-kill | **re-arm: run `nhq-await` again** |
+| `NHQ-AWAIT-STATUS: WATCHING` | 0 | `--watch` handed off to a detached poller | read `<session>.await-result` later |
+| `NHQ-AWAIT-STATUS: GONE` | 3 | session crashed/killed, no report | **alert** — a real failure |
+| `NHQ-AWAIT-STATUS: ERROR` | 1 | bad usage | fix the call |
+
+Why it works: the default timeout is **540s (9 min)** — under the 10-min cap — so the
+watcher self-exits cleanly *before* the harness kills it. A `SIGTERM`/`INT` trap is the
+belt-and-suspenders: if anything hard-kills the watcher anyway, the trap still prints
+`STILL-RUNNING` and exits 0. So Director's re-arm loop is simply:
+
+```bash
+# Director's poll loop for a long Fleet task (each call ≤ 9 min, under the cap):
+while :; do
+  out=$(nhq-await fleet-heydaddy-long-task)        # exits 0 in ≤ 9 min
+  case "$out" in
+    *"STATUS: REPORTED"*)      echo "$out"; break ;;   # done — has the report
+    *"STATUS: GONE"*)          echo "agent died"; break ;;
+    *"STATUS: STILL-RUNNING"*) : ;;                    # loop: re-arm
+  esac
+done
+```
+
+Or, for fully hands-off waits longer than 10 min, `nhq-await <session> --watch`
+returns immediately and a `setsid`-detached poller (outside the harness process group,
+so the cap can't reach it) writes the report to `~/.nhq-fleet/<session>.await-result`
+and fires a toast on completion/GONE.
 
 ## State detection (the v1 bug, fixed)
 

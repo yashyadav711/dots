@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# nhq-await <session> [--timeout SECONDS] — block until a fleet agent reports back.
+# nhq-await <session> [--timeout SECONDS] [--poll SECONDS] [--watch]
+#   Block until a fleet agent reports back — WITHOUT reading as a failure when it
+#   simply hasn't finished yet.
 #
 # THE missing return path. Director runs this (via its harness `run_in_background`)
 # right after `nhq-spawn`. It blocks until the named session's agent calls
@@ -7,15 +9,38 @@
 # the captured report and exits 0 — so Director's harness fires a real completion
 # notification instead of having to poll the inbox.
 #
-# Robustness: it records its own start time and waits for a marker that is NEWER
-# than start (mtime >= start). A stale marker from a previous run of a reused
-# session therefore never false-trips it. Watching a per-session marker (not the
-# shared inbox) also avoids cross-agent false trips when two agents run at once.
+# ── Why the rewrite (the "everything shows FAILED" bug) ─────────────────────────
+# The harness caps a background Bash command at 600000ms (10 min). The old default
+# timeout here was 1500s (25 min) — so when Director watched a 30–45 min Fleet task,
+# the harness SIGTERM-killed this watcher at 10 min, BEFORE it reached its own
+# timeout branch. A killed bg process renders as a FAILED card. The old self-timeout
+# path also exited 124 (= failed). Both produced false-failure signals while the
+# agent work was succeeding underneath.
 #
-# Exit: 0 = report captured (printed to stdout). 124 = timed out. 1 = bad usage.
+# Fix: a still-running poll is now a CLEAN, non-failure signal Director re-arms:
+#   * default timeout 540s (9 min) — self-exits BEFORE the 10-min harness kill;
+#   * own-timeout exits 0 (not 124) with a STILL-RUNNING status → re-arm;
+#   * a SIGTERM/SIGINT trap turns any hard-kill into the same clean STILL-RUNNING/exit-0;
+#   * genuine outcomes stay distinguishable via a stable final NHQ-AWAIT-STATUS line
+#     AND exit code (below).
+#
+# ── Outcome contract (parse the final `NHQ-AWAIT-STATUS:` line) ─────────────────
+#   REPORTED       exit 0   agent ran nhq-done; report printed   (real completion)
+#   STILL-RUNNING  exit 0   own-timeout or hard-kill; RE-ARM     (NOT a failure)
+#   WATCHING       exit 0   --watch handed off to a detached poller (see below)
+#   GONE           exit 3   session crashed/killed, no report    (REAL failure)
+#   ERROR          exit 1   bad usage
+# Director: exit 0 + STILL-RUNNING  → just call nhq-await again (re-arm the watch).
+#           exit 0 + REPORTED       → fire the completion notification.
+#           exit 3 (GONE)           → alert: the agent died without reporting.
+#
+# Robustness: waits for a marker NEWER than start (mtime >= start) so a stale marker
+# from a prior run of a reused session never false-trips it. Watching a per-session
+# marker (not the shared inbox) avoids cross-agent false trips when two agents run.
 #
 # Usage: nhq-await fleet-heydaddy-add-retry
-#        nhq-await fleet-mirror-xyz --timeout 1800
+#        nhq-await fleet-mirror-xyz --timeout 540
+#        nhq-await fleet-heydaddy-long-task --watch   # detached, survives the cap
 set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
@@ -24,27 +49,29 @@ source "$(dirname "$SELF")/nhq-lib.sh"
 
 SESSION="${1:-}"
 shift || true
-TIMEOUT=1500   # default ~25 min
+# Default 540s (9 min): self-exit cleanly BEFORE the 600s/10-min harness bg cap.
+TIMEOUT=540
 POLL=20        # seconds between checks
+WATCH=0        # --watch => hand off to a detached poller that outlives the cap
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --timeout) TIMEOUT="${2:-1500}"; shift 2 ;;
+    --timeout) TIMEOUT="${2:-540}"; shift 2 ;;
     --poll)    POLL="${2:-20}"; shift 2 ;;
+    --watch)   WATCH=1; shift ;;
     *)         shift ;;
   esac
 done
 
 if [[ -z "$SESSION" ]]; then
-  echo "usage: nhq-await <session> [--timeout SECONDS]" >&2
+  echo "usage: nhq-await <session> [--timeout SECONDS] [--poll SECONDS] [--watch]" >&2
+  echo "NHQ-AWAIT-STATUS: ERROR"
   exit 1
 fi
 
 nhq_ensure_state_dir
 MARKER="$(nhq_marker "$SESSION")"
 START=$(date +%s)
-
-echo "nhq-await: watching $SESSION (timeout ${TIMEOUT}s, poll ${POLL}s) for $MARKER"
 
 # A marker counts only if it appeared/refreshed at or after we started waiting.
 marker_is_fresh() {
@@ -53,29 +80,84 @@ marker_is_fresh() {
   [[ "$m" -ge "$START" ]]
 }
 
+# --watch: fork a setsid-detached poller that survives the harness 10-min cap,
+# writes the report to <session>.await-result + fires a toast, then return now.
+if [[ "$WATCH" == "1" ]]; then
+  RESULT="$NHQ_STATE_DIR/${SESSION}.await-result"
+  NOTIFY="$HOME/.local/bin/nhq-notify"
+  # Detached poller: own session/process group, so a harness process-group kill of
+  # the foreground watcher never reaches it. Polls up to ~1h.
+  setsid bash -c '
+    SESSION="'"$SESSION"'"; MARKER="'"$MARKER"'"; RESULT="'"$RESULT"'"
+    POLL="'"$POLL"'"; START="'"$START"'"; NOTIFY="'"$NOTIFY"'"
+    WATCH_TIMEOUT=3600
+    fresh() { [ -f "$MARKER" ] || return 1; m=$(stat -c %Y "$MARKER" 2>/dev/null || echo 0); [ "$m" -ge "$START" ]; }
+    while :; do
+      if fresh; then
+        { echo "NHQ-AWAIT-STATUS: REPORTED"; cat "$MARKER"; } > "$RESULT"
+        [ -x "$NOTIFY" ] && "$NOTIFY" done "Fleet: $SESSION reported" "$(head -c 140 "$MARKER")" || true
+        exit 0
+      fi
+      now=$(date +%s)
+      [ $(( now - START )) -ge "$WATCH_TIMEOUT" ] && { echo "NHQ-AWAIT-STATUS: STILL-RUNNING (watch timeout)" > "$RESULT"; exit 0; }
+      if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        fresh && continue
+        echo "NHQ-AWAIT-STATUS: GONE" > "$RESULT"
+        [ -x "$NOTIFY" ] && "$NOTIFY" warn "Fleet: $SESSION GONE" "session died with no report" || true
+        exit 0
+      fi
+      sleep "$POLL"
+    done
+  ' >/dev/null 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+  echo "nhq-await: WATCHING $SESSION (detached poller; survives the 10-min cap)."
+  echo "  result will land in: $RESULT  (+ desktop toast on completion/GONE)"
+  echo "NHQ-AWAIT-STATUS: WATCHING"
+  exit 0
+fi
+
+# Foreground blocking watch. A hard-kill (e.g. the harness 10-min cap, if a caller
+# passed --timeout beyond it) is caught here and turned into a clean STILL-RUNNING
+# re-arm signal rather than a FAILED card.
+on_term() {
+  echo
+  echo "STILL-RUNNING — ${SESSION} has not reported yet (watcher terminated). Re-arm nhq-await."
+  echo "NHQ-AWAIT-STATUS: STILL-RUNNING"
+  exit 0
+}
+trap on_term TERM INT
+
+echo "nhq-await: watching $SESSION (timeout ${TIMEOUT}s, poll ${POLL}s) for $MARKER"
+
 while :; do
   if marker_is_fresh; then
     echo "── ${SESSION} reported ──────────────────────────────────────────"
     cat "$MARKER"
     echo "─────────────────────────────────────────────────────────────────"
+    echo "NHQ-AWAIT-STATUS: REPORTED"
     exit 0
   fi
 
   now=$(date +%s)
   if [[ $(( now - START )) -ge "$TIMEOUT" ]]; then
+    # Own timeout: NOT a failure — the agent is (almost certainly) still working.
+    # Exit 0 with STILL-RUNNING so Director re-arms instead of seeing a FAILED card.
     state="$(nhq_session_state "$SESSION")"
-    echo "TIMEOUT — ${SESSION} did not report within ${TIMEOUT}s. Session may be stuck — check the pane:"
+    echo "STILL-RUNNING — ${SESSION} has not reported within ${TIMEOUT}s (under the 10-min harness cap)."
     echo "  state: $(nhq_state_badge "$state")"
-    echo "  watch: tmux attach -t $SESSION"
-    exit 124
+    echo "  re-arm: nhq-await $SESSION   (or use --watch for a detached poller)"
+    echo "  inspect: tmux attach -t $SESSION"
+    echo "NHQ-AWAIT-STATUS: STILL-RUNNING"
+    exit 0
   fi
 
-  # If the session has gone DEAD with no fresh report, surface it early rather
-  # than blocking the full timeout (claude crashed / was killed mid-task).
+  # If the session has gone DEAD with no fresh report, surface it as a REAL failure
+  # (distinct from a still-running timeout) rather than blocking the full timeout.
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     if marker_is_fresh; then continue; fi
     echo "GONE — ${SESSION} no longer exists and left no report. It likely crashed or was killed."
-    exit 1
+    echo "NHQ-AWAIT-STATUS: GONE"
+    exit 3
   fi
 
   sleep "$POLL"
