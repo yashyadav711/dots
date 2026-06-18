@@ -208,9 +208,10 @@ case "${1:-}" in
     TOOL="$(printf '%s' "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)"
     [[ "$TOOL" == "Bash" ]] || exit 0
     CMD="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)"
-    # Commit detection (H3 + N2): allow inline env assignments (incl GIT_DIR=…) AND an
-    # `env [opts] [VAR=val…]` wrapper before `git` (N2: `env GIT_DIR=… git commit`).
-    echo "$CMD" | grep -qE '(^|[;&|]|&&)[[:space:]]*(env[[:space:]]+([^[:space:]]+[[:space:]]+)*)?([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git[[:space:]]+([^|;&]*[[:space:]])?commit([[:space:]]|$)' || exit 0
+    # Commit detection (H3 + N2 + NEW-C): allow inline env assignments (incl GIT_DIR=…) AND
+    # an env-wrapper before `git`, in ANY form — bare `env` or a path ending in `/env`
+    # (`/usr/bin/env git commit`). The pre-commit hook is the real gate; this is detection.
+    echo "$CMD" | grep -qE '(^|[;&|]|&&)[[:space:]]*((([^[:space:]]*/)?env)[[:space:]]+([^[:space:]]+[[:space:]]+)*)?([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git[[:space:]]+([^|;&]*[[:space:]])?commit([[:space:]]|$)' || exit 0
     CWD="$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)"; CWD="${CWD:-$PWD}"
     p3_set_git_ctx_from_cmd "$CMD" "$CWD"
     if p3_evaluate pretooluse; then exit 0; fi

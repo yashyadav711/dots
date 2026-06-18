@@ -45,14 +45,22 @@ check_dangerous() {
             return 0
         fi
 
-        # N3: strip a leading `[sudo] env [-i|-u VAR|-C dir|VAR=val …]` wrapper and re-check,
-        # so `env RAILWAY_TOKEN=x railway up`, `env -i railway up`, `sudo env … railway up`
-        # can't dodge the command-position anchors via the env(1) utility.
-        # Each option is consumed as exactly one of: an arg-taking flag + its value
-        # (-u/-C/-S…), a VAR=val assignment, or a no-arg flag (-i/-0/--…). Ordering the
-        # arg-taking flags first stops `-i` from wrongly swallowing the command token.
+        # N3 + NEW-A: strip a leading command-runner / env wrapper and re-check, so a
+        # dangerous cmd can't hide behind it. Two strips, each re-evaluated:
+        #  (i) a bare runner word at command position: [sudo] (command|exec|builtin) [-flags] —
+        #      catches `command railway up`, `exec railway up`.
+        local runstripped
+        runstripped="$(printf '%s' "$cmd" | sed -E 's/(^|[;&|(][[:space:]]*)(sudo[[:space:]]+)?(command|exec|builtin)([[:space:]]+-[A-Za-z]+)*[[:space:]]+/\1/')"
+        if [[ "$runstripped" != "$cmd" ]]; then
+            local rr; rr="$(check_dangerous "$runstripped" $((depth + 1)))"
+            [[ -n "$rr" ]] && { echo "$rr"; return 0; }
+        fi
+        #  (ii) the env(1) utility in ANY form (NEW-A): [sudo] [command|exec] [/usr(/local)?/bin/
+        #       |/bin/]env [opts]. Options consumed one-by-one: an arg-taking flag + its value
+        #       (-u/-C/-S…), a VAR=val assignment, or a no-arg flag — arg-taking first so `-i`
+        #       can't swallow the command token. Defeats `/usr/bin/env railway up`, `command env …`.
         local enstripped
-        enstripped="$(printf '%s' "$cmd" | sed -E 's/(^|[;&|(][[:space:]]*)(sudo[[:space:]]+)?env[[:space:]]+((-u|--unset|-C|--chdir|-S|--split-string|--block-signal)[[:space:]]+[^[:space:]]+[[:space:]]+|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+|-[^[:space:]]+[[:space:]]+)*/\1/')"
+        enstripped="$(printf '%s' "$cmd" | sed -E 's@(^|[;&|(][[:space:]]*)((command|exec)[[:space:]]+)?(sudo[[:space:]]+)?(/usr(/local)?/bin/|/bin/)?env[[:space:]]+((-u|--unset|-C|--chdir|-S|--split-string|--block-signal)[[:space:]]+[^[:space:]]+[[:space:]]+|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+|-[^[:space:]]+[[:space:]]+)*@\1@')"
         if [[ "$enstripped" != "$cmd" ]]; then
             local re; re="$(check_dangerous "$enstripped" $((depth + 1)))"
             [[ -n "$re" ]] && { echo "$re"; return 0; }
@@ -246,18 +254,25 @@ request_approval() {
     if [[ -n "${NHQ_APPROVE_CMD:-}" ]]; then
         "$NHQ_APPROVE_CMD" "$reason" "$cmd"; return $?
     fi
-    # Interactive GUI prompt on Yash's display — the agent cannot drive it and no token
-    # lands in any readable store (default selection = Deny).
-    if command -v rofi >/dev/null 2>&1 && [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
+    # No display at all (headless / relay) → cannot obtain human approval → DENY.
+    [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]] || return 1
+    # Interactive GUI prompt on Yash's display. NEW-B: ~/.local/bin is agent-writable and
+    # earlier in PATH than /usr/bin, so a planted `rofi`/`zenity` could auto-"Approve".
+    # Defeat the PATH-hijack: resolve the binary, require its realpath to be the trusted
+    # system path, and invoke THAT absolute path. A non-system binary → ignore → fail closed.
+    local rp
+    rp="$(realpath "$(command -v rofi 2>/dev/null)" 2>/dev/null || true)"
+    if [[ "$rp" == /usr/bin/rofi ]]; then
         choice="$(printf 'Deny\nApprove (I understand the risk)\n' \
-            | timeout 60 rofi -dmenu -i -no-custom -p "$prompt" 2>/dev/null)"
+            | timeout 60 /usr/bin/rofi -dmenu -i -no-custom -p "$prompt" 2>/dev/null)"
         [[ "$choice" == Approve* ]] && return 0 || return 1
     fi
-    if command -v zenity >/dev/null 2>&1 && [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
-        timeout 60 zenity --question --title="Dangerous command" \
+    rp="$(realpath "$(command -v zenity 2>/dev/null)" 2>/dev/null || true)"
+    if [[ "$rp" == /usr/bin/zenity ]]; then
+        timeout 60 /usr/bin/zenity --question --title="Dangerous command" \
             --text="$prompt"$'\n\n'"$cmd" 2>/dev/null && return 0 || return 1
     fi
-    # No interactive channel (headless / relay) → cannot obtain human approval → DENY.
+    # No TRUSTED interactive channel (only an untrusted/planted one, or none) → DENY.
     return 1
 }
 

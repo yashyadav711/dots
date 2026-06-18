@@ -482,6 +482,12 @@ gb "dunstctl history"
 gb "dunstctl close-all"
 gb "dunstctl history-pop"
 ga "dunstctl set-paused true"
+# NEW-B: a PATH-hijacked rofi (agent-planted, echoes Approve) must NOT auto-approve —
+# request_approval requires the binary's realpath to be the trusted /usr/bin/rofi.
+FAKER="$TMP/fakebin"; mkdir -p "$FAKER"
+printf '#!/usr/bin/env bash\necho "Approve (I understand the risk)"\n' > "$FAKER/rofi"; chmod +x "$FAKER/rofi"
+o="$(printf '%s' "$c1json" | env -u NHQ_APPROVE_CMD NHQ_NOTIFY="$C1NS" DISPLAY=:0 PATH="$FAKER:$PATH" bash "$GUARD")"
+grep -q '"deny"' <<<"$o" && ok "NEW-B: PATH-hijacked fake rofi rejected → DENY" || no "NEW-B: fake rofi AUTO-APPROVED (PATH hijack)"
 
 echo "── SEC-C2: eval / interpreter -c wrapper bypass blocked ────────────────"
 gb 'eval "rm -rf ~/Github/heydaddy"'
@@ -500,13 +506,26 @@ gb "A=1 sudo wipefs -a /dev/sda"
 gb "TOKEN=x dd if=z of=/dev/sda"
 ga "make FOO=bar all"
 
-echo "── SEC-N3: env(1)-wrapper dangerous command blocked ────────────────────"
+echo "── SEC-N3/NEW-A: env(1)/runner-wrapper dangerous command blocked ───────"
 gb "env RAILWAY_TOKEN=x railway up"
 gb "env -i railway up"
 gb "env -u FOO railway up"
 gb "sudo env FOO=1 wipefs -a /dev/sda"
+# NEW-A: absolute-path env, command/exec runners, and the C2 compound
+gb "/usr/bin/env railway up"
+gb "/bin/env supabase db reset"
+gb "/usr/local/bin/env railway up"
+gb "command env railway up"
+gb "exec env railway up"
+gb "command railway up"
+gb "exec railway up"
+gb 'bash -c "/usr/bin/env railway up"'
+gb "sudo /usr/bin/env pacman -Rns foo"
 ga "env LANG=C echo hi"
 ga "environment_setup railway"
+ga "/usr/bin/env python script.py"
+ga "command -v rofi"
+ga "commander deploy"
 
 echo "── SEC-L1: quoted secrets scrubbed in audit log ────────────────────────"
 LAF="$TMP/l1-audit.jsonl"
@@ -541,6 +560,9 @@ eq "H3: bogus GIT_DIR → fail-closed deny"            "$(pre_decision "GIT_DIR=
 # N2: the env(1) utility wrapping a commit is also detected (defense-in-depth; pre-commit is the real gate)
 eq "N2: env GIT_DIR= git commit detected → deny"     "$(pre_decision "env GIT_DIR=$SECR/.git git commit -m x")"     "deny"
 eq "N2: env FOO=1 GIT_DIR= git commit → deny"        "$(pre_decision "env FOO=1 GIT_DIR=$SECR/.git git commit -m x")" "deny"
+# NEW-C: absolute-path env wrapping a commit is detected too (consistency)
+eq "NEW-C: /usr/bin/env GIT_DIR= git commit → deny"  "$(pre_decision "/usr/bin/env GIT_DIR=$SECR/.git git commit -m x")" "deny"
+eq "NEW-C: /bin/env GIT_DIR= git commit → deny"      "$(pre_decision "/bin/env GIT_DIR=$SECR/.git git commit -m x")"     "deny"
 
 echo "── SEC-M3: mcp-write-guard generic hard pattern (no fail-open) ─────────"
 eq "M3: remove_environment → hard" "$("$BIN/mcp-write-guard" classify mcp__plugin_railway_railway__remove_environment)" "hard"
