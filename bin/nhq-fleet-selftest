@@ -18,6 +18,16 @@ trap 'rm -rf "$TMP"; tmux kill-session -t fleet-selftest-fresh 2>/dev/null || tr
 export NHQ_STATE_DIR="$TMP/state"
 mkdir -p "$NHQ_STATE_DIR"
 
+# TEST HYGIENE: fixtures must NEVER fire a real desktop toast at Yash. Two layers:
+#  1. NHQ_NOTIFY → a no-op stub. Every guard resolves notify via ${NHQ_NOTIFY:-…}, so
+#     even before this branch is merged (when $HOME/.local/bin/nhq-notify is still the
+#     old live binary) the guards call the stub, not the live notifier.
+#  2. NHQ_NOTIFY_SUPPRESS=1 — once this branch is live, nhq-notify itself early-exits,
+#     covering any hardcoded-path call too.
+export NHQ_NOTIFY="$TMP/notify-noop"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$NHQ_NOTIFY"; chmod +x "$NHQ_NOTIFY"
+export NHQ_NOTIFY_SUPPRESS=1 NHQ_TEST=1
+
 pass=0; fail=0
 ok() { echo "  PASS: $1"; pass=$((pass + 1)); }
 no() { echo "  FAIL: $1"; fail=$((fail + 1)); }
@@ -519,6 +529,23 @@ echo "── SEC-M3: mcp-write-guard generic hard pattern (no fail-open) ──�
 eq "M3: remove_environment → hard" "$("$BIN/mcp-write-guard" classify mcp__plugin_railway_railway__remove_environment)" "hard"
 eq "M3: wipe_data → hard"          "$("$BIN/mcp-write-guard" classify mcp__plugin_railway_railway__wipe_data)"          "hard"
 eq "M3: reset_project → hard"      "$("$BIN/mcp-write-guard" classify mcp__plugin_railway_railway__reset_project)"      "hard"
+
+echo "── SEC-NOTIFY: fixtures are toast-silent (no real desktop popups) ───────"
+# (1) nhq-notify self-suppresses under NHQ_NOTIFY_SUPPRESS=1 (covers hardcoded-path callers).
+if NHQ_NOTIFY_SUPPRESS=1 bash "$BIN/nhq-notify" blocked X Y >/dev/null 2>&1; then
+  ok "nhq-notify honors NHQ_NOTIFY_SUPPRESS (exit 0, no toast)"
+else
+  no "nhq-notify did not honor NHQ_NOTIFY_SUPPRESS"
+fi
+# (2) every guard routes its notification via ${NHQ_NOTIFY:-…}, so a deny lands on the
+#     stub — never the live notifier — even on an unmerged branch. Prove with p3-guard.
+NCAP="$TMP/notify-cap"; NSTB="$TMP/notify-cap-stub"
+printf '#!/usr/bin/env bash\necho fired >> "%s"\n' "$NCAP" > "$NSTB"; chmod +x "$NSTB"
+NREPO="$TMP/notify-repo"; git init -q "$NREPO"; git_quiet "$NREPO" commit --allow-empty -m base
+echo "SECRET=1" > "$NREPO/.env"; git_quiet "$NREPO" add .env
+NJ="$(jq -nc --arg c "git commit -m x" --arg cwd "$NREPO" '{tool_name:"Bash",session_id:"s",cwd:$cwd,tool_input:{command:$c}}')"
+echo "$NJ" | env NHQ_P3_PATHS="$P3PF" NHQ_AUDIT_BIN=/bin/true NHQ_NOTIFY="$NSTB" NHQ_AGENT=Envy NHQ_SESSION=fleet-envy-x "$BIN/nhq-p3-guard" >/dev/null 2>&1
+[[ -s "$NCAP" ]] && ok "p3-guard deny routes notify via NHQ_NOTIFY override (not the live binary)" || no "p3-guard notify NOT overridable — could fire a real toast"
 
 echo "────────────────────────────────────────────────────────────────────────"
 echo "nhq-fleet-selftest: ${pass} passed, ${fail} failed"

@@ -70,7 +70,7 @@ mcp_evaluate() {
 
 mcp_emit_deny() {
   local t="$1"
-  "$HOME/.local/bin/nhq-notify" blocked "🛑 Railway MCP BLOCKED" "$t needs approval" 2>/dev/null || true
+  "${NHQ_NOTIFY:-$HOME/.local/bin/nhq-notify}" blocked "🛑 Railway MCP BLOCKED" "$t needs approval" 2>/dev/null || true
   cat <<EOF
 {
   "hookSpecificOutput": {
