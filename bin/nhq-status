@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# nhq-status — the single fleet-state surface every reader renders from. Walks the
+# live fleet-* tmux sessions, resolves each one's full state (nhq_session_state_full)
+# and pulls its .meta (task / tokens / cost / branch). Four modes:
+#
+#   --block   one line per ACTIVE session (RUNNING/STALLED/BLOCKED) in the exact
+#             Director "🔄 RUNNING" copy-box format (replies.md RULE -4). Director
+#             pastes this verbatim — never hand-writes it. Empty fleet → prints
+#             NOTHING (no header, no newline).
+#   --human   the human dashboard (the old nhq-fleet view) + tokens/cost per session.
+#             Runs an opportunistic reap pass first unless --no-reap. (default)
+#   --json    [{session,agent,name,repo,state,task,runtime_min,tokens_in,tokens_out,
+#             cost_usd,branch}] — Control Center + `nhq-fleet --json` feed.
+#   --watch   `watch -n3 nhq-status --human` for a fleet-monitor pane.
+#
+# Source-guarded (like nhq-reap): sourcing exposes the render_* helpers (+ the
+# pluggable `live_sessions` / `meta_get`) for the selftest without walking tmux.
+#
+# Usage: nhq-status [--block|--human|--json|--watch] [--no-reap]
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+# shellcheck source=/dev/null
+source "$BIN/nhq-lib.sh"
+RESOLVER="$BIN/nhq-agent-name"
+
+# Live fleet sessions (overridable in tests).
+live_sessions() { tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^fleet-' || true; }
+
+# Read one field from a session's .meta ("" if absent/null).
+meta_get() {
+  local f; f="$(nhq_meta "$1")"
+  [[ -f "$f" ]] || { printf ''; return 0; }
+  jq -r --arg k "$2" 'if .[$k]==null then "" else .[$k] end' "$f" 2>/dev/null || printf ''
+}
+
+# Display name: prefer .meta agent_name, fall back to the resolver, then the session.
+session_name() {
+  local n; n="$(meta_get "$1" agent_name)"
+  [[ -z "$n" && -x "$RESOLVER" ]] && n="$("$RESOLVER" --session "$1" 2>/dev/null)"
+  [[ -z "$n" ]] && n="$1"
+  printf '%s' "$n"
+}
+
+# ── --block : the RULE -4 "🔄 RUNNING" copy box ───────────────────────────────
+render_block() {
+  local lines=() S st nm task suffix
+  while IFS= read -r S; do
+    [[ -z "$S" ]] && continue
+    st="$(nhq_session_state_full "$S")"
+    case "$st" in RUNNING|STALLED|BLOCKED) ;; *) continue ;; esac
+    nm="$(session_name "$S")"
+    task="$(meta_get "$S" task)"; [[ -z "$task" ]] && task="(no task recorded)"
+    suffix=""
+    [[ "$st" == "STALLED" ]] && suffix=" [STALLED]"
+    [[ "$st" == "BLOCKED" ]] && suffix=" [BLOCKED]"
+    lines+=("${nm} — ${task}${suffix}")
+  done < <(live_sessions)
+  # Empty fleet → print NOTHING.
+  [[ "${#lines[@]}" -eq 0 ]] && return 0
+  echo "🔄 RUNNING"
+  local n="${#lines[@]}" i
+  for i in "${!lines[@]}"; do
+    if [[ $(( i + 1 )) -eq "$n" ]]; then echo "└── ${lines[$i]}"; else echo "├── ${lines[$i]}"; fi
+  done
+}
+
+# ── --json ────────────────────────────────────────────────────────────────────
+render_json() {
+  local objs=() S st agent nm repo task branch tin tout cost se rt now
+  now="$(date +%s)"
+  while IFS= read -r S; do
+    [[ -z "$S" ]] && continue
+    st="$(nhq_session_state_full "$S")"
+    agent="$(nhq_session_agent "$S")"
+    nm="$(session_name "$S")"
+    repo="$(meta_get "$S" repo)"; [[ -z "$repo" ]] && repo="$(nhq_agent_repo "$agent")"
+    task="$(meta_get "$S" task)"
+    branch="$(meta_get "$S" branch)"
+    tin="$(meta_get "$S" tokens_in)";   [[ -z "$tin"  ]] && tin=0
+    tout="$(meta_get "$S" tokens_out)"; [[ -z "$tout" ]] && tout=0
+    cost="$(meta_get "$S" cost_usd)";   [[ -z "$cost" ]] && cost=0
+    se="$(meta_get "$S" spawn_epoch)";  [[ -z "$se" || "$se" == "0" ]] && se="$now"
+    rt=$(( (now - se) / 60 )); [[ "$rt" -lt 0 ]] && rt=0
+    objs+=("$(jq -n \
+      --arg session "$S" --arg agent "$agent" --arg name "$nm" --arg repo "$repo" \
+      --arg state "$st" --arg task "$task" --argjson runtime_min "$rt" \
+      --argjson tokens_in "$tin" --argjson tokens_out "$tout" --argjson cost_usd "$cost" \
+      --arg branch "$branch" \
+      '{session:$session,agent:$agent,name:$name,repo:$repo,state:$state,task:$task,
+        runtime_min:$runtime_min,tokens_in:$tokens_in,tokens_out:$tokens_out,
+        cost_usd:$cost_usd,branch:(if $branch=="" then null else $branch end)}')")
+  done < <(live_sessions)
+  if [[ "${#objs[@]}" -eq 0 ]]; then echo "[]"; else printf '%s\n' "${objs[@]}" | jq -s '.'; fi
+}
+
+# ── --human dashboard ─────────────────────────────────────────────────────────
+render_human() {
+  local noreap="${1:-0}" S
+  if [[ "$noreap" -eq 0 && -x "$BIN/nhq-reap" ]]; then
+    "$BIN/nhq-reap" >/dev/null 2>&1 || true
+  fi
+  local SESSIONS=(); while IFS= read -r S; do [[ -n "$S" ]] && SESSIONS+=("$S"); done < <(live_sessions)
+  if [[ "${#SESSIONS[@]}" -eq 0 ]]; then echo "🛰  NHQ FLEET — no live fleet sessions."; return 0; fi
+
+  echo "🛰  NHQ FLEET — ${#SESSIONS[@]} live session(s)"
+  echo "──────────────────────────────────────────────────────────────"
+  local agent nm repo state tin tout cost PROG
+  for S in "${SESSIONS[@]}"; do
+    agent="$(nhq_session_agent "$S")"
+    nm="$(session_name "$S")"
+    repo="$(meta_get "$S" repo)"; [[ -z "$repo" ]] && repo="$(nhq_agent_repo "$agent")"
+    state="$(nhq_state_badge "$(nhq_session_state_full "$S")")"
+    tin="$(meta_get "$S" tokens_in)"; tout="$(meta_get "$S" tokens_out)"; cost="$(meta_get "$S" cost_usd)"
+    printf '%s\n' "$S"
+    printf '   agent:  %s\n' "${nm:-<unresolved>}"
+    printf '   repo:   %s\n' "${repo:-<unknown — non-standard session name>}"
+    printf '   state:  %s\n' "$state"
+    if [[ -n "${tin}${tout}${cost}" ]]; then
+      printf '   usage:  %s in / %s out · $%s\n' "${tin:-0}" "${tout:-0}" "${cost:-0}"
+    fi
+    if [[ -n "$repo" && -d "$repo/ai" ]]; then
+      PROG=$(ls -t "$repo/ai"/*.md 2>/dev/null | head -1 || true)
+      if [[ -n "$PROG" ]]; then
+        printf '   progress (%s):\n' "$(basename "$PROG")"
+        tail -n 4 "$PROG" 2>/dev/null | sed 's/^/     │ /'
+      fi
+    fi
+    echo "──────────────────────────────────────────────────────────────"
+  done
+}
+
+nhq_status_main() {
+  local MODE="--human" NOREAP=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --block|--human|--json|--watch) MODE="$arg" ;;
+      --no-reap) NOREAP=1 ;;
+    esac
+  done
+  case "$MODE" in
+    --watch) exec watch -n3 "$SELF" --human ;;
+    --block) render_block ;;
+    --json)  render_json ;;
+    *)       render_human "$NOREAP" ;;
+  esac
+}
+
+# Run only when executed directly; sourcing exposes the render_* helpers for tests.
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+  nhq_status_main "$@"
+fi

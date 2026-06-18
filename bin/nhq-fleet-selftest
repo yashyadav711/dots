@@ -164,6 +164,88 @@ else
   echo "  SKIP: P1-c spawn-meta/NHQ_AGENT (tmux unavailable)"
 fi
 
+echo "── P2-a: nhq-cost sums a known JSONL → .meta ───────────────────────────"
+# Known transcript: input 100+200+300=600, output 10+20+30=60 (+ a non-assistant line).
+CJ="$NHQ_STATE_DIR/known-session.jsonl"
+{
+  echo '{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":5,"cache_creation_input_tokens":1}}}'
+  echo '{"type":"user","message":{"role":"user","content":"hi"}}'
+  echo '{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":200,"output_tokens":20}}}'
+  echo '{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":300,"output_tokens":30}}}'
+} > "$CJ"
+SC="fleet-selftest-cost"
+"$BIN/nhq-meta" init "$SC" repo "$HOME/Github/envy" model "Claude Sonnet 4.6 (Thinking)" spawn_epoch 1 >/dev/null 2>&1
+"$BIN/nhq-meta" set "$SC" jsonl "$CJ" >/dev/null 2>&1   # cache so cost uses our fixture
+"$BIN/nhq-cost" "$SC" >/dev/null 2>&1
+eq "cost tokens_in == 600"  "$("$BIN/nhq-meta" get "$SC" tokens_in)"  "600"
+eq "cost tokens_out == 60"  "$("$BIN/nhq-meta" get "$SC" tokens_out)" "60"
+eq "cost_usd == 0.0027"     "$("$BIN/nhq-meta" get "$SC" cost_usd)"   "0.0027"
+[[ -n "$("$BIN/nhq-meta" get "$SC" last_cost_ts)" ]] && ok "cost wrote last_cost_ts" || no "cost did not write last_cost_ts"
+
+echo "── P2-b: nhq_session_state_full 7-state resolver ───────────────────────"
+# Drive the base state via a mock; markers + a temp repo drive the derived states.
+nhq_session_state() { echo "${MOCK_BASE:-IDLE}"; }
+SR="$TMP/state_full_repo"; git init -q "$SR"
+git_quiet "$SR" commit --allow-empty -m base
+SB_COMMIT="$(git -C "$SR" rev-parse HEAD)"
+
+# GHOST: IDLE + fresh .done
+SG="fleet-selftest-ghost"; "$BIN/nhq-meta" init "$SG" repo "$SR" base_commit "$SB_COMMIT" >/dev/null 2>&1
+: > "$NHQ_STATE_DIR/$SG.done"; MOCK_BASE=IDLE
+eq "IDLE + fresh .done → GHOST" "$(nhq_session_state_full "$SG")" "GHOST"
+
+# ORPHAN: IDLE + new commit since base_commit + no .done
+SO="fleet-selftest-orphan"; "$BIN/nhq-meta" init "$SO" repo "$SR" base_commit "$SB_COMMIT" >/dev/null 2>&1
+git_quiet "$SR" commit --allow-empty -m work   # advances HEAD past base_commit
+MOCK_BASE=IDLE
+eq "IDLE + new commit + no .done → ORPHAN" "$(nhq_session_state_full "$SO")" "ORPHAN"
+
+# BLOCKED/STALLED markers win over base; pass-through otherwise.
+SBL="fleet-selftest-blocked"; "$BIN/nhq-meta" init "$SBL" repo "$SR" base_commit "$(git -C "$SR" rev-parse HEAD)" >/dev/null 2>&1
+: > "$NHQ_STATE_DIR/$SBL.blocked"; MOCK_BASE=RUNNING
+eq "blocked marker → BLOCKED (over RUNNING)" "$(nhq_session_state_full "$SBL")" "BLOCKED"
+SPT="fleet-selftest-passthru"; "$BIN/nhq-meta" init "$SPT" repo "$SR" base_commit "$(git -C "$SR" rev-parse HEAD)" >/dev/null 2>&1
+MOCK_BASE=RUNNING
+eq "no markers, no new commit → base RUNNING" "$(nhq_session_state_full "$SPT")" "RUNNING"
+unset -f nhq_session_state   # restore real resolver for anything downstream
+
+echo "── P2-c: nhq-status modes (mocked sessions) ────────────────────────────"
+# shellcheck source=/dev/null
+source "$BIN/nhq-status"   # source-guarded → exposes render_* without walking tmux
+"$BIN/nhq-meta" init fleet-selftest-run agent_name HeyDaddy task "Add retry cap to the upload queue" >/dev/null 2>&1
+"$BIN/nhq-meta" init fleet-selftest-stl agent_name Mirror   task "Fix the audit gap" >/dev/null 2>&1
+live_sessions() { printf '%s\n' fleet-selftest-run fleet-selftest-stl; }
+nhq_session_state_full() { case "$1" in fleet-selftest-run) echo RUNNING ;; fleet-selftest-stl) echo STALLED ;; *) echo IDLE ;; esac; }
+BLK="$(render_block)"
+WANT_BLK=$'🔄 RUNNING\n├── HeyDaddy — Add retry cap to the upload queue\n└── Mirror — Fix the audit gap [STALLED]'
+eq "--block byte-for-byte RULE -4" "$BLK" "$WANT_BLK"
+if render_json | jq -e 'type=="array" and length==2 and (.[0].state=="RUNNING")' >/dev/null 2>&1; then
+  ok "--json valid array, RUNNING session present"
+else
+  no "--json invalid or missing RUNNING session"
+fi
+# Empty fleet → --block prints nothing.
+live_sessions() { printf ''; }
+EMPTY="$(render_block)"
+eq "empty fleet → empty --block" "${#EMPTY}" "0"
+eq "empty fleet → --json is []" "$(render_json)" "[]"
+
+echo "── P2-d: nhq-done logs one ledger row + flips .meta DONE ────────────────"
+LED="$TMP/task-ledger.md"; printf '# NHQ Task Ledger\n\n## Ledger (newest first)\n' > "$LED"
+DJ="$NHQ_STATE_DIR/done-known.jsonl"
+echo '{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":200}}}' > "$DJ"
+"$BIN/nhq-meta" init fleet-envy agent envy agent_name Envy repo "$HOME/Github/envy" \
+  task "P2 OBSERVE build" model "Claude Opus 4.8" spawn_epoch "$(( $(date +%s) - 300 ))" last_state RUNNING >/dev/null 2>&1
+"$BIN/nhq-meta" set fleet-envy jsonl "$DJ" >/dev/null 2>&1
+# TMUX unset → nhq-done resolves the fallback session fleet-envy; hermetic overrides.
+env -u TMUX NHQ_LEDGER="$LED" NHQ_INBOX="$TMP/inbox.md" NHQ_NOTIFY=/bin/true NHQ_STATE_DIR="$NHQ_STATE_DIR" \
+  "$BIN/nhq-done" envy "Done: P2 built on feat/aos-v0-p1. No push." >/dev/null 2>&1
+eq "ledger has exactly one row" "$(grep -cE '^\| ' "$LED")" "1"
+ROW="$(grep -E '^\| ' "$LED")"
+if grep -qE '1000\+200 tok · \$0\.0300' <<<"$ROW"; then ok "ledger row carries real tokens + \$cost"; else no "ledger row missing token/cost ($ROW)"; fi
+eq "nhq-done flipped .meta last_state=DONE" "$("$BIN/nhq-meta" get fleet-envy last_state)" "DONE"
+[[ -n "$("$BIN/nhq-meta" get fleet-envy done_ts)" ]] && ok "nhq-done set done_ts" || no "nhq-done did not set done_ts"
+
 echo "────────────────────────────────────────────────────────────────────────"
 echo "nhq-fleet-selftest: ${pass} passed, ${fail} failed"
 [[ "$fail" -eq 0 ]]

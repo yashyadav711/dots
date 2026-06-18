@@ -89,12 +89,16 @@ nhq_session_state() {
   fi
 }
 
-# Pretty colored badge for a state.
+# Pretty colored badge for a state (base 3 + the P2 derived states).
 nhq_state_badge() {
   case "${1:-}" in
     RUNNING) echo "🟢 RUNNING (claude busy)" ;;
     IDLE)    echo "⚪ IDLE (claude alive, awaiting nhq-tell)" ;;
     DEAD)    echo "⚫ DEAD (no claude / at fish)" ;;
+    BLOCKED) echo "🔴 BLOCKED (agent needs a human gate)" ;;
+    STALLED) echo "🟠 STALLED (no progress past stall_min)" ;;
+    GHOST)   echo "👻 GHOST (reported, session lingering)" ;;
+    ORPHAN)  echo "🟣 ORPHAN (committed work, never called nhq-done)" ;;
     *)       echo "❓ UNKNOWN" ;;
   esac
 }
@@ -161,4 +165,52 @@ nhq_session_agent() {
     | "\(.t)\t\(.k)"
   ' "$(nhq_registry)" 2>/dev/null)
   printf ''
+}
+
+# ── P2 · 7-state resolver (marker-driven; P3 writes .stalled/.blocked, zero more
+# lib edits) ────────────────────────────────────────────────────────────────
+# Seconds a `.done` marker stays "fresh" enough to read an IDLE session as a
+# lingering GHOST card (vs a long-dead leftover). Overridable.
+NHQ_GHOST_FRESH_SEC="${NHQ_GHOST_FRESH_SEC:-900}"
+
+# Is marker file $1 present AND newer than $2 seconds (default the ghost window)?
+nhq_marker_fresh() {
+  local f="${1:-}" win="${2:-$NHQ_GHOST_FRESH_SEC}"
+  [[ -f "$f" ]] || return 1
+  local m now; m=$(stat -c %Y "$f" 2>/dev/null || echo 0); now=$(date +%s)
+  [[ $(( now - m )) -le "$win" ]]
+}
+
+# Did the session's repo advance past the base_commit captured in .meta at spawn?
+# 0 (true) only when .meta has a base_commit + repo and HEAD differs from it.
+nhq_session_has_new_commit() {
+  local s="${1:-}" meta base repo head
+  meta="$(nhq_meta "$s")"
+  [[ -f "$meta" ]] || return 1
+  base="$(jq -r '.base_commit // ""' "$meta" 2>/dev/null)"
+  repo="$(jq -r '.repo // ""' "$meta" 2>/dev/null)"
+  [[ -z "$base" || -z "$repo" || ! -d "$repo" ]] && return 1
+  head="$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "")"
+  [[ -n "$head" && "$head" != "$base" ]]
+}
+
+# Full fleet state on top of nhq_session_state's RUNNING|IDLE|DEAD:
+#   .blocked present                    → BLOCKED  (P3 producer; read here)
+#   .stalled present                    → STALLED  (P3 producer; read here)
+#   IDLE & fresh .done                  → GHOST    (reported, card lingering — relay C16)
+#   IDLE & new commit & no .done        → ORPHAN   (silent-complete — relay C4)
+#   else                                → base
+# Marker checks come first so a producer marker wins over the live base.
+nhq_session_state_full() {
+  local s="${1:-}"
+  [[ -f "$NHQ_STATE_DIR/$s.blocked" ]] && { echo "BLOCKED"; return 0; }
+  [[ -f "$NHQ_STATE_DIR/$s.stalled" ]] && { echo "STALLED"; return 0; }
+  local base; base="$(nhq_session_state "$s")"
+  if [[ "$base" == "IDLE" ]]; then
+    if nhq_marker_fresh "$(nhq_marker "$s")"; then echo "GHOST"; return 0; fi
+    if [[ ! -f "$(nhq_marker "$s")" ]] && nhq_session_has_new_commit "$s"; then
+      echo "ORPHAN"; return 0
+    fi
+  fi
+  echo "$base"
 }

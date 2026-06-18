@@ -1,64 +1,14 @@
 #!/usr/bin/env bash
 # nhq-fleet — dashboard of every live NHQ fleet agent.
 #
-# Lists each `fleet-*` tmux session: name, repo, true state, and the tail of the
-# most-recently-touched file in that repo's ai/ dir (the agent's progress).
-#
-# State (v2 — fixed): 🟢 RUNNING (claude busy) / ⚪ IDLE (claude alive at its
-# prompt, awaiting nhq-tell) / ⚫ DEAD (no claude / at fish). Detected by the
-# shared nhq-lib (process-tree + pane content), NOT pane_current_command — which
-# falsely reports `fish` while claude is mid-task (the v1 bug this fixes).
-#
-# Usage: nhq-fleet [--no-reap]
+# P2: this is now a thin alias over `nhq-status`, the single fleet-state surface.
+#   nhq-fleet            → nhq-status --human   (dashboard + tokens/cost per session)
+#   nhq-fleet --json     → nhq-status --json    (Control Center feed)
+#   nhq-fleet --no-reap  → nhq-status --human --no-reap   (skip the opportunistic reap)
+# nhq-status defaults to --human, so a bare `nhq-fleet` renders the dashboard; an
+# explicit mode flag (e.g. --json) overrides it. All state/repo/usage resolution
+# now lives in nhq-status + nhq-lib (registry + .meta), not here.
 set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
-# shellcheck source=/dev/null
-source "$(dirname "$SELF")/nhq-lib.sh"
-
-# Real agent name (canonical) is resolved by the shared nhq-agent-name helper so
-# the dashboard matches the Stop-hook reply toast and survives multi-word agents
-# (product-manager) and dashed slugs — never a naive `cut -d-` fragment.
-RESOLVER="$HOME/.local/bin/nhq-agent-name"
-
-# Opportunistic RAM-aware reap pass (no daemon needed): retire idle/dead sessions
-# whenever the dashboard is viewed. Skip with --no-reap.
-if [[ "${1:-}" != "--no-reap" && -x "$HOME/.local/bin/nhq-reap" ]]; then
-  "$HOME/.local/bin/nhq-reap" >/dev/null 2>&1 || true
-fi
-
-mapfile -t SESSIONS < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^fleet-' || true)
-
-if [[ "${#SESSIONS[@]}" -eq 0 ]]; then
-  echo "🛰  NHQ FLEET — no live fleet sessions."
-  exit 0
-fi
-
-echo "🛰  NHQ FLEET — ${#SESSIONS[@]} live session(s)"
-echo "──────────────────────────────────────────────────────────────"
-
-for S in "${SESSIONS[@]}"; do
-  # session name: fleet-<agent>-<slug...> — resolve the REAL agent, not a fragment
-  AGENT=""
-  [[ -x "$RESOLVER" ]] && AGENT=$("$RESOLVER" --session "$S" 2>/dev/null)
-  # Repo comes straight from the registry (nhq-lib), keyed off the session name —
-  # the single roster source, replacing the old display-name → repo case.
-  REPO=$(nhq_agent_repo "$(nhq_session_agent "$S")")
-
-  STATE="$(nhq_state_badge "$(nhq_session_state "$S")")"
-
-  printf '%s\n' "$S"
-  printf '   agent:  %s\n' "${AGENT:-<unresolved>}"
-  printf '   repo:   %s\n' "${REPO:-<unknown — non-standard session name>}"
-  printf '   state:  %s\n' "$STATE"
-
-  # Tail the most-recently-modified file in the repo's ai/ dir, if any
-  if [[ -n "$REPO" && -d "$REPO/ai" ]]; then
-    PROG=$(ls -t "$REPO/ai"/*.md 2>/dev/null | head -1 || true)
-    if [[ -n "$PROG" ]]; then
-      printf '   progress (%s):\n' "$(basename "$PROG")"
-      tail -n 4 "$PROG" 2>/dev/null | sed 's/^/     │ /'
-    fi
-  fi
-  echo "──────────────────────────────────────────────────────────────"
-done
+exec "$(dirname "$SELF")/nhq-status" "$@"

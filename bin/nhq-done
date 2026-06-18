@@ -13,6 +13,11 @@
 # Usage: nhq-done heydaddy "Done: added retry cap on branch feat/upload-retry. No push."
 set -euo pipefail
 
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+# shellcheck source=/dev/null
+source "$BIN/nhq-lib.sh"
+
 AGENT="${1:-}"
 RESULT="${2:-}"
 
@@ -21,8 +26,10 @@ if [[ -z "$AGENT" || -z "$RESULT" ]]; then
   exit 1
 fi
 
-INBOX="$HOME/Github/product-manager/ai/fleet-inbox.md"
-NOTIFY="$HOME/.local/bin/nhq-notify"
+# Overridable so the selftest stays hermetic (no real inbox / toast / ledger writes).
+INBOX="${NHQ_INBOX:-$HOME/Github/product-manager/ai/fleet-inbox.md}"
+NOTIFY="${NHQ_NOTIFY:-$HOME/.local/bin/nhq-notify}"
+LEDGER="${NHQ_LEDGER:-$HOME/Github/nhq-agentic-os/ai/task-ledger.md}"
 STATE_DIR="${NHQ_STATE_DIR:-$HOME/.nhq-fleet}"
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -41,6 +48,58 @@ mkdir -p "$STATE_DIR" 2>/dev/null || true
   echo "## ${TS} — ${AGENT} (${SESSION})"
   echo "${RESULT}"
 } > "$STATE_DIR/${SESSION}.done" 2>/dev/null || true
+
+# ── P2: settle cost, log one task-ledger row, flip .meta → DONE ───────────────
+# Best-effort and fully guarded — a missing .meta (pre-P1 session / direct CLI
+# call) just skips this; the core callback (marker + inbox + toast) never fails.
+META="$(nhq_meta "$SESSION")"
+if [[ -f "$META" ]]; then
+  # 1. Fill tokens_in/out + cost_usd from the session transcript.
+  "$BIN/nhq-cost" "$SESSION" >/dev/null 2>&1 || true
+
+  # 2. Read the record + capture the agent's working branch.
+  d_task="$(jq -r '.task        // ""' "$META" 2>/dev/null)"
+  d_model="$(jq -r '.model      // ""' "$META" 2>/dev/null)"
+  d_name="$(jq -r '.agent_name  // ""' "$META" 2>/dev/null)"
+  d_repo="$(jq -r '.repo        // ""' "$META" 2>/dev/null)"
+  d_epoch="$(jq -r '.spawn_epoch // 0' "$META" 2>/dev/null)"
+  d_tin="$(jq -r '.tokens_in    // 0'  "$META" 2>/dev/null)"
+  d_tout="$(jq -r '.tokens_out  // 0'  "$META" 2>/dev/null)"
+  d_cost="$(jq -r '.cost_usd    // 0'  "$META" 2>/dev/null)"
+  d_branch=""
+  [[ -n "$d_repo" && -d "$d_repo" ]] && d_branch="$(git -C "$d_repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+
+  # 3. Duration (wall-clock since spawn).
+  now_e="$(date +%s)"
+  if [[ "$d_epoch" =~ ^[0-9]+$ && "$d_epoch" -gt 0 ]]; then
+    mins=$(( (now_e - d_epoch) / 60 )); [[ "$mins" -lt 0 ]] && mins=0
+    if [[ "$mins" -ge 60 ]]; then dur="~$(( mins / 60 ))h $(( mins % 60 ))m"; else dur="~${mins}m"; fi
+  else
+    dur="—"
+  fi
+
+  # 4. Append exactly one task-ledger row (newest-first). Sanitize cell content so a
+  #    pipe / newline in the task or result can't break the markdown table.
+  san() { printf '%s' "${1:-}" | tr '\n' ' ' | sed 's/|/\//g; s/  */ /g'; }
+  when="$(date +%m-%d)"
+  row="| ${when} | $(san "$d_task") | relay | ${AGENT} | Director | ${d_name:-$AGENT} (fleet) | ${d_model:-—} | ${dur} | ${d_tin}+${d_tout} tok · \$${d_cost} | ✅ done | agent-only | ${d_branch:-—} · $(san "${RESULT:0:200}") |"
+  if [[ -f "$LEDGER" ]] && grep -qE '^\| ' "$LEDGER"; then
+    awk -v row="$row" '!ins && /^\| / { print row; ins=1 } { print }' "$LEDGER" > "$LEDGER.tmp" \
+      && mv "$LEDGER.tmp" "$LEDGER"
+  elif [[ -f "$LEDGER" ]] && grep -q '^## Ledger' "$LEDGER"; then
+    awk -v row="$row" '{print} !ins && /^## Ledger/ { print ""; print row; ins=1 }' "$LEDGER" > "$LEDGER.tmp" \
+      && mv "$LEDGER.tmp" "$LEDGER"
+  else
+    mkdir -p "$(dirname "$LEDGER")" 2>/dev/null || true
+    printf '%s\n' "$row" >> "$LEDGER"
+  fi
+
+  # 5. Flip the record to DONE.
+  "$BIN/nhq-meta" set "$SESSION" last_state DONE      >/dev/null 2>&1 || true
+  "$BIN/nhq-meta" set "$SESSION" done_ts    "$TS"     >/dev/null 2>&1 || true
+  "$BIN/nhq-meta" set "$SESSION" result     "$RESULT" >/dev/null 2>&1 || true
+  [[ -n "$d_branch" ]] && "$BIN/nhq-meta" set "$SESSION" branch "$d_branch" >/dev/null 2>&1 || true
+fi
 
 # Ensure the inbox exists with a header
 if [[ ! -f "$INBOX" ]]; then

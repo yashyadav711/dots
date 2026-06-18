@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# nhq-cost <session> | --all — sum a fleet session's token usage from its Claude
+# Code JSONL transcript and write tokens_in/tokens_out + cost_usd (+ the resolved
+# jsonl path + last_cost_ts) into the session's .meta record.
+#
+# JSONL→session resolution (Envy-lane heuristic; the cost source was locked by the
+# v0 plan, so this is mechanism, not a decision):
+#   1. Encode the repo path the way Claude Code does: every '/' and '.' → '-', under
+#      ~/.claude/projects/<ENC>/.
+#   2. If .meta.jsonl is already cached AND still exists, use it. Otherwise pick the
+#      newest *.jsonl in that dir with mtime ≥ the session's spawn_epoch, and cache
+#      it back into .meta.jsonl so later passes are stable.
+#   3. Sum the assistant `message.usage` token counters across the whole transcript.
+#   4. cost_usd from a model-keyed price table (list prices, per-MTok; recommend-only
+#      econ per plan decision D6 — not a billing source of truth).
+#
+# Usage: nhq-cost <session>     # one session
+#        nhq-cost --all         # every *.meta in the state dir
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+# shellcheck source=/dev/null
+source "$(dirname "$SELF")/nhq-lib.sh"
+META_BIN="$(dirname "$SELF")/nhq-meta"
+
+command -v jq >/dev/null 2>&1 || { echo "nhq-cost: jq not found" >&2; exit 1; }
+
+# List prices per million tokens (input / output), keyed loosely by the .meta model
+# string. Override-friendly defaults; cache tokens are folded into input at list rate
+# for a conservative estimate (we only persist tokens_in/out per the .meta schema).
+price_in()  { case "$1" in *Opus*) echo 15 ;; *Sonnet*) echo 3 ;; *Haiku*) echo 1 ;; *) echo 3 ;; esac; }
+price_out() { case "$1" in *Opus*) echo 75 ;; *Sonnet*) echo 15 ;; *Haiku*) echo 5 ;; *) echo 15 ;; esac; }
+
+cost_one() {
+  local session="${1:-}"
+  local meta; meta="$(nhq_meta "$session")"
+  [[ -f "$meta" ]] || { echo "nhq-cost: no .meta for '$session'" >&2; return 1; }
+
+  local repo model spawn_epoch cached
+  repo="$(jq -r '.repo // ""'        "$meta" 2>/dev/null)"
+  model="$(jq -r '.model // ""'      "$meta" 2>/dev/null)"
+  spawn_epoch="$(jq -r '.spawn_epoch // 0' "$meta" 2>/dev/null)"
+  cached="$(jq -r '.jsonl // ""'     "$meta" 2>/dev/null)"
+
+  # Resolve the transcript JSONL.
+  local jsonl=""
+  if [[ -n "$cached" && -f "$cached" ]]; then
+    jsonl="$cached"
+  elif [[ -n "$repo" ]]; then
+    local enc proj
+    enc="$(printf '%s' "$repo" | sed 's#[/.]#-#g')"
+    proj="$HOME/.claude/projects/$enc"
+    if [[ -d "$proj" ]]; then
+      jsonl="$(find "$proj" -maxdepth 1 -name '*.jsonl' -newermt "@$spawn_epoch" -printf '%T@ %p\n' 2>/dev/null \
+               | sort -rn | head -1 | cut -d' ' -f2-)"
+    fi
+  fi
+  if [[ -z "$jsonl" || ! -f "$jsonl" ]]; then
+    echo "nhq-cost: could not resolve a JSONL transcript for '$session'" >&2
+    return 1
+  fi
+
+  # Sum assistant message.usage across the transcript (cumulative; the locked source).
+  local sums tin tout
+  sums="$(jq -s '[.[]|.message.usage]
+    | { in:    (map(.input_tokens          // 0) | add),
+        out:   (map(.output_tokens         // 0) | add),
+        cache_r:(map(.cache_read_input_tokens // 0) | add),
+        cache_c:(map(.cache_creation_input_tokens // 0) | add) }' "$jsonl" 2>/dev/null)"
+  tin="$(jq -r '.in  // 0' <<<"$sums")"
+  tout="$(jq -r '.out // 0' <<<"$sums")"
+
+  # cost_usd = in/1e6*price_in + out/1e6*price_out (list prices).
+  local pin pout cost
+  pin="$(price_in "$model")"; pout="$(price_out "$model")"
+  cost="$(awk -v i="$tin" -v o="$tout" -v pi="$pin" -v po="$pout" \
+            'BEGIN{ printf "%.4f", (i/1000000.0)*pi + (o/1000000.0)*po }')"
+
+  local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "$META_BIN" set --json "$session" tokens_in  "$tin"   >/dev/null 2>&1 || true
+  "$META_BIN" set --json "$session" tokens_out "$tout"  >/dev/null 2>&1 || true
+  "$META_BIN" set --json "$session" cost_usd   "$cost"  >/dev/null 2>&1 || true
+  "$META_BIN" set        "$session" jsonl      "$jsonl" >/dev/null 2>&1 || true
+  "$META_BIN" set        "$session" last_cost_ts "$now" >/dev/null 2>&1 || true
+
+  echo "nhq-cost: $session  in=$tin out=$tout  \$$cost  ($model)"
+}
+
+case "${1:-}" in
+  --all)
+    nhq_ensure_state_dir
+    shopt -s nullglob
+    for m in "$NHQ_STATE_DIR"/*.meta; do
+      s="$(basename "$m" .meta)"
+      cost_one "$s" || true
+    done
+    ;;
+  ""|-h|--help)
+    echo "usage: nhq-cost <session> | --all" >&2
+    ;;
+  *)
+    cost_one "$1"
+    ;;
+esac
