@@ -454,28 +454,34 @@ eq "clean state → 0 leaks" "$(ctx_collect | jq 'length')" "0"
 export NHQ_STATE_DIR="$CTX_OLD_SD"
 unset -f nhq_session_state nhq_session_state_full 2>/dev/null || true
 
-echo "── SEC-C1: self-approval bypass closed (UUID commitment, SHA256) ───────"
-# Execute the guard (main) hermetically: isolated token dir + captured notification.
+echo "── SEC-C1/N1: out-of-band approval — no forgeable token, nothing in dunst ─"
+# The approval is synchronous + out-of-band (NHQ_APPROVE_CMD / interactive GUI). There is
+# NO token in any file, JSON, or notification, so the same-uid agent cannot forge it AND
+# nothing leaks via `dunstctl history` (round-2 N1). Hermetic: stub the approver + notify.
 GUARD="$BIN/../claude/hooks/dangerous-command-guard.sh"
-C1DIR="$TMP/c1"; C1NL="$TMP/c1-notif.log"
-C1NS="$TMP/c1-notify"; printf '#!/usr/bin/env bash\necho "$@" >> "%s"\n' "$C1NL" > "$C1NS"; chmod +x "$C1NS"
-c1run() { printf '{"tool_name":"Bash","session_id":"sx","tool_input":{"command":"railway up"}}' \
-  | env CLAUDE_DANGEROUS_DIR="$C1DIR" NHQ_NOTIFY="$C1NS" bash "$GUARD"; }
-o1="$(c1run)"
-grep -q '"deny"' <<<"$o1" && ok "C1: dangerous cmd denied on first block" || no "C1: first block not denied"
-PFILE="$(ls "$C1DIR"/pending/*.json 2>/dev/null | head -1)"; PJSON="$(cat "$PFILE" 2>/dev/null)"
-# NEGATIVE: forge approvals from every value the agent can read in the pending JSON (+cmdhash)
-for v in $(jq -r '.. | strings' "$PFILE" 2>/dev/null); do touch "$C1DIR/approved/$v" 2>/dev/null; done
-touch "$C1DIR/approved/$(basename "$PFILE" .json)" 2>/dev/null
-o2="$(c1run)"
-grep -q '"deny"' <<<"$o2" && ok "C1: forged approvals from pending JSON still DENIED" || no "C1: SELF-APPROVAL BYPASS"
-# POSITIVE: only the real UUID (notification-only) approves
-rm -f "$C1DIR"/approved/* 2>/dev/null
-C1U="$(grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$C1NL" | head -1)"
-touch "$C1DIR/approved/$C1U"
-o3="$(c1run)"
-grep -q '"deny"' <<<"$o3" && no "C1: real UUID failed to approve" || ok "C1: real notification UUID approves"
-if grep -q "$C1U" <<<"$PJSON"; then no "C1: uuid leaked into agent-readable JSON"; else ok "C1: uuid absent from pending JSON"; fi
+C1NL="$TMP/c1-notif.log"; C1NS="$TMP/c1-notify"
+printf '#!/usr/bin/env bash\necho "$@" >> "%s"\n' "$C1NL" > "$C1NS"; chmod +x "$C1NS"
+c1json='{"tool_name":"Bash","session_id":"sx","tool_input":{"command":"railway up"}}'
+# approver DENIES → command denied
+o="$(printf '%s' "$c1json" | env NHQ_NOTIFY="$C1NS" NHQ_APPROVE_CMD=/bin/false bash "$GUARD")"
+grep -q '"deny"' <<<"$o" && ok "C1: approver-deny → command DENIED" || no "C1: deny path broken"
+# approver APPROVES → allowed (no deny output)
+o="$(printf '%s' "$c1json" | env NHQ_NOTIFY="$C1NS" NHQ_APPROVE_CMD=/bin/true bash "$GUARD")"
+grep -q '"deny"' <<<"$o" && no "C1: approve path broke" || ok "C1: approver-approve → allowed"
+# no approver AND no GUI display → fail CLOSED (cannot self-approve)
+o="$(printf '%s' "$c1json" | env -u WAYLAND_DISPLAY -u DISPLAY -u NHQ_APPROVE_CMD NHQ_NOTIFY="$C1NS" bash "$GUARD")"
+grep -q '"deny"' <<<"$o" && ok "C1: no GUI + no approver → fail-closed deny" || no "C1: failed OPEN without an approver"
+# N1: the notification carries NO approval token / uuid / touch-path → nothing for dunst to leak
+if grep -qiE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|approved/|touch ' "$C1NL"; then
+  no "N1: notification leaks an approval token (would land in dunst history)"
+else
+  ok "N1: notification carries no token (nothing for dunstctl history to expose)"
+fi
+# N1a: reading/flushing the notification history is itself blocked
+gb "dunstctl history"
+gb "dunstctl close-all"
+gb "dunstctl history-pop"
+ga "dunstctl set-paused true"
 
 echo "── SEC-C2: eval / interpreter -c wrapper bypass blocked ────────────────"
 gb 'eval "rm -rf ~/Github/heydaddy"'
@@ -493,6 +499,14 @@ gb "RAILWAY_TOKEN=abc railway up"
 gb "A=1 sudo wipefs -a /dev/sda"
 gb "TOKEN=x dd if=z of=/dev/sda"
 ga "make FOO=bar all"
+
+echo "── SEC-N3: env(1)-wrapper dangerous command blocked ────────────────────"
+gb "env RAILWAY_TOKEN=x railway up"
+gb "env -i railway up"
+gb "env -u FOO railway up"
+gb "sudo env FOO=1 wipefs -a /dev/sda"
+ga "env LANG=C echo hi"
+ga "environment_setup railway"
 
 echo "── SEC-L1: quoted secrets scrubbed in audit log ────────────────────────"
 LAF="$TMP/l1-audit.jsonl"
@@ -524,6 +538,9 @@ eq "H1: pre-commit hook DENIES staged p3 (real defense vs add&&commit)" "$r" "de
 eq "H3: GIT_DIR= git commit detected → deny"        "$(pre_decision "GIT_DIR=$SECR/.git git commit -m x")"        "deny"
 eq "H3: leading-env + GIT_DIR= still detected → deny" "$(pre_decision "FOO=1 GIT_DIR=$SECR/.git git commit -m x")" "deny"
 eq "H3: bogus GIT_DIR → fail-closed deny"            "$(pre_decision "GIT_DIR=/nonexistent/.git git commit -m x")" "deny"
+# N2: the env(1) utility wrapping a commit is also detected (defense-in-depth; pre-commit is the real gate)
+eq "N2: env GIT_DIR= git commit detected → deny"     "$(pre_decision "env GIT_DIR=$SECR/.git git commit -m x")"     "deny"
+eq "N2: env FOO=1 GIT_DIR= git commit → deny"        "$(pre_decision "env FOO=1 GIT_DIR=$SECR/.git git commit -m x")" "deny"
 
 echo "── SEC-M3: mcp-write-guard generic hard pattern (no fail-open) ─────────"
 eq "M3: remove_environment → hard" "$("$BIN/mcp-write-guard" classify mcp__plugin_railway_railway__remove_environment)" "hard"

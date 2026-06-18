@@ -29,7 +29,9 @@ the real defense.** Wire BOTH:
 
 **A. PreToolUse (harness-level):** `settings.json` -> `hooks.PreToolUse` `Bash` matcher ->
 `~/.local/bin/nhq-p3-guard` (no args; reads hook JSON on stdin). Already in
-`settings.json.example`. Detects inline-env / `GIT_DIR=` / `git -C` commit forms (H3).
+`settings.json.example`. Detects inline-env / `GIT_DIR=` / `git -C` / `env … git commit`
+forms (H3 + N2). NOTE: PreToolUse is best-effort detection only — **the git pre-commit
+hook (B) is the real gate** that always sees the true staged set.
 
 **B. git pre-commit (REQUIRED on heydaddy, mirror, nhq-agentic-os):**
 ```

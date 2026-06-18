@@ -6,29 +6,30 @@
 # Original concept adapted to use file-based single-use approval tokens.
 #
 # Install: Add to .claude/settings.json under hooks.PreToolUse
-# Requires: jq, sha256sum, uuidgen (or /proc/sys/kernel/random/uuid)
+# Requires: jq; for the interactive approval prompt: rofi or zenity (optional).
 #
-# SECURITY MODEL (P4 hardening 2026-06-19, post Security review):
-#  • Approval is a RANDOM UUID shown ONLY in the desktop notification (Yash's screen).
-#    The pending JSON the guarded agent can read holds ONLY sha256(uuid) — a commitment
-#    it cannot reverse — so the agent can never mint its own approval (C1). SHA256 (L4).
-#  • Obscured commands can't slip through: `eval` is blocked outright, and the payload
-#    of an interpreter wrapper (bash -c / sh -c / python -c / …) is re-checked, including
-#    a quote-stripped pass for nested quoting (C2).
-#  • Inline env-var prefixes (RAILWAY_TOKEN=x railway up) are stripped + re-checked (M2);
-#    `..` path-traversal in a recursive rm is blocked (M1).
+# SECURITY MODEL (P4 hardening 2026-06-19, after two Security reviews):
+#  • Approval is OUT-OF-BAND and synchronous: on a dangerous command the hook asks Yash
+#    via an interactive rofi/zenity GUI prompt and blocks on his answer. There is NO
+#    approval token in any file, JSON, or notification — so it cannot be read or forged
+#    by the guarded agent (same-uid threat), and nothing leaks via `dunstctl history`
+#    (round-2 N1: the old UUID-in-dunst scheme is GONE). With no GUI (headless/relay)
+#    the gate fails CLOSED. A harness/test approver may be wired via NHQ_APPROVE_CMD
+#    (the agent cannot inject it — its command-inline env never reaches this hook).
+#  • Obscured commands can't slip through: `eval` blocked; interpreter -c/-e payloads
+#    re-checked incl. a quote-stripped pass (C2); inline env-var prefixes (M2) AND a
+#    leading `env`/`sudo env` wrapper (N3) are stripped + re-checked; `..` traversal in
+#    a recursive rm is blocked (M1); reading the notification history is blocked (N1a).
 #
-# TESTABILITY: `check_dangerous` is a pure function. The stdin-reading main logic runs
-# only when EXECUTED (sourced-vs-executed guard at the bottom). Env overrides for tests:
-# CLAUDE_DANGEROUS_DIR, NHQ_NOTIFY.
+# TESTABILITY: `check_dangerous` is a pure function; main runs only when EXECUTED
+# (sourced-vs-executed guard at the bottom). Test/override env: NHQ_NOTIFY, NHQ_APPROVE_CMD.
 
 # --- Configuration ---
-DANGEROUS_DIR="${CLAUDE_DANGEROUS_DIR:-/tmp/claude-dangerous}"
-PENDING_DIR="$DANGEROUS_DIR/pending"
-APPROVED_DIR="$DANGEROUS_DIR/approved"
 NOTIFY="${NHQ_NOTIFY:-$HOME/.local/bin/nhq-notify}"
-
-sha256() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+# NHQ_APPROVE_CMD (optional): an out-of-band approver this hook runs to ask Yash; exit 0
+# = approve. Set ONLY by the harness/settings/tests — the guarded agent cannot inject it
+# (its command-inline env affects the command, not this already-running hook process).
+# When unset, an interactive rofi/zenity GUI prompt is used; with no GUI we fail CLOSED.
 
 # --- Pattern matching ---
 # Returns a human-readable reason if the command is dangerous, empty otherwise.
@@ -42,6 +43,19 @@ check_dangerous() {
         if echo "$cmd" | grep -qiE '(^|[;&|(])[[:space:]]*eval([[:space:]]|$)'; then
             echo "run an obscured command via eval"
             return 0
+        fi
+
+        # N3: strip a leading `[sudo] env [-i|-u VAR|-C dir|VAR=val …]` wrapper and re-check,
+        # so `env RAILWAY_TOKEN=x railway up`, `env -i railway up`, `sudo env … railway up`
+        # can't dodge the command-position anchors via the env(1) utility.
+        # Each option is consumed as exactly one of: an arg-taking flag + its value
+        # (-u/-C/-S…), a VAR=val assignment, or a no-arg flag (-i/-0/--…). Ordering the
+        # arg-taking flags first stops `-i` from wrongly swallowing the command token.
+        local enstripped
+        enstripped="$(printf '%s' "$cmd" | sed -E 's/(^|[;&|(][[:space:]]*)(sudo[[:space:]]+)?env[[:space:]]+((-u|--unset|-C|--chdir|-S|--split-string|--block-signal)[[:space:]]+[^[:space:]]+[[:space:]]+|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+|-[^[:space:]]+[[:space:]]+)*/\1/')"
+        if [[ "$enstripped" != "$cmd" ]]; then
+            local re; re="$(check_dangerous "$enstripped" $((depth + 1)))"
+            [[ -n "$re" ]] && { echo "$re"; return 0; }
         fi
 
         # M2: strip a run of inline VAR=val prefixes at command position and re-check, so
@@ -138,6 +152,14 @@ check_dangerous() {
         return 0
     fi
 
+    # Read/flush the desktop notification history — could expose approval prompts or other
+    # secrets shown to Yash (N1a defense-in-depth, even though the approval flow no longer
+    # puts any token in a notification).
+    if echo "$cmd" | grep -qiE '(^|[;&|(]|[[:space:]])dunstctl[[:space:]]+(history|close-all|history-pop)([[:space:]]|$)'; then
+        echo "read or flush the desktop notification history (dunstctl)"
+        return 0
+    fi
+
     # Kill all processes
     if echo "$cmd" | grep -qiE '(^|[[:space:]])kill[[:space:]]+(-9[[:space:]]+)?-1([[:space:]]|$)'; then
         echo "kill all processes"
@@ -214,73 +236,61 @@ check_dangerous() {
     return 1
 }
 
+# request_approval <reason> <command> — obtain Yash's out-of-band approval.
+# Returns 0 (approve) / non-zero (deny). NO token is written anywhere (N1): the approval
+# is the human interaction itself, so it can't be read or forged by the same-uid agent.
+request_approval() {
+    local reason="$1" cmd="$2" choice prompt
+    prompt="DANGEROUS — would $reason. Approve this command?"
+    # Custom/automated approver (harness/settings/test only; the agent cannot inject it).
+    if [[ -n "${NHQ_APPROVE_CMD:-}" ]]; then
+        "$NHQ_APPROVE_CMD" "$reason" "$cmd"; return $?
+    fi
+    # Interactive GUI prompt on Yash's display — the agent cannot drive it and no token
+    # lands in any readable store (default selection = Deny).
+    if command -v rofi >/dev/null 2>&1 && [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
+        choice="$(printf 'Deny\nApprove (I understand the risk)\n' \
+            | timeout 60 rofi -dmenu -i -no-custom -p "$prompt" 2>/dev/null)"
+        [[ "$choice" == Approve* ]] && return 0 || return 1
+    fi
+    if command -v zenity >/dev/null 2>&1 && [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
+        timeout 60 zenity --question --title="Dangerous command" \
+            --text="$prompt"$'\n\n'"$cmd" 2>/dev/null && return 0 || return 1
+    fi
+    # No interactive channel (headless / relay) → cannot obtain human approval → DENY.
+    return 1
+}
+
 # --- Main hook logic (runs only when EXECUTED, not when sourced for testing) ---
 main() {
-    mkdir -p "$PENDING_DIR" "$APPROVED_DIR" 2>/dev/null
-
-    local INPUT TOOL_NAME
+    local INPUT TOOL_NAME COMMAND REASON
     INPUT=$(cat)
     TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty')
-    SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 
     [[ "$TOOL_NAME" != "Bash" ]] && exit 0
 
     COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
     [[ -z "$COMMAND" ]] && exit 0
 
-    # Cleanup stale tokens (pending: 5 min, approved: 60s)
-    find "$PENDING_DIR" -type f -mmin +5 -delete 2>/dev/null
-    find "$APPROVED_DIR" -type f -mmin +1 -delete 2>/dev/null
-
-    local REASON
     REASON=$(check_dangerous "$COMMAND")
     [[ -z "$REASON" ]] && exit 0   # Not dangerous, allow
 
-    # Approval scheme (C1): a per-block random UUID, shown ONLY in the notification.
-    # The pending JSON holds sha256(uuid) — a commitment the agent can't reverse. An
-    # approved file is valid iff sha256(its name) == the stored commitment.
-    local CMDHASH PENDING_FILE COMMIT
-    CMDHASH="$(sha256 "${SESSION_ID}:${COMMAND}")"
-    PENDING_FILE="$PENDING_DIR/$CMDHASH.json"
+    # Alert Yash. The notification carries NO approval token (N1: nothing to leak via
+    # dunst history) — the real approval is the out-of-band prompt below.
+    "$NOTIFY" blocked "🛑 Dangerous command needs approval" \
+      "Would $REASON — answer the approval prompt on screen." 2>/dev/null || true
 
-    if [[ -f "$PENDING_FILE" ]]; then
-        COMMIT="$(jq -r '.commitment // empty' "$PENDING_FILE" 2>/dev/null)"
-        local af
-        for af in "$APPROVED_DIR"/*; do
-            [[ -f "$af" ]] || continue
-            if [[ -n "$COMMIT" && "$(sha256 "$(basename "$af")")" == "$COMMIT" ]]; then
-                rm -f "$af" "$PENDING_FILE"     # single-use; consume both
-                exit 0                          # APPROVED → allow
-            fi
-        done
-        # pending exists, no matching approval → still blocked (reuse the commitment).
-    else
-        # First block for this command: mint a UUID, store ONLY its sha256 commitment.
-        local UUID
-        UUID="$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)"
-        COMMIT="$(sha256 "$UUID")"
-        cat > "$PENDING_FILE" <<PENDING_EOF
-{
-  "cmdhash": "$CMDHASH",
-  "session_id": "$SESSION_ID",
-  "command": $(echo "$COMMAND" | jq -Rs .),
-  "reason": "$REASON",
-  "commitment": "$COMMIT",
-  "timestamp": $(date +%s)
-}
-PENDING_EOF
-        # The UUID appears ONLY here (Yash's screen) — never on stdout, never in the JSON.
-        "$NOTIFY" blocked "🛑 Dangerous command BLOCKED" \
-          "Would $REASON. To approve, run:  touch $APPROVED_DIR/$UUID" 2>/dev/null || true
+    # Synchronous out-of-band approval. The guarded agent can neither read nor answer it.
+    if request_approval "$REASON" "$COMMAND"; then
+        exit 0   # Yash approved → allow
     fi
 
-    # Deny — the reason for the agent must NOT reveal the approval token.
     cat <<EOF
 {
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
-    "permissionDecisionReason": "BLOCKED: This command would $REASON. A one-time approval code was sent to Yash's desktop notification — it is NOT readable from here. Ask Yash to approve."
+    "permissionDecisionReason": "BLOCKED: This command would $REASON. Approval is interactive (on Yash's screen) and cannot be granted from here — ask Yash to approve."
   }
 }
 EOF
