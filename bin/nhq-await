@@ -26,13 +26,20 @@
 #
 # ── Outcome contract (parse the final `NHQ-AWAIT-STATUS:` line) ─────────────────
 #   REPORTED       exit 0   agent ran nhq-done; report printed   (real completion)
+#   DONE           exit 0   alias of REPORTED (P3 typed outcome; DONE == REPORTED)
+#   BLOCKED        exit 0   agent ran nhq-blocked; needs a human gate (NOT a failure)
+#   STALLED        exit 0   warden flagged no-progress; Director fires Otto playbook-05
 #   STILL-RUNNING  exit 0   own-timeout or hard-kill; RE-ARM     (NOT a failure)
 #   WATCHING       exit 0   --watch handed off to a detached poller (see below)
 #   GONE           exit 3   session crashed/killed, no report    (REAL failure)
 #   ERROR          exit 1   bad usage
-# Director: exit 0 + STILL-RUNNING  → just call nhq-await again (re-arm the watch).
-#           exit 0 + REPORTED       → fire the completion notification.
-#           exit 3 (GONE)           → alert: the agent died without reporting.
+# Director: exit 0 + REPORTED/DONE   → fire the completion notification.
+#           exit 0 + BLOCKED         → surface the gate to Yash; re-task once cleared.
+#           exit 0 + STALLED         → fire Otto playbook-05 (STALLED-session recovery).
+#           exit 0 + STILL-RUNNING   → just call nhq-await again (re-arm the watch).
+#           exit 3 (GONE)            → alert: the agent died without reporting.
+# Marker priority each poll: .blocked > .stalled > .done (a human gate / no-progress
+# flag outranks a completion that may have been written first).
 #
 # Robustness (the "stale marker false-fire" bug): at arm time we RETIRE any marker
 # older than a small grace window — a genuine report for THIS task cannot predate the
@@ -76,7 +83,9 @@ if [[ -z "$SESSION" ]]; then
 fi
 
 nhq_ensure_state_dir
-MARKER="$(nhq_marker "$SESSION")"
+MARKER="$(nhq_marker "$SESSION")"                    # .done  (nhq-done)
+BLOCKED_MARKER="$NHQ_STATE_DIR/${SESSION}.blocked"   # .blocked (nhq-blocked)
+STALLED_MARKER="$NHQ_STATE_DIR/${SESSION}.stalled"   # .stalled (nhq-warden)
 START=$(date +%s)
 
 # Re-arm hand-off tolerance (seconds): a report can land in the gap between one
@@ -88,21 +97,31 @@ ARM_GRACE="${NHQ_AWAIT_ARM_GRACE:-120}"
 # RETIRE a stale leftover marker at arm time: if a marker exists and is older than
 # the grace window, it is from a prior run (or truncated/orphaned) and must never
 # trip this await. Move it aside (best-effort; fall back to delete) and log it.
-if [[ -f "$MARKER" ]]; then
-  _mm=$(stat -c %Y "$MARKER" 2>/dev/null || echo 0)
-  if [[ $(( START - _mm )) -gt "$ARM_GRACE" ]]; then
-    mv -f "$MARKER" "${MARKER}.stale-${START}" 2>/dev/null || rm -f "$MARKER" 2>/dev/null || true
-    echo "nhq-await: retired a stale leftover marker for $SESSION ($(( START - _mm ))s old at arm)" >&2
+# P3: applies to all three typed markers (.done / .blocked / .stalled).
+retire_stale() {
+  local f="${1:-}"; [[ -f "$f" ]] || return 0
+  local m; m=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+  if [[ $(( START - m )) -gt "$ARM_GRACE" ]]; then
+    mv -f "$f" "${f}.stale-${START}" 2>/dev/null || rm -f "$f" 2>/dev/null || true
+    echo "nhq-await: retired a stale leftover marker $(basename "$f") for $SESSION ($(( START - m ))s old at arm)" >&2
   fi
-fi
+}
+retire_stale "$MARKER"
+retire_stale "$BLOCKED_MARKER"
+retire_stale "$STALLED_MARKER"
 
 # A marker counts as a real report only if it is no older than the grace window
 # relative to arm — i.e. it landed at/after arm, or in the re-arm hand-off just
 # before it. A pre-arm leftover (already retired above) can never satisfy this.
-marker_is_fresh() {
-  [[ -f "$MARKER" ]] || return 1
-  local m; m=$(stat -c %Y "$MARKER" 2>/dev/null || echo 0)
+marker_fresh() {
+  local f="${1:-}"; [[ -f "$f" ]] || return 1
+  local m; m=$(stat -c %Y "$f" 2>/dev/null || echo 0)
   [[ $(( START - m )) -le "$ARM_GRACE" ]]
+}
+marker_is_fresh() { marker_fresh "$MARKER"; }   # back-compat: .done freshness
+# Is ANY typed marker fresh (used to avoid a false GONE when a report just landed)?
+any_marker_fresh() {
+  marker_fresh "$BLOCKED_MARKER" || marker_fresh "$STALLED_MARKER" || marker_fresh "$MARKER"
 }
 
 # --watch: fork a setsid-detached poller that survives the harness 10-min cap,
@@ -114,19 +133,30 @@ if [[ "$WATCH" == "1" ]]; then
   # the foreground watcher never reaches it. Polls up to ~1h.
   setsid bash -c '
     SESSION="'"$SESSION"'"; MARKER="'"$MARKER"'"; RESULT="'"$RESULT"'"
+    BLOCKED_MARKER="'"$BLOCKED_MARKER"'"; STALLED_MARKER="'"$STALLED_MARKER"'"
     POLL="'"$POLL"'"; START="'"$START"'"; NOTIFY="'"$NOTIFY"'"; ARM_GRACE="'"$ARM_GRACE"'"
     WATCH_TIMEOUT=3600
-    fresh() { [ -f "$MARKER" ] || return 1; m=$(stat -c %Y "$MARKER" 2>/dev/null || echo 0); [ $(( START - m )) -le "$ARM_GRACE" ]; }
+    fresh() { [ -f "$1" ] || return 1; m=$(stat -c %Y "$1" 2>/dev/null || echo 0); [ $(( START - m )) -le "$ARM_GRACE" ]; }
     while :; do
-      if fresh; then
-        { echo "NHQ-AWAIT-STATUS: REPORTED"; cat "$MARKER"; } > "$RESULT"
+      if fresh "$BLOCKED_MARKER"; then
+        { echo "NHQ-AWAIT-STATUS: BLOCKED"; cat "$BLOCKED_MARKER"; } > "$RESULT"
+        [ -x "$NOTIFY" ] && "$NOTIFY" needs-you "Fleet: $SESSION BLOCKED" "$(head -c 140 "$BLOCKED_MARKER")" || true
+        exit 0
+      fi
+      if fresh "$STALLED_MARKER"; then
+        { echo "NHQ-AWAIT-STATUS: STALLED"; cat "$STALLED_MARKER"; } > "$RESULT"
+        [ -x "$NOTIFY" ] && "$NOTIFY" warn "Fleet: $SESSION STALLED" "$(head -c 140 "$STALLED_MARKER")" || true
+        exit 0
+      fi
+      if fresh "$MARKER"; then
+        { echo "NHQ-AWAIT-STATUS: REPORTED"; echo "NHQ-AWAIT-STATUS: DONE"; cat "$MARKER"; } > "$RESULT"
         [ -x "$NOTIFY" ] && "$NOTIFY" done "Fleet: $SESSION reported" "$(head -c 140 "$MARKER")" || true
         exit 0
       fi
       now=$(date +%s)
       [ $(( now - START )) -ge "$WATCH_TIMEOUT" ] && { echo "NHQ-AWAIT-STATUS: STILL-RUNNING (watch timeout)" > "$RESULT"; exit 0; }
       if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-        fresh && continue
+        { fresh "$BLOCKED_MARKER" || fresh "$STALLED_MARKER" || fresh "$MARKER"; } && continue
         echo "NHQ-AWAIT-STATUS: GONE" > "$RESULT"
         [ -x "$NOTIFY" ] && "$NOTIFY" warn "Fleet: $SESSION GONE" "session died with no report" || true
         exit 0
@@ -155,11 +185,28 @@ trap on_term TERM INT
 echo "nhq-await: watching $SESSION (timeout ${TIMEOUT}s, poll ${POLL}s) for $MARKER"
 
 while :; do
+  # Typed markers, priority .blocked > .stalled > .done.
+  if marker_fresh "$BLOCKED_MARKER"; then
+    echo "── ${SESSION} BLOCKED — needs a human gate ──────────────────────"
+    cat "$BLOCKED_MARKER"
+    echo "─────────────────────────────────────────────────────────────────"
+    echo "NHQ-AWAIT-STATUS: BLOCKED"
+    exit 0
+  fi
+  if marker_fresh "$STALLED_MARKER"; then
+    echo "── ${SESSION} STALLED — no progress (warden) ────────────────────"
+    cat "$STALLED_MARKER"
+    echo "─────────────────────────────────────────────────────────────────"
+    echo "NHQ-AWAIT-STATUS: STALLED"
+    exit 0
+  fi
   if marker_is_fresh; then
     echo "── ${SESSION} reported ──────────────────────────────────────────"
     cat "$MARKER"
     echo "─────────────────────────────────────────────────────────────────"
+    # REPORTED stays the back-compat terminal token; DONE is the P3 alias.
     echo "NHQ-AWAIT-STATUS: REPORTED"
+    echo "NHQ-AWAIT-STATUS: DONE"
     exit 0
   fi
 
@@ -179,7 +226,7 @@ while :; do
   # If the session has gone DEAD with no fresh report, surface it as a REAL failure
   # (distinct from a still-running timeout) rather than blocking the full timeout.
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-    if marker_is_fresh; then continue; fi
+    if any_marker_fresh; then continue; fi   # a typed marker just landed — let the loop top handle it
     echo "GONE — ${SESSION} no longer exists and left no report. It likely crashed or was killed."
     echo "NHQ-AWAIT-STATUS: GONE"
     exit 3

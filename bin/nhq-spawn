@@ -71,7 +71,7 @@ if [[ ! -x "$CLAUDE_BIN" ]]; then
 fi
 
 # Standard FLEET PROTOCOL footer (agent name baked in for the callback)
-FOOTER="--- FLEET PROTOCOL: You are an autonomous NHQ fleet agent. BRANCHES ONLY — no push, no merge, no deploy unless Yash explicitly says so. Surgical changes; flag Protocol-3 (auth/payments/PII/security), don't silently commit it. Keep a live progress file in this repo's ai/ dir. WHEN YOU FINISH (or are blocked), you MUST run: nhq-done ${AGENT} \"<one-paragraph result: what you did / blocked-on / branch>\" — this reports back to Director. Do not end silently."
+FOOTER="--- FLEET PROTOCOL: You are an autonomous NHQ fleet agent. BRANCHES ONLY — no push, no merge, no deploy unless Yash explicitly says so. Surgical changes; flag Protocol-3 (auth/payments/PII/security), don't silently commit it. Keep a live progress file in this repo's ai/ dir. WHEN YOU FINISH (or are blocked), you MUST run: nhq-done ${AGENT} \"<one-paragraph result: what you did / blocked-on / branch>\" — this reports back to Director. If you hit a human gate you cannot pass autonomously (a decision, credential, or approval only Yash can give), run nhq-blocked ${AGENT} \"<what you need to be unblocked>\" instead of stalling. Do not end silently."
 
 MESSAGE="${TASK} ${FOOTER}"
 

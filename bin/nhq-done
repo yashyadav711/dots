@@ -6,7 +6,7 @@
 #      report — the signal `nhq-await` blocks on. This is the v2 return path that
 #      lets Director get a real completion notification instead of polling.
 #   2. Appends a timestamped, structured entry to Director's fleet inbox
-#      (~/Github/product-manager/ai/fleet-inbox.md — created if missing).
+#      (~/Github/nhq-agentic-os/ai/fleet-inbox.md — created if missing).
 #   3. Fires a desktop toast so Yash gets pinged immediately.
 # Director reads the inbox on next session start and chains the next task.
 #
@@ -27,7 +27,9 @@ if [[ -z "$AGENT" || -z "$RESULT" ]]; then
 fi
 
 # Overridable so the selftest stays hermetic (no real inbox / toast / ledger writes).
-INBOX="${NHQ_INBOX:-$HOME/Github/product-manager/ai/fleet-inbox.md}"
+# P3: inbox migrated to nhq-agentic-os (Director's canonical home; product-manager
+# is now legacy/fallback).
+INBOX="${NHQ_INBOX:-$HOME/Github/nhq-agentic-os/ai/fleet-inbox.md}"
 NOTIFY="${NHQ_NOTIFY:-$HOME/.local/bin/nhq-notify}"
 LEDGER="${NHQ_LEDGER:-$HOME/Github/nhq-agentic-os/ai/task-ledger.md}"
 STATE_DIR="${NHQ_STATE_DIR:-$HOME/.nhq-fleet}"

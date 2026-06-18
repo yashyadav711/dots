@@ -11,7 +11,7 @@ Watches every 30 s:
 Alerts go to nhq-notify warden. Cooldown: 900 s (15 min) per alert type.
 Log: ~/.local/state/nhq-warden.log
 """
-import os, time, shutil, glob, subprocess, signal
+import os, time, shutil, glob, subprocess, signal, json, re, sys
 
 INTERVAL   = 30    # seconds between polls
 COOLDOWN   = 900   # seconds between repeated alerts of the same type
@@ -22,8 +22,20 @@ DISK_USED_PCT_WARN = 90          # alert when / usage % > this
 ZOMBIE_WARN        = 5           # alert when zombie count >= this
 
 OOM_LOG   = os.path.expanduser("~/.local/state/claude-oom-guard.log")
-STATE_LOG = os.path.expanduser("~/.local/state/nhq-warden.log")
-NOTIFY    = os.path.expanduser("~/.local/bin/nhq-notify")
+STATE_LOG = os.environ.get("NHQ_WARDEN_LOG", os.path.expanduser("~/.local/state/nhq-warden.log"))
+NOTIFY    = os.environ.get("NHQ_NOTIFY", os.path.expanduser("~/.local/bin/nhq-notify"))
+
+# ── P3 · fleet-supervision config ─────────────────────────────────────────────
+SELF_DIR          = os.path.dirname(os.path.realpath(__file__))
+NHQ_LIB           = os.path.join(SELF_DIR, "nhq-lib.sh")
+STATE_DIR         = os.environ.get("NHQ_STATE_DIR", os.path.expanduser("~/.nhq-fleet"))
+DEFAULT_STALL_MIN = int(os.environ.get("NHQ_DEFAULT_STALL_MIN", "15"))
+# A session's token-timer is "frozen" if its JSONL transcript hasn't advanced within
+# this window (no model activity) — one of the three ANDed STALLED conditions.
+FREEZE_SEC        = int(os.environ.get("NHQ_WARDEN_FREEZE_SEC", "300"))
+# Base-state resolver. Default: the canonical nhq-lib resolver (RUNNING|IDLE|DEAD).
+# Overridable with a stub `<cmd> <session>` for hermetic unit tests.
+STATE_CMD         = os.environ.get("NHQ_WARDEN_STATE_CMD", "")
 
 _last_alert: dict[str, float] = {}
 _oom_log_pos = 0
@@ -104,6 +116,128 @@ def check_oom_log() -> None:
         pass
 
 
+# ── P3 · fleet supervision (one extra pass in the same 30s loop) ──────────────
+def _sh(args: list[str], timeout: int = 10) -> str:
+    """Run a command, return stripped stdout ('' on any failure)."""
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def base_state(session: str) -> str:
+    """Live base state (RUNNING|IDLE|DEAD) via the canonical nhq-lib resolver, or a
+    test-injected stub. Never raises — unknown → DEAD."""
+    if STATE_CMD:
+        return _sh([STATE_CMD, session]) or "DEAD"
+    return _sh(["bash", "-c", 'source "$1"; nhq_session_state "$2"', "_", NHQ_LIB, session]) or "DEAD"
+
+
+def stall_min_for(meta: dict) -> int:
+    """Per-agent stall threshold from the registry, falling back to the default."""
+    agent = meta.get("agent") or ""
+    if agent:
+        out = _sh(["bash", "-c", 'source "$1"; nhq_agent_stall_min "$2"', "_", NHQ_LIB, agent])
+        if out.isdigit():
+            return int(out)
+    return DEFAULT_STALL_MIN
+
+
+def _jsonl_for(meta: dict):
+    """The session's transcript JSONL: cached .meta.jsonl if present, else the newest
+    *.jsonl in the repo's encoded project dir with mtime >= spawn_epoch (P2 heuristic,
+    inlined so P3 stays independent of P2)."""
+    j = meta.get("jsonl")
+    if j and os.path.exists(j):
+        return j
+    repo = meta.get("repo") or ""
+    if not repo:
+        return None
+    proj = os.path.expanduser("~/.claude/projects/" + re.sub(r"[/.]", "-", repo))
+    if not os.path.isdir(proj):
+        return None
+    spawn = int(meta.get("spawn_epoch") or 0)
+    best, best_m = None, -1.0
+    for p in glob.glob(os.path.join(proj, "*.jsonl")):
+        try:
+            m = os.path.getmtime(p)
+        except OSError:
+            continue
+        if m >= spawn and m > best_m:
+            best, best_m = p, m
+    return best
+
+
+def jsonl_frozen(meta: dict, now: float) -> bool:
+    """True when no model activity within FREEZE_SEC (transcript mtime stale, or none)."""
+    j = _jsonl_for(meta)
+    if not j:
+        return True
+    try:
+        return (now - os.path.getmtime(j)) > FREEZE_SEC
+    except OSError:
+        return True
+
+
+def has_new_commit(meta: dict) -> bool:
+    """Did the repo advance past the base_commit captured at spawn?"""
+    base = meta.get("base_commit") or ""
+    repo = meta.get("repo") or ""
+    if not base or not repo or not os.path.isdir(repo):
+        return False
+    head = _sh(["git", "-C", repo, "rev-parse", "HEAD"])
+    return bool(head) and head != base
+
+
+def check_fleet() -> None:
+    """One supervision pass over every *.meta. Cooldown-gated via alert(); .stalled
+    writes are idempotent and cleared when a session leaves RUNNING. Additive to the
+    system-resource job — wrapped so a fleet error never breaks the machine watch."""
+    now = time.time()
+    for mp in glob.glob(os.path.join(STATE_DIR, "*.meta")):
+        try:
+            with open(mp) as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            continue
+        session = meta.get("session") or os.path.basename(mp)[:-5]
+        stalled_marker = os.path.join(STATE_DIR, f"{session}.stalled")
+        done_marker    = os.path.join(STATE_DIR, f"{session}.done")
+        blocked_marker = os.path.join(STATE_DIR, f"{session}.blocked")
+        base = base_state(session)
+
+        # Clear a lingering .stalled once the session leaves RUNNING (recovered/idle/gone).
+        if base != "RUNNING" and os.path.exists(stalled_marker):
+            try:
+                os.remove(stalled_marker)
+                log(f"fleet: cleared .stalled for {session} (left RUNNING → {base})")
+            except OSError:
+                pass
+
+        # STALLED: RUNNING AND past stall_min AND no new commit AND token-timer frozen.
+        # (A blocked session is awaiting a human gate, not stalled — skip it.)
+        if base == "RUNNING" and not os.path.exists(blocked_marker):
+            spawn = int(meta.get("spawn_epoch") or 0)
+            runtime = now - spawn if spawn else 0
+            if runtime > stall_min_for(meta) * 60 and not has_new_commit(meta) and jsonl_frozen(meta, now):
+                reason = (f"RUNNING {int(runtime // 60)}m, no commit since {meta.get('base_commit','')[:7]}, "
+                          f"token-timer frozen >{FREEZE_SEC}s")
+                if not os.path.exists(stalled_marker):
+                    try:
+                        with open(stalled_marker, "w") as f:
+                            f.write(time.strftime("## %Y-%m-%dT%H:%M:%SZ", time.gmtime(now)) +
+                                    f" — warden STALLED\n{reason}\n")
+                    except OSError:
+                        pass
+                alert(f"stall:{session}", f"🟠 Fleet STALLED: {session}", reason)
+
+        # Silent-complete / ORPHAN: IDLE AND new commit since spawn AND no .done.
+        elif base == "IDLE" and not os.path.exists(done_marker) and has_new_commit(meta):
+            alert(f"orphan:{session}", f"🟣 Fleet finished, no nhq-done: {session}",
+                  "committed work but never called nhq-done — verify the artifact")
+
+
 def check_all() -> None:
     mem = meminfo()
 
@@ -140,6 +274,13 @@ def check_all() -> None:
 
     check_oom_log()
 
+    # Fleet supervision shares this one loop (the plan's "one daemon" rule). Isolated
+    # so any fleet-side error can never break the system-resource watch above.
+    try:
+        check_fleet()
+    except Exception as e:
+        log(f"fleet error: {e!r}")
+
 
 def main() -> None:
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # auto-reap nhq-notify children; prevents zombie accumulation
@@ -161,6 +302,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # One-shot fleet-supervision pass (no daemon loop) — for the selftest + ad-hoc
+    # checks. Runs check_fleet() exactly once and exits.
+    if "--check-fleet-once" in sys.argv:
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        try:
+            check_fleet()
+        except Exception as e:
+            log(f"fleet error: {e!r}")
+        sys.exit(0)
     try:
         main()
     except KeyboardInterrupt:

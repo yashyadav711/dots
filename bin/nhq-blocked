@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# nhq-blocked <agent> "<what you need>" — the BLOCKED callback (sibling of nhq-done).
+#
+# An agent runs this when it hits a human gate it cannot pass autonomously (a
+# decision only Yash can make, a credential it lacks, a Protocol-3 approval). It:
+#   1. Drops a per-session blocked-marker (~/.nhq-fleet/<session>.blocked) holding
+#      what's needed — the signal `nhq-await` returns as BLOCKED (exit 0, a gate,
+#      NOT a failure) and `nhq_session_state_full` renders as BLOCKED.
+#   2. Appends a `BLOCKED:`-tagged entry to Director's fleet inbox
+#      (~/Github/nhq-agentic-os/ai/fleet-inbox.md — created if missing).
+#   3. Fires a `needs-you` desktop toast so Yash is pinged to unblock it.
+# Director reads the inbox, surfaces the gate to Yash, and re-tasks once cleared.
+#
+# Mirrors nhq-done's structure exactly (session resolution, inbox-ensure, toast) so
+# the two callbacks behave identically apart from the marker + tag.
+#
+# Usage: nhq-blocked mirror "Need the GCP service-account JSON to wire Vertex AI."
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+# shellcheck source=/dev/null
+source "$BIN/nhq-lib.sh"
+
+AGENT="${1:-}"
+NEED="${2:-}"
+
+if [[ -z "$AGENT" || -z "$NEED" ]]; then
+  echo "usage: nhq-blocked <agent> \"<what you need to be unblocked>\"" >&2
+  exit 1
+fi
+
+# Overridable so the selftest stays hermetic (no real inbox / toast writes).
+INBOX="${NHQ_INBOX:-$HOME/Github/nhq-agentic-os/ai/fleet-inbox.md}"
+NOTIFY="${NHQ_NOTIFY:-$HOME/.local/bin/nhq-notify}"
+STATE_DIR="${NHQ_STATE_DIR:-$HOME/.nhq-fleet}"
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# 1. Resolve THIS session from the ambient tmux env (agent runs this from inside its
+#    own fleet pane); fall back to fleet-<agent> for a direct CLI call.
+SESSION=""
+if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+  SESSION=$(tmux display-message -p '#S' 2>/dev/null || true)
+fi
+[[ "$SESSION" != fleet-* ]] && SESSION="fleet-${AGENT}"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+# Blocked-marker — the signal nhq-await/warden watch. Holds timestamp + the ask.
+{
+  echo "## ${TS} — ${AGENT} (${SESSION}) BLOCKED"
+  echo "${NEED}"
+} > "$STATE_DIR/${SESSION}.blocked" 2>/dev/null || true
+
+# Clear any stale .done/.stalled for this session so the state is unambiguously BLOCKED.
+rm -f "$STATE_DIR/${SESSION}.stalled" 2>/dev/null || true
+
+# Reflect into .meta if present (best-effort; nhq-status --json then shows BLOCKED).
+if [[ -f "$(nhq_meta "$SESSION")" ]]; then
+  "$BIN/nhq-meta" set "$SESSION" last_state BLOCKED >/dev/null 2>&1 || true
+  "$BIN/nhq-meta" set "$SESSION" result    "$NEED"  >/dev/null 2>&1 || true
+fi
+
+# 2. Ensure the inbox exists with a header, then append the BLOCKED entry.
+if [[ ! -f "$INBOX" ]]; then
+  mkdir -p "$(dirname "$INBOX")"
+  {
+    echo "# NHQ Fleet Inbox"
+    echo
+    echo "Callbacks from autonomous fleet agents (\`nhq-done\` / \`nhq-blocked\`). Newest entries appended at the bottom."
+    echo "Director: read on session start, then chain the next task."
+    echo
+  } > "$INBOX"
+fi
+{
+  echo "## ${TS} — ${AGENT} (${SESSION})"
+  echo "BLOCKED: ${NEED}"
+  echo
+} >> "$INBOX"
+
+# 3. needs-you toast (best-effort — never fail the callback if notify is missing).
+if [[ -x "$NOTIFY" ]]; then
+  "$NOTIFY" needs-you "Fleet: ${AGENT} BLOCKED" "${NEED:0:140}" || true
+fi
+
+echo "nhq-blocked: logged ${AGENT} block (marker: $STATE_DIR/${SESSION}.blocked, inbox: $INBOX)"

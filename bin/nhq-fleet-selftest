@@ -246,6 +246,81 @@ if grep -qE '1000\+200 tok · \$0\.0300' <<<"$ROW"; then ok "ledger row carries 
 eq "nhq-done flipped .meta last_state=DONE" "$("$BIN/nhq-meta" get fleet-envy last_state)" "DONE"
 [[ -n "$("$BIN/nhq-meta" get fleet-envy done_ts)" ]] && ok "nhq-done set done_ts" || no "nhq-done did not set done_ts"
 
+echo "── P3-a: nhq-warden STALLED detection + clear-on-leave ─────────────────"
+# Hermetic: base state injected via a stub; no live tmux/claude needed.
+STUB="$TMP/state-stub"
+cat > "$STUB" <<'EOS'
+#!/usr/bin/env bash
+f="$NHQ_STATE_DIR/$1.basestate"; [[ -f "$f" ]] && cat "$f" || echo DEAD
+EOS
+chmod +x "$STUB"
+WLOG="$TMP/warden.log"
+warden_once() { env NHQ_STATE_DIR="$NHQ_STATE_DIR" NHQ_WARDEN_STATE_CMD="$STUB" \
+  NHQ_NOTIFY=/bin/true NHQ_WARDEN_LOG="$WLOG" python3 "$BIN/nhq-warden" --check-fleet-once; }
+
+WR="$TMP/warden-repo"; git init -q "$WR"; git_quiet "$WR" commit --allow-empty -m base
+WR_HEAD="$(git -C "$WR" rev-parse HEAD)"
+SS="fleet-selftest-stall"
+"$BIN/nhq-meta" init "$SS" agent heydaddy repo "$WR" base_commit "$WR_HEAD" \
+  spawn_epoch "$(( $(date +%s) - 1900 ))" >/dev/null 2>&1          # spawned 31m ago (> 15m stall_min)
+WJ="$NHQ_STATE_DIR/$SS.jsonl"; echo '{}' > "$WJ"; touch -d '10 minutes ago' "$WJ"   # frozen transcript
+"$BIN/nhq-meta" set "$SS" jsonl "$WJ" >/dev/null 2>&1
+echo RUNNING > "$NHQ_STATE_DIR/$SS.basestate"                       # RUNNING + old + no commit + frozen
+warden_once >/dev/null 2>&1
+[[ -f "$NHQ_STATE_DIR/$SS.stalled" ]] && ok "warden wrote .stalled (RUNNING+old+no-commit+frozen)" || no "warden did NOT write .stalled"
+eq "warden logged one stall ALERT" "$(grep -c 'ALERT \[stall:'"$SS" "$WLOG" 2>/dev/null || echo 0)" "1"
+# leave RUNNING → .stalled cleared
+echo IDLE > "$NHQ_STATE_DIR/$SS.basestate"
+warden_once >/dev/null 2>&1
+[[ ! -f "$NHQ_STATE_DIR/$SS.stalled" ]] && ok "warden cleared .stalled on leave-RUNNING" || no "warden did NOT clear .stalled"
+
+echo "── P3-b: nhq-warden silent-complete / ORPHAN ──────────────────────────"
+OR="$TMP/orphan-repo"; git init -q "$OR"; git_quiet "$OR" commit --allow-empty -m base
+OR_BASE="$(git -C "$OR" rev-parse HEAD)"
+SOR="fleet-selftest-orphan"
+"$BIN/nhq-meta" init "$SOR" agent mirror repo "$OR" base_commit "$OR_BASE" \
+  spawn_epoch "$(( $(date +%s) - 600 ))" >/dev/null 2>&1
+git_quiet "$OR" commit --allow-empty -m work                        # HEAD now past base_commit
+echo IDLE > "$NHQ_STATE_DIR/$SOR.basestate"                         # IDLE + new commit + no .done
+: > "$WLOG"   # fresh log so the count is unambiguous
+warden_once >/dev/null 2>&1
+eq "warden logged ORPHAN alert" "$(grep -c 'ALERT \[orphan:'"$SOR" "$WLOG" 2>/dev/null || echo 0)" "1"
+[[ ! -f "$NHQ_STATE_DIR/$SOR.stalled" ]] && ok "ORPHAN writes no .stalled" || no "ORPHAN wrongly wrote .stalled"
+
+echo "── P3-c: nhq-blocked → .blocked + inbox + nhq-await BLOCKED ─────────────"
+BINB="$TMP/inbox-blocked.md"
+"$BIN/nhq-meta" init fleet-mirror agent mirror agent_name Mirror repo "$HOME/Github/mirror" \
+  task "wire vertex" last_state RUNNING >/dev/null 2>&1
+env -u TMUX NHQ_INBOX="$BINB" NHQ_NOTIFY=/bin/true NHQ_STATE_DIR="$NHQ_STATE_DIR" \
+  "$BIN/nhq-blocked" mirror "Need the GCP service-account JSON." >/dev/null 2>&1
+[[ -f "$NHQ_STATE_DIR/fleet-mirror.blocked" ]] && ok "nhq-blocked wrote .blocked marker" || no "nhq-blocked did not write .blocked"
+grep -q '^BLOCKED: ' "$BINB" && ok "nhq-blocked tagged inbox 'BLOCKED:'" || no "inbox missing BLOCKED: tag"
+eq "nhq-blocked flipped .meta last_state" "$("$BIN/nhq-meta" get fleet-mirror last_state)" "BLOCKED"
+bout="$("$BIN/nhq-await" fleet-mirror --timeout 3 --poll 1 2>&1 || true)"
+eq "nhq-await → BLOCKED" "$(status_of "$bout")" "NHQ-AWAIT-STATUS: BLOCKED"
+
+echo "── P3-d: nhq-await typed outcomes + stale guard ────────────────────────"
+# .stalled → STALLED exit 0
+SD1="fleet-selftest-awaitstall"; echo "## now"$'\n'"no progress" > "$NHQ_STATE_DIR/$SD1.stalled"
+o1="$("$BIN/nhq-await" "$SD1" --timeout 3 --poll 1 2>&1 || true)"
+eq "fresh .stalled → STALLED" "$(status_of "$o1")" "NHQ-AWAIT-STATUS: STALLED"
+# .done → REPORTED + DONE alias both present
+SD2="fleet-selftest-awaitdone"; echo "## now"$'\n'"all good" > "$NHQ_STATE_DIR/$SD2.done"
+o2="$("$BIN/nhq-await" "$SD2" --timeout 3 --poll 1 2>&1 || true)"
+if grep -q 'NHQ-AWAIT-STATUS: REPORTED' <<<"$o2" && grep -q 'NHQ-AWAIT-STATUS: DONE' <<<"$o2"; then
+  ok "fresh .done → REPORTED + DONE alias"
+else
+  no "fresh .done missing REPORTED/DONE ($(status_of "$o2"))"
+fi
+# priority: .blocked outranks .done
+SD3="fleet-selftest-awaitprio"; echo x > "$NHQ_STATE_DIR/$SD3.done"; echo y > "$NHQ_STATE_DIR/$SD3.blocked"
+o3="$("$BIN/nhq-await" "$SD3" --timeout 3 --poll 1 2>&1 || true)"
+eq ".blocked outranks .done" "$(status_of "$o3")" "NHQ-AWAIT-STATUS: BLOCKED"
+# stale .stalled (old) must NOT false-fire
+SD4="fleet-selftest-awaitstale"; echo z > "$NHQ_STATE_DIR/$SD4.stalled"; touch -d '5 minutes ago' "$NHQ_STATE_DIR/$SD4.stalled"
+o4="$("$BIN/nhq-await" "$SD4" --timeout 2 --poll 1 2>&1 || true)"
+if grep -q 'STALLED' <<<"$(status_of "$o4")"; then no "stale .stalled false-fired"; else ok "stale .stalled did not false-fire ($(status_of "$o4"))"; fi
+
 echo "────────────────────────────────────────────────────────────────────────"
 echo "nhq-fleet-selftest: ${pass} passed, ${fail} failed"
 [[ "$fail" -eq 0 ]]
