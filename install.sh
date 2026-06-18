@@ -47,6 +47,15 @@ link bin/agyq           "$HOME/.local/bin/agyq"
 link bin/agy-snapshot   "$HOME/.local/bin/agy-snapshot"
 link bin/agy-usage      "$HOME/.local/bin/agy-usage"
 
+# NHQ Fleet Kit — per-file symlinks into ~/.local/bin (matches the live pattern).
+# NOTE: nhq-lib.sh + fleet-registry.json are NOT linked — the scripts resolve them
+# as siblings in dots/bin via `readlink -f`, so they must stay beside the binaries.
+for cmd in nhq-agent-name nhq-await nhq-blocked nhq-cost nhq-done nhq-fleet \
+           nhq-fleet-selftest nhq-kill nhq-meta nhq-notify nhq-reap nhq-spawn \
+           nhq-status nhq-tell nhq-warden; do
+  link "bin/$cmd" "$HOME/.local/bin/$cmd"
+done
+
 
 echo "==> [4/4] System config (apply manually with sudo or per-user as noted)"
 echo "  earlyoom (anti-freeze OOM daemon):  sudo cp $DOTS/system/earlyoom.conf /etc/default/earlyoom && sudo systemctl enable --now earlyoom"
