@@ -67,20 +67,46 @@ check_dangerous() {
         return 0
     fi
 
-    # rm -rf from root (but allow /tmp paths)
-    if echo "$cmd" | grep -qiE 'rm[[:space:]]+(-[rfRF]+[[:space:]]+)*/[[:space:]]*$'; then
-        echo "delete from root directory"
+    # --- Destructive rm guards ---
+    # Treat `rm` as dangerous ONLY in command position: at the start of the command, or
+    # right after a shell separator (; & | ( or a new line — grep matches per line so a
+    # leading-of-line rm is caught by ^), optionally wrapped in sudo. This stops the guard
+    # from firing when a dangerous pattern merely appears as QUOTED TEXT inside an argument
+    # to another command, e.g. nhq-spawn envy "...keep blocking rm -rf ~ and rm -rf /...".
+    local RM='(^|[;&|(])[[:space:]]*(sudo[[:space:]]+)?rm[[:space:]]+'
+    # FL = an optional run of flag tokens.  RECUR = a flag bundle that actually requests
+    # recursion (r/R anywhere in a short flag, or --recursive). A forced-but-not-recursive
+    # delete (rm -f <one file>) never satisfies RECUR, so a single named file is never
+    # treated as a recursive blast.
+    local FL='(--?[a-zA-Z][a-zA-Z-]*[[:space:]]+)*'
+    local RECUR='(-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)[[:space:]]+'
+
+    # rm of the root directory itself: `rm [flags] /` (with/without recursion).
+    if echo "$cmd" | grep -qiE "${RM}${FL}/+[[:space:]]*$"; then
+        echo "delete the root directory"
         return 0
     fi
 
-    if echo "$cmd" | grep -qiE 'rm[[:space:]]+-[rfRF]+[[:space:]]+/' && ! echo "$cmd" | grep -qiE 'rm[[:space:]]+-[rfRF]+[[:space:]]+/tmp'; then
-        echo "recursively delete from root directory"
+    # Recursive rm whose TARGET is genuinely dangerous: root, a whole top-level system
+    # directory, or a root-level glob. A specific deep path (e.g. /home/yash/Github/foo)
+    # is the operator's normal authority and is allowed. /tmp paths are explicitly allowed.
+    if echo "$cmd" | grep -qiE "${RM}${FL}${RECUR}${FL}('|\")?(/+([[:space:]]|$)|/(etc|usr|bin|sbin|lib|lib64|boot|var|dev|proc|sys|root|home|opt|srv|run|mnt)/?([[:space:]]|$)|/+[^[:space:]]*[*?[])" \
+       && ! echo "$cmd" | grep -qiE "${RM}${FL}${RECUR}${FL}('|\")?/tmp"; then
+        echo "recursively delete the root, a top-level system directory, or a root-level glob"
         return 0
     fi
 
-    # rm -rf home directory
-    if echo "$cmd" | grep -qiE 'rm[[:space:]]+-[rfRF]+[[:space:]]+~'; then
-        echo "recursively delete from home directory"
+    # Recursive rm whose TARGET is the home directory itself or a glob under home
+    # (~, ~/, $HOME, ~/*, ~/.* ...). A specific named path under home (~/.nhq-fleet/done/x)
+    # is NOT a recursive home wipe and is allowed.
+    if echo "$cmd" | grep -qiE "${RM}${FL}${RECUR}${FL}('|\")?(~|\\\$HOME)((/+)?([[:space:]]|$)|/+[^[:space:]]*[*?[])"; then
+        echo "recursively delete the home directory or a home-level glob"
+        return 0
+    fi
+
+    # Recursive rm of a bare top-level glob: `rm -rf *` (would wipe the whole cwd).
+    if echo "$cmd" | grep -qiE "${RM}${FL}${RECUR}${FL}('|\")?[*]+([[:space:]]|$)"; then
+        echo "recursively delete everything matched by a bare glob"
         return 0
     fi
 
