@@ -16,7 +16,11 @@
       "**/id_rsa*",
       "**/service-account*.json",
       "**/serviceAccount*.json",
-      "**/*service_account*.json"
+      "**/*service_account*.json",
+      "**/token*.*",
+      "**/jwt*.*",
+      "**/session*.*",
+      "**/middleware/**"
     ],
     "payments": [
       "**/billing/**",
@@ -24,13 +28,20 @@
       "**/payments/**",
       "**/*stripe*",
       "**/*invoice*",
-      "**/*checkout*"
+      "**/*checkout*",
+      "**/*nowpayments*",
+      "**/*payment_provider*"
     ],
     "pii": [
       "**/pii/**",
       "**/*pii*",
       "**/*personal-data*",
-      "**/customer-data/**"
+      "**/customer-data/**",
+      "**/models/user*",
+      "**/models/account*"
+    ],
+    "migrations": [
+      "**/migrations/**"
     ],
     "audit": [
       "ai/state/audit.jsonl",

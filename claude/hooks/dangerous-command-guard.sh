@@ -6,24 +6,73 @@
 # Original concept adapted to use file-based single-use approval tokens.
 #
 # Install: Add to .claude/settings.json under hooks.PreToolUse
-# Requires: jq
+# Requires: jq, sha256sum, uuidgen (or /proc/sys/kernel/random/uuid)
 #
-# TESTABILITY (P4): `check_dangerous` is a pure function (reason on stdout, rc 0
-# if dangerous). The stdin-reading main logic is guarded by a sourced-vs-executed
-# check at the bottom, so nhq-fleet-selftest can `source` this file and unit-test
-# `check_dangerous` against a case table WITHOUT the hook trying to read stdin.
+# SECURITY MODEL (P4 hardening 2026-06-19, post Security review):
+#  • Approval is a RANDOM UUID shown ONLY in the desktop notification (Yash's screen).
+#    The pending JSON the guarded agent can read holds ONLY sha256(uuid) — a commitment
+#    it cannot reverse — so the agent can never mint its own approval (C1). SHA256 (L4).
+#  • Obscured commands can't slip through: `eval` is blocked outright, and the payload
+#    of an interpreter wrapper (bash -c / sh -c / python -c / …) is re-checked, including
+#    a quote-stripped pass for nested quoting (C2).
+#  • Inline env-var prefixes (RAILWAY_TOKEN=x railway up) are stripped + re-checked (M2);
+#    `..` path-traversal in a recursive rm is blocked (M1).
+#
+# TESTABILITY: `check_dangerous` is a pure function. The stdin-reading main logic runs
+# only when EXECUTED (sourced-vs-executed guard at the bottom). Env overrides for tests:
+# CLAUDE_DANGEROUS_DIR, NHQ_NOTIFY.
 
 # --- Configuration ---
-# Approval token directory (change if needed)
-DANGEROUS_DIR="/tmp/claude-dangerous"
+DANGEROUS_DIR="${CLAUDE_DANGEROUS_DIR:-/tmp/claude-dangerous}"
 PENDING_DIR="$DANGEROUS_DIR/pending"
 APPROVED_DIR="$DANGEROUS_DIR/approved"
+NOTIFY="${NHQ_NOTIFY:-$HOME/.local/bin/nhq-notify}"
+
+sha256() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
 
 # --- Pattern matching ---
 # Returns a human-readable reason if the command is dangerous, empty otherwise.
-# Customize this function to add or remove patterns for your environment.
+# $2 = recursion depth (internal; bounds the unwrap recursion).
 check_dangerous() {
-    local cmd="$1"
+    local cmd="$1" depth="${2:-0}"
+
+    # ── Unwrap obscured commands (C2 / M2) — bounded recursion ──────────────
+    if [[ "$depth" -lt 6 ]]; then
+        # eval: block outright. Legit agents don't need it; it defeats every pattern.
+        if echo "$cmd" | grep -qiE '(^|[;&|(])[[:space:]]*eval([[:space:]]|$)'; then
+            echo "run an obscured command via eval"
+            return 0
+        fi
+
+        # M2: strip a run of inline VAR=val prefixes at command position and re-check, so
+        # `RAILWAY_TOKEN=abc railway up` / `A=1 wipefs …` can't dodge command-position anchors.
+        local stripped
+        stripped="$(printf '%s' "$cmd" | sed -E 's/(^|[;&|(][[:space:]]*)([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)+/\1/g')"
+        if [[ "$stripped" != "$cmd" ]]; then
+            local rs; rs="$(check_dangerous "$stripped" $((depth + 1)))"
+            [[ -n "$rs" ]] && { echo "$rs"; return 0; }
+        fi
+
+        # C2: only when an interpreter wrapper is present (so quoted text in a plain
+        # command — echo "; railway up" — never false-fires).
+        if echo "$cmd" | grep -qiE '(^|[;&|(]|[[:space:]])((bash|sh|zsh|dash|ksh|env)[[:space:]]+([^[:space:]]+[[:space:]]+)*-c([[:space:]]|$)|(python3?|perl|ruby|node)[[:space:]]+([^[:space:]]+[[:space:]]+)*-[ce]([[:space:]]|$))'; then
+            # (a) re-check the -c/-e payload (dangerous cmd sits at the payload's start).
+            local payload
+            payload="$(printf '%s' "$cmd" | sed -nE 's/.*[[:space:]]-(c|e)[[:space:]]+(.*)/\2/p' | head -1)"
+            if [[ -n "$payload" ]]; then
+                payload="${payload#[\"\']}"; payload="${payload%[\"\']}"
+                local rp; rp="$(check_dangerous "$payload" $((depth + 1)))"
+                [[ -n "$rp" ]] && { echo "$rp (inside a -c wrapper)"; return 0; }
+            fi
+            # (b) quote-stripped pass exposes tokens hidden behind nested quotes, e.g.
+            #     python3 -c "import os; os.system('wipefs -a /dev/sda')".
+            local dq; dq="$(printf '%s' "$cmd" | tr "\"'" '  ')"
+            if [[ "$dq" != "$cmd" ]]; then
+                local rd; rd="$(check_dangerous "$dq" $((depth + 1)))"
+                [[ -n "$rd" ]] && { echo "$rd (obscured by quoting)"; return 0; }
+            fi
+        fi
+    fi
 
     # System reboot/shutdown
     if echo "$cmd" | grep -qiE '(^|[[:space:]])(reboot|shutdown|poweroff|halt)([[:space:]]|$)'; then
@@ -44,18 +93,18 @@ check_dangerous() {
     fi
 
     # --- Destructive rm guards ---
-    # Treat `rm` as dangerous ONLY in command position: at the start of the command, or
-    # right after a shell separator (; & | ( or a new line — grep matches per line so a
-    # leading-of-line rm is caught by ^), optionally wrapped in sudo. This stops the guard
-    # from firing when a dangerous pattern merely appears as QUOTED TEXT inside an argument
-    # to another command, e.g. nhq-spawn envy "...keep blocking rm -rf ~ and rm -rf /...".
+    # `rm` is dangerous only in command position (start, or after ; & | ( — optionally via
+    # sudo) so a pattern quoted as TEXT inside another command's argument doesn't fire.
     local RM='(^|[;&|(])[[:space:]]*(sudo[[:space:]]+)?rm[[:space:]]+'
-    # FL = an optional run of flag tokens.  RECUR = a flag bundle that actually requests
-    # recursion (r/R anywhere in a short flag, or --recursive). A forced-but-not-recursive
-    # delete (rm -f <one file>) never satisfies RECUR, so a single named file is never
-    # treated as a recursive blast.
     local FL='(--?[a-zA-Z][a-zA-Z-]*[[:space:]]+)*'
     local RECUR='(-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)[[:space:]]+'
+
+    # M1: a recursive rm whose target traverses through `..` can't be reasoned about
+    # safely (rm -rf /tmp/../home/yash/Github/x) — block any /.. in a recursive rm target.
+    if echo "$cmd" | grep -qiE "${RM}${FL}${RECUR}.*/\.\.(/|[[:space:]]|'|\"|$)"; then
+        echo "recursively delete through a .. path traversal"
+        return 0
+    fi
 
     # rm of the root directory itself: `rm [flags] /` (with/without recursion).
     if echo "$cmd" | grep -qiE "${RM}${FL}/+[[:space:]]*$"; then
@@ -64,33 +113,26 @@ check_dangerous() {
     fi
 
     # Recursive rm whose TARGET is genuinely dangerous: root, a whole top-level system
-    # directory, or a root-level glob. A specific deep path (e.g. /home/yash/Github/foo)
-    # is the operator's normal authority and is allowed. /tmp paths are explicitly allowed.
+    # directory, or a root-level glob. A specific deep path is allowed; /tmp is allowed.
     if echo "$cmd" | grep -qiE "${RM}${FL}${RECUR}${FL}('|\")?(/+([[:space:]]|$)|/(etc|usr|bin|sbin|lib|lib64|boot|var|dev|proc|sys|root|home|opt|srv|run|mnt)/?([[:space:]]|$)|/+[^[:space:]]*[*?[])" \
        && ! echo "$cmd" | grep -qiE "${RM}${FL}${RECUR}${FL}('|\")?/tmp"; then
         echo "recursively delete the root, a top-level system directory, or a root-level glob"
         return 0
     fi
 
-    # Recursive rm whose TARGET is the home directory itself or a glob under home
-    # (~, ~/, $HOME, ~/*, ~/.* ...). A specific named path under home (~/.nhq-fleet/done/x)
-    # is NOT a recursive home wipe and is allowed.
+    # Recursive rm whose TARGET is the home directory itself or a glob under home.
     if echo "$cmd" | grep -qiE "${RM}${FL}${RECUR}${FL}('|\")?(~|\\\$HOME)((/+)?([[:space:]]|$)|/+[^[:space:]]*[*?[])"; then
         echo "recursively delete the home directory or a home-level glob"
         return 0
     fi
 
-    # Recursive rm of an ENTIRE project tree: a direct child of a Github/ dir
-    # (rm -rf ~/Github/heydaddy, /home/yash/Github/mirror, ./Github/foo). Wiping a whole
-    # repo is the catastrophic case the operator constitution calls out. A path BELOW a
-    # project (~/Github/foo/build) is normal authority and stays allowed: the target must
-    # be the project root itself (Github/<name> with nothing but an optional trailing /).
+    # Recursive rm of an ENTIRE project tree: a direct child of a Github/ dir.
     if echo "$cmd" | grep -qiE "${RM}${FL}${RECUR}${FL}('|\")?([^[:space:]'\"]*/)?Github/[^/[:space:]'\"]+/?([[:space:]'\"]|\$)"; then
         echo "recursively delete an entire Github project tree"
         return 0
     fi
 
-    # Recursive rm of a bare top-level glob: `rm -rf *` (would wipe the whole cwd).
+    # Recursive rm of a bare top-level glob: `rm -rf *`.
     if echo "$cmd" | grep -qiE "${RM}${FL}${RECUR}${FL}('|\")?[*]+([[:space:]]|$)"; then
         echo "recursively delete everything matched by a bare glob"
         return 0
@@ -114,35 +156,31 @@ check_dangerous() {
         return 0
     fi
 
-    # Erase filesystem signatures with wipefs (makes a disk/partition unmountable).
-    # Command-position-anchored (like rm) so a wipefs mentioned in quoted text doesn't fire.
+    # Erase filesystem signatures with wipefs (command-position-anchored).
     if echo "$cmd" | grep -qiE '(^|[;&|(])[[:space:]]*(sudo[[:space:]]+)?wipefs([[:space:]]|$)'; then
         echo "erase filesystem signatures with wipefs"
         return 0
     fi
 
-    # Direct disk write with dd (dd ... of=/dev/sdX — overwrites a raw device). Anchored to
-    # command position so a dd-of-device string quoted inside another command isn't a match.
+    # Direct disk write with dd (… of=/dev/sdX). Command-position-anchored.
     if echo "$cmd" | grep -qiE '(^|[;&|(])[[:space:]]*(sudo[[:space:]]+)?dd[[:space:]]+.*of=/dev/'; then
         echo "write directly to a disk device with dd"
         return 0
     fi
 
-    # pacman cascade remove: -R with the recursive-deps flag (-Rns, -Rs, -Rsn ...). Can
-    # uninstall dependency chains and break the boot/desktop stack. Command-position-anchored.
+    # pacman cascade remove: -R with the recursive-deps flag (-Rns, -Rs …).
     if echo "$cmd" | grep -qiE '(^|[;&|(])[[:space:]]*(sudo[[:space:]]+)?pacman[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-R[a-z]*s'; then
         echo "cascade-remove packages with pacman -R...s (can break the system)"
         return 0
     fi
 
-    # Railway infra mutation: up / deploy / down / delete (a spawned agent could silently
-    # ship or tear down production infra). Routine read ops (logs/status) are untouched.
+    # Railway infra mutation: up / deploy / down / delete / remove.
     if echo "$cmd" | grep -qiE '(^|[;&|(])[[:space:]]*railway[[:space:]]+(up|deploy|down|delete|remove)([[:space:]]|$)'; then
         echo "mutate Railway infrastructure (railway up/deploy/down)"
         return 0
     fi
 
-    # Supabase destructive DB ops: db push (apply migrations) / db reset (drop + recreate).
+    # Supabase destructive DB ops: db push / db reset.
     if echo "$cmd" | grep -qiE '(^|[;&|(])[[:space:]]*supabase[[:space:]]+db[[:space:]]+(push|reset)([[:space:]]|$)'; then
         echo "push or reset the Supabase database schema"
         return 0
@@ -176,33 +214,19 @@ check_dangerous() {
     return 1
 }
 
-# --- Hash generation ---
-# Each approval token is scoped to a specific command in a specific session
-generate_hash() {
-    echo -n "${SESSION_ID}:${COMMAND}" | md5sum | cut -d' ' -f1
-}
-
-# --- Main hook logic (only runs when EXECUTED, not when sourced for testing) ---
+# --- Main hook logic (runs only when EXECUTED, not when sourced for testing) ---
 main() {
     mkdir -p "$PENDING_DIR" "$APPROVED_DIR" 2>/dev/null
 
-    # --- Read hook input ---
     local INPUT TOOL_NAME
     INPUT=$(cat)
-
     TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty')
     SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 
-    # Only intercept Bash tool calls
-    if [[ "$TOOL_NAME" != "Bash" ]]; then
-        exit 0
-    fi
+    [[ "$TOOL_NAME" != "Bash" ]] && exit 0
 
     COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
-
-    if [[ -z "$COMMAND" ]]; then
-        exit 0
-    fi
+    [[ -z "$COMMAND" ]] && exit 0
 
     # Cleanup stale tokens (pending: 5 min, approved: 60s)
     find "$PENDING_DIR" -type f -mmin +5 -delete 2>/dev/null
@@ -210,45 +234,53 @@ main() {
 
     local REASON
     REASON=$(check_dangerous "$COMMAND")
-    if [[ -z "$REASON" ]]; then
-        exit 0  # Not dangerous, allow
-    fi
+    [[ -z "$REASON" ]] && exit 0   # Not dangerous, allow
 
-    # Check for pre-existing approval token
-    local HASH APPROVAL_FILE PENDING_FILE
-    HASH=$(generate_hash)
-    APPROVAL_FILE="$APPROVED_DIR/$HASH"
-    PENDING_FILE="$PENDING_DIR/$HASH.json"
+    # Approval scheme (C1): a per-block random UUID, shown ONLY in the notification.
+    # The pending JSON holds sha256(uuid) — a commitment the agent can't reverse. An
+    # approved file is valid iff sha256(its name) == the stored commitment.
+    local CMDHASH PENDING_FILE COMMIT
+    CMDHASH="$(sha256 "${SESSION_ID}:${COMMAND}")"
+    PENDING_FILE="$PENDING_DIR/$CMDHASH.json"
 
-    if [[ -f "$APPROVAL_FILE" ]]; then
-        # Consume the single-use approval token
-        rm -f "$APPROVAL_FILE"
-        rm -f "$PENDING_FILE"
-        exit 0  # Allow
-    fi
-
-    # Write pending file (for external approval systems to read)
-    cat > "$PENDING_FILE" << PENDING_EOF
+    if [[ -f "$PENDING_FILE" ]]; then
+        COMMIT="$(jq -r '.commitment // empty' "$PENDING_FILE" 2>/dev/null)"
+        local af
+        for af in "$APPROVED_DIR"/*; do
+            [[ -f "$af" ]] || continue
+            if [[ -n "$COMMIT" && "$(sha256 "$(basename "$af")")" == "$COMMIT" ]]; then
+                rm -f "$af" "$PENDING_FILE"     # single-use; consume both
+                exit 0                          # APPROVED → allow
+            fi
+        done
+        # pending exists, no matching approval → still blocked (reuse the commitment).
+    else
+        # First block for this command: mint a UUID, store ONLY its sha256 commitment.
+        local UUID
+        UUID="$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)"
+        COMMIT="$(sha256 "$UUID")"
+        cat > "$PENDING_FILE" <<PENDING_EOF
 {
-  "hash": "$HASH",
+  "cmdhash": "$CMDHASH",
   "session_id": "$SESSION_ID",
   "command": $(echo "$COMMAND" | jq -Rs .),
   "reason": "$REASON",
+  "commitment": "$COMMIT",
   "timestamp": $(date +%s)
 }
 PENDING_EOF
+        # The UUID appears ONLY here (Yash's screen) — never on stdout, never in the JSON.
+        "$NOTIFY" blocked "🛑 Dangerous command BLOCKED" \
+          "Would $REASON. To approve, run:  touch $APPROVED_DIR/$UUID" 2>/dev/null || true
+    fi
 
-    # --- Notification hook point ---
-    # Desktop notification so Yash sees the block (NHQ: wired to dunst via notify-send)
-    "$HOME/.local/bin/nhq-notify" blocked "🛑 Dangerous command BLOCKED" "Would $REASON" 2>/dev/null || true
-
-    # Deny the command with a clear explanation
-    cat << EOF
+    # Deny — the reason for the agent must NOT reveal the approval token.
+    cat <<EOF
 {
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
-    "permissionDecisionReason": "BLOCKED: This command would $REASON. To approve, create the token file: touch $APPROVAL_FILE"
+    "permissionDecisionReason": "BLOCKED: This command would $REASON. A one-time approval code was sent to Yash's desktop notification — it is NOT readable from here. Ask Yash to approve."
   }
 }
 EOF

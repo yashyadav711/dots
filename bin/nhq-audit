@@ -23,12 +23,14 @@ GENESIS="GENESIS"
 sha() { printf '%s' "$1" | sha256sum | awk '{print $1}'; }
 
 # Scrub secret-looking values from a command string before it is logged.
+# L1: also handle QUOTED values — --token "sk-x" / RAILWAY_TOKEN='abc' — by consuming an
+# optional opening quote before the value (the value class still stops at the closing quote).
 scrub() {
   printf '%s' "$1" | sed -E \
-    -e 's/(--?(token|password|passwd|pwd|secret|api[-_]?key|apikey|auth|bearer)[[:space:]=:]+)[^[:space:]"'"'"']+/\1***/Ig' \
-    -e 's/([A-Za-z0-9_]*(SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|PRIVATE_KEY)[A-Za-z0-9_]*=)[^[:space:]"'"'"']+/\1***/Ig' \
+    -e 's/(--?(token|password|passwd|pwd|secret|api[-_]?key|apikey|auth|bearer)[[:space:]=:]+)["'"'"']?[^[:space:]"'"'"']+/\1***/Ig' \
+    -e 's/([A-Za-z0-9_]*(SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|PRIVATE_KEY)[A-Za-z0-9_]*=)["'"'"']?[^[:space:]"'"'"']+/\1***/Ig' \
     -e 's/(ghp_|gho_|ghu_|ghs_|github_pat_|sk-|xox[baprs]-|AKIA|AIza)[A-Za-z0-9_\-]{8,}/***/g' \
-    -e 's/([Bb]earer[[:space:]]+)[A-Za-z0-9._\-]+/\1***/g'
+    -e 's/([Bb]earer[[:space:]]+)["'"'"']?[A-Za-z0-9._\-]+/\1***/g'
 }
 
 # Recover the core (no h field) from a stored line.
@@ -101,7 +103,15 @@ cmd_verify() {
     prev="$sh"
   done < "$AF"
   if [[ "$bad" -eq 0 ]]; then
-    echo "nhq-audit verify: OK — $chained chained line(s) of $n intact"; return 0
+    echo "nhq-audit verify: OK — $chained chained line(s) of $n intact"
+    # L3 (documented limit): the chain detects EDIT / DELETE / REORDER of existing lines,
+    # but NOT a newly-APPENDED forged entry — an attacker who can write the file knows the
+    # last h (prev_h) and can extend the chain. This is acceptable for the threat model:
+    # appends to audit.jsonl are themselves gated by the P3 commit guard (audit/ is a
+    # protected path), so a forged append cannot be committed without an approval token.
+    echo "nhq-audit verify: note — chain proves no edit/delete/reorder; forged APPENDS are"
+    echo "  out of scope (defended by the P3 gate on the audit path). See L3."
+    return 0
   fi
   return 1
 }

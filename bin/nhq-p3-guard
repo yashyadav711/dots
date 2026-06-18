@@ -83,47 +83,64 @@ p3_caller_privileged() {
   [[ -z "$agent" || "$canon" == "director" ]]
 }
 
-# p3_evaluate <repo> — sets P3_MATCHED + P3_VERDICT; returns 0 allow / 1 deny.
+# Git invocation context for the repo under evaluation (set by each caller). Using the
+# real GIT_DIR/-C the commit targets defeats H3 misdirection.
+P3_GIT_ARGS=()
+p3_staged_files() { git "${P3_GIT_ARGS[@]}" diff --cached --name-only 2>/dev/null; }
+
+# p3_evaluate <mode>  (mode = pretooluse | precommit)
+# sets P3_MATCHED + P3_VERDICT; returns 0 allow / 1 deny. Reads P3_GIT_ARGS.
 P3_MATCHED=""; P3_VERDICT=""
 p3_evaluate() {
-  local repo="$1" f
+  local mode="${1:-pretooluse}" f
   if ! p3_load_globs; then
-    # Fail-OPEN on a missing policy file is unsafe for a security gate, but failing
-    # CLOSED would brick every commit if the file is absent. Choose closed-with-loud:
+    # A security gate must not commit blind. Fail CLOSED if the policy file is missing.
     P3_VERDICT="DENY(no-policy-file)"; P3_MATCHED=""; return 1
+  fi
+  # H3: the git context must resolve to a real repo. If -C / GIT_DIR points nowhere
+  # (misdirection), we can't read the true staged set → fail CLOSED.
+  if ! git "${P3_GIT_ARGS[@]}" rev-parse --git-dir >/dev/null 2>&1; then
+    P3_VERDICT="DENY(unresolvable-repo)"; P3_MATCHED=""; return 1
   fi
   local matched=""
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     p3_match_file "$f" && matched+="$f"$'\n'
-  done < <(git -C "$repo" diff --cached --name-only 2>/dev/null)
+  done < <(p3_staged_files)
   P3_MATCHED="${matched%$'\n'}"
   if [[ -z "$P3_MATCHED" ]]; then
     P3_VERDICT="ALLOW(no-p3-paths)"; return 0
   fi
+  # H2: pre-commit runs with whatever env the `git commit` inherited — an agent can set
+  # NHQ_AGENT/NHQ_SESSION/VFRAME_P3_OK inline. So pre-commit NEVER trusts env identity:
+  # it ALWAYS treats the caller as an agent with NO self-approve. Self-approval exists
+  # ONLY in PreToolUse mode (harness env, not command-inline).
+  if [[ "$mode" == "precommit" ]]; then
+    P3_VERDICT="DENY(precommit-no-selfapprove)"; p3_audit deny; return 1
+  fi
   if p3_caller_privileged; then
     if [[ "${VFRAME_P3_OK:-}" == "1" ]]; then
-      P3_VERDICT="ALLOW(director-token)"; p3_audit "allow" "$repo"; return 0
+      P3_VERDICT="ALLOW(director-token)"; p3_audit allow; return 0
     fi
-    P3_VERDICT="DENY(director-no-token)"; p3_audit "deny" "$repo"; return 1
+    P3_VERDICT="DENY(director-no-token)"; p3_audit deny; return 1
   fi
-  P3_VERDICT="DENY(fleet-hard-block)"; p3_audit "deny" "$repo"; return 1
+  P3_VERDICT="DENY(fleet-hard-block)"; p3_audit deny; return 1
 }
 
 # Best-effort audit line (never fatal).
 p3_audit() {
-  local decision="$1" repo="$2" ab="${NHQ_AUDIT_BIN:-$BIN/nhq-audit}"
+  local decision="$1" ab="${NHQ_AUDIT_BIN:-$BIN/nhq-audit}"
   [[ -x "$ab" ]] || ab="$(command -v nhq-audit 2>/dev/null || true)"
   [[ -n "$ab" && -x "$ab" ]] || return 0
   "$ab" append --tool p3-guard --bucket "p3:${decision}" \
     --file "$(printf '%s' "$P3_MATCHED" | head -1)" \
-    --cmd "git commit @ $repo verdict=$P3_VERDICT" 2>/dev/null || true
+    --cmd "git commit verdict=$P3_VERDICT" 2>/dev/null || true
 }
 
 # Emit a PreToolUse deny decision (stdout JSON) + notify.
 p3_emit_deny() {
   local reason="$1"
-  "$HOME/.local/bin/nhq-notify" blocked "🛑 P3 commit BLOCKED" "$reason" 2>/dev/null || true
+  "${NHQ_NOTIFY:-$HOME/.local/bin/nhq-notify}" blocked "🛑 P3 commit BLOCKED" "$reason" 2>/dev/null || true
   cat <<EOF
 {
   "hookSpecificOutput": {
@@ -139,17 +156,32 @@ p3_deny_reason() {
   local m; m="$(printf '%s' "$P3_MATCHED" | tr '\n' ' ')"
   case "$P3_VERDICT" in
     DENY\(fleet-hard-block\)) echo "this commit stages protected path(s) [$m]; fleet/relay agents are hard-blocked from auth/payments/PII/audit/security commits — escalate to Yash via nhq-blocked." ;;
-    DENY\(director-no-token\)) echo "this commit stages protected path(s) [$m]; Director must self-approve by re-running with VFRAME_P3_OK=1 (the approval is logged to audit.jsonl)." ;;
+    DENY\(director-no-token\)) echo "this commit stages protected path(s) [$m]; Director must self-approve in PreToolUse with VFRAME_P3_OK=1 (logged to audit.jsonl)." ;;
+    DENY\(precommit-no-selfapprove\)) echo "this commit stages protected path(s) [$m]; the pre-commit gate never trusts inline env — no self-approve here. A legitimate Director p3 commit is approved at the PreToolUse layer (harness env); to bypass the hook deliberately use 'git commit --no-verify' as a conscious human override." ;;
+    DENY\(unresolvable-repo\)) echo "the git target (-C / GIT_DIR) does not resolve to a real repository — refusing to evaluate a misdirected commit." ;;
     DENY\(no-policy-file\)) echo "p3-paths.json policy file not found at $(p3_paths_file) — refusing to commit blind. Restore the policy file." ;;
     *) echo "protected-path commit denied." ;;
   esac
 }
 
+# Parse the git context (GIT_DIR / -C) out of a PreToolUse Bash command into P3_GIT_ARGS.
+# Prefer GIT_DIR (where the index lives) over -C; fall back to the hook cwd.
+p3_set_git_ctx_from_cmd() {
+  local cmd="$1" cwd="$2" gd tgt
+  gd="$(printf '%s' "$cmd" | grep -oE 'GIT_DIR=[^[:space:]]+' | head -1 | cut -d= -f2-)"
+  tgt="$(printf '%s' "$cmd" | grep -oE 'git[[:space:]]+(-[^[:space:]]+[[:space:]]+)*-C[[:space:]]+[^[:space:]]+' | grep -oE -- '-C[[:space:]]+[^[:space:]]+' | head -1 | sed -E 's/^-C[[:space:]]+//')"
+  if [[ -n "$gd" ]]; then P3_GIT_ARGS=(--git-dir="$gd")
+  elif [[ -n "$tgt" ]]; then P3_GIT_ARGS=(-C "$tgt")
+  else P3_GIT_ARGS=(-C "$cwd"); fi
+}
+
 # ---- Mode dispatch ----
 case "${1:-}" in
   check)
-    repo="${2:-$PWD}"
-    if p3_evaluate "$repo"; then
+    # nhq-p3-guard check <repo> [pretooluse|precommit]
+    repo="${2:-$PWD}"; mode="${3:-pretooluse}"
+    P3_GIT_ARGS=(-C "$repo")
+    if p3_evaluate "$mode"; then
       echo "P3: $P3_VERDICT"; [[ -n "$P3_MATCHED" ]] && echo "matched:"$'\n'"$P3_MATCHED"
       exit 0
     else
@@ -158,33 +190,34 @@ case "${1:-}" in
     fi
     ;;
   pre-commit)
-    if p3_evaluate "$PWD"; then exit 0; fi
+    # The git pre-commit hook — fires after `git add`, before the commit is written.
+    # ALWAYS precommit mode → never trusts inline env (H2). Uses the ambient repo.
+    P3_GIT_ARGS=()
+    if p3_evaluate precommit; then exit 0; fi
     echo "🛑 P3 commit blocked: $(p3_deny_reason)" >&2
     exit 1
     ;;
   "")
-    # No arg: PreToolUse hook mode if there's hook JSON on stdin, else pre-commit on cwd.
+    # No arg: PreToolUse hook if hook JSON is on stdin, else pre-commit on cwd.
     if [[ -t 0 ]]; then
-      # interactive, no stdin → treat as pre-commit on cwd
-      if p3_evaluate "$PWD"; then exit 0; fi
+      P3_GIT_ARGS=(-C "$PWD")
+      if p3_evaluate precommit; then exit 0; fi
       echo "🛑 P3 commit blocked: $(p3_deny_reason)" >&2; exit 1
     fi
     INPUT="$(cat)"
     TOOL="$(printf '%s' "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)"
     [[ "$TOOL" == "Bash" ]] || exit 0
     CMD="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)"
-    # Only care about commands that actually create a commit.
-    echo "$CMD" | grep -qE '(^|[;&|]|&&)[[:space:]]*git[[:space:]]+([^|;&]*[[:space:]])?commit([[:space:]]|$)' || exit 0
+    # Commit detection (H3): allow inline env assignments (incl GIT_DIR=…) before `git`.
+    echo "$CMD" | grep -qE '(^|[;&|]|&&)[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git[[:space:]]+([^|;&]*[[:space:]])?commit([[:space:]]|$)' || exit 0
     CWD="$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)"; CWD="${CWD:-$PWD}"
-    # honor a git -C <dir> in the command
-    TGT="$(echo "$CMD" | grep -oE 'git[[:space:]]+-C[[:space:]]+[^[:space:]]+' | head -1 | awk '{print $3}')"
-    [[ -n "$TGT" ]] && CWD="$TGT"
-    if p3_evaluate "$CWD"; then exit 0; fi
+    p3_set_git_ctx_from_cmd "$CMD" "$CWD"
+    if p3_evaluate pretooluse; then exit 0; fi
     p3_emit_deny "$(p3_deny_reason)"
-    exit 0   # decision is carried in the JSON, not the exit code
+    exit 0   # decision carried in the JSON, not the exit code
     ;;
   *)
-    echo "usage: nhq-p3-guard {check <repo>|pre-commit}  (or pipe PreToolUse hook JSON)" >&2
+    echo "usage: nhq-p3-guard {check <repo> [pretooluse|precommit]|pre-commit}  (or pipe PreToolUse hook JSON)" >&2
     exit 2
     ;;
 esac

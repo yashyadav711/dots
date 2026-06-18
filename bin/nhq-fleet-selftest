@@ -444,6 +444,82 @@ eq "clean state → 0 leaks" "$(ctx_collect | jq 'length')" "0"
 export NHQ_STATE_DIR="$CTX_OLD_SD"
 unset -f nhq_session_state nhq_session_state_full 2>/dev/null || true
 
+echo "── SEC-C1: self-approval bypass closed (UUID commitment, SHA256) ───────"
+# Execute the guard (main) hermetically: isolated token dir + captured notification.
+GUARD="$BIN/../claude/hooks/dangerous-command-guard.sh"
+C1DIR="$TMP/c1"; C1NL="$TMP/c1-notif.log"
+C1NS="$TMP/c1-notify"; printf '#!/usr/bin/env bash\necho "$@" >> "%s"\n' "$C1NL" > "$C1NS"; chmod +x "$C1NS"
+c1run() { printf '{"tool_name":"Bash","session_id":"sx","tool_input":{"command":"railway up"}}' \
+  | env CLAUDE_DANGEROUS_DIR="$C1DIR" NHQ_NOTIFY="$C1NS" bash "$GUARD"; }
+o1="$(c1run)"
+grep -q '"deny"' <<<"$o1" && ok "C1: dangerous cmd denied on first block" || no "C1: first block not denied"
+PFILE="$(ls "$C1DIR"/pending/*.json 2>/dev/null | head -1)"; PJSON="$(cat "$PFILE" 2>/dev/null)"
+# NEGATIVE: forge approvals from every value the agent can read in the pending JSON (+cmdhash)
+for v in $(jq -r '.. | strings' "$PFILE" 2>/dev/null); do touch "$C1DIR/approved/$v" 2>/dev/null; done
+touch "$C1DIR/approved/$(basename "$PFILE" .json)" 2>/dev/null
+o2="$(c1run)"
+grep -q '"deny"' <<<"$o2" && ok "C1: forged approvals from pending JSON still DENIED" || no "C1: SELF-APPROVAL BYPASS"
+# POSITIVE: only the real UUID (notification-only) approves
+rm -f "$C1DIR"/approved/* 2>/dev/null
+C1U="$(grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$C1NL" | head -1)"
+touch "$C1DIR/approved/$C1U"
+o3="$(c1run)"
+grep -q '"deny"' <<<"$o3" && no "C1: real UUID failed to approve" || ok "C1: real notification UUID approves"
+if grep -q "$C1U" <<<"$PJSON"; then no "C1: uuid leaked into agent-readable JSON"; else ok "C1: uuid absent from pending JSON"; fi
+
+echo "── SEC-C2: eval / interpreter -c wrapper bypass blocked ────────────────"
+gb 'eval "rm -rf ~/Github/heydaddy"'
+gb 'bash -c "railway up"'
+gb "sh -c 'supabase db reset'"
+PYEVAL='python3 -c "import os; os.system(SQwipefs -a /dev/sdaSQ)"'; PYEVAL="${PYEVAL//SQ/\'}"
+gb "$PYEVAL"
+gb 'env FOO=1 bash -c "rm -rf /"'
+ga 'echo "; railway up"'
+ga 'bash -c "echo hello"'
+
+echo "── SEC-M1/M2: traversal + inline-env-prefix bypasses blocked ───────────"
+gb "rm -rf /tmp/../home/yash/Github/heydaddy"
+gb "RAILWAY_TOKEN=abc railway up"
+gb "A=1 sudo wipefs -a /dev/sda"
+gb "TOKEN=x dd if=z of=/dev/sda"
+ga "make FOO=bar all"
+
+echo "── SEC-L1: quoted secrets scrubbed in audit log ────────────────────────"
+LAF="$TMP/l1-audit.jsonl"
+env NHQ_AUDIT_FILE="$LAF" "$BIN/nhq-audit" append --tool Bash --cmd 'railway up --token "sk-QUOTEDsecret999"' >/dev/null 2>&1
+env NHQ_AUDIT_FILE="$LAF" "$BIN/nhq-audit" append --tool Bash --cmd "deploy RAILWAY_TOKEN='abcQUOTEDtoken'" >/dev/null 2>&1
+if grep -qE 'QUOTEDsecret999|abcQUOTEDtoken' "$LAF"; then no "L1: quoted secret leaked into audit"; else ok "L1: quoted secrets scrubbed"; fi
+
+echo "── SEC-H1/H2/H3: nhq-p3-guard bypasses closed ──────────────────────────"
+# reuse the P4-b fixture policy file ($P3PF) + git_quiet
+p3c() { # p3c <repo> <mode> [env=val...] → echoes allow|deny
+  local repo="$1" mode="$2"; shift 2
+  if env NHQ_P3_PATHS="$P3PF" NHQ_AUDIT_BIN=/bin/true "$@" "$BIN/nhq-p3-guard" check "$repo" "$mode" >/dev/null 2>&1; then echo allow; else echo deny; fi
+}
+pre_decision() { # pre_decision <full-bash-cmd> → echoes allow|deny for a PreToolUse fleet-agent commit
+  local j out; j="$(jq -nc --arg c "$1" '{tool_name:"Bash",session_id:"s",cwd:"/tmp",tool_input:{command:$c}}')"
+  out="$(echo "$j" | env NHQ_P3_PATHS="$P3PF" NHQ_AUDIT_BIN=/bin/true NHQ_AGENT=Envy NHQ_SESSION=fleet-envy-x "$BIN/nhq-p3-guard")"
+  if grep -q '"deny"' <<<"$out"; then echo deny; else echo allow; fi
+}
+SECR="$TMP/sec-p3repo"; git init -q "$SECR"; git_quiet "$SECR" commit --allow-empty -m base
+echo "SECRET=1" > "$SECR/.env"; git_quiet "$SECR" add .env
+# H2: pre-commit mode never trusts inline env (spoofed director+token still blocked)
+eq "H2: pre-commit + spoofed director/token → DENY" "$(p3c "$SECR" precommit NHQ_AGENT=director NHQ_SESSION= VFRAME_P3_OK=1)" "deny"
+eq "H2: (control) pretooluse + director/token → ALLOW" "$(p3c "$SECR" pretooluse NHQ_AGENT=Director NHQ_SESSION=main VFRAME_P3_OK=1)" "allow"
+# H1: the pre-commit hook is the real defense for the staging-timing gap
+env NHQ_P3_PATHS="$P3PF" NHQ_AUDIT_BIN=/bin/true NHQ_AGENT=Envy NHQ_SESSION=fleet-envy-x \
+  bash -c 'cd "$1" && "$2" pre-commit' _ "$SECR" "$BIN/nhq-p3-guard" >/dev/null 2>&1 && r=allow || r=deny
+eq "H1: pre-commit hook DENIES staged p3 (real defense vs add&&commit)" "$r" "deny"
+# H3: GIT_DIR= and inline-env git commit are detected + validated
+eq "H3: GIT_DIR= git commit detected → deny"        "$(pre_decision "GIT_DIR=$SECR/.git git commit -m x")"        "deny"
+eq "H3: leading-env + GIT_DIR= still detected → deny" "$(pre_decision "FOO=1 GIT_DIR=$SECR/.git git commit -m x")" "deny"
+eq "H3: bogus GIT_DIR → fail-closed deny"            "$(pre_decision "GIT_DIR=/nonexistent/.git git commit -m x")" "deny"
+
+echo "── SEC-M3: mcp-write-guard generic hard pattern (no fail-open) ─────────"
+eq "M3: remove_environment → hard" "$("$BIN/mcp-write-guard" classify mcp__plugin_railway_railway__remove_environment)" "hard"
+eq "M3: wipe_data → hard"          "$("$BIN/mcp-write-guard" classify mcp__plugin_railway_railway__wipe_data)"          "hard"
+eq "M3: reset_project → hard"      "$("$BIN/mcp-write-guard" classify mcp__plugin_railway_railway__reset_project)"      "hard"
+
 echo "────────────────────────────────────────────────────────────────────────"
 echo "nhq-fleet-selftest: ${pass} passed, ${fail} failed"
 [[ "$fail" -eq 0 ]]

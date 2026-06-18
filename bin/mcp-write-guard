@@ -30,11 +30,14 @@ mcp_classify() {
   local t="$1" base
   [[ "$t" == mcp__*railway* ]] || { echo ignore; return; }
   base="${t##*__}"
+  # READ first (a read tool name never contains remove/delete/reset/wipe), then the
+  # GENERIC hard pattern (M3) so a future remove_environment/wipe_data/reset_project is
+  # caught instead of silently falling through to routine. Then routine for the rest.
   case "$base" in
-    remove_service|remove_volume|delete_domain|remove_bucket|delete_project|project_delete)
-      echo hard ;;
     list_*|get_*|*_status|*_metrics|http_*|whoami|docs_*|search_*)
       echo read ;;
+    remove_*|delete_*|*_remove|*_delete|*reset*|*wipe*|*destroy*|*purge*)
+      echo hard ;;
     *)
       echo routine ;;
   esac
