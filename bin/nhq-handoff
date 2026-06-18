@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# nhq-handoff — context-hygiene tool for the session handoff swap (P5).
+#
+#   nhq-handoff validate [file]   schema-check a handoff doc (default ai/session-handoff.md)
+#   nhq-handoff validate --json [file]
+#
+# A handoff is the load-bearing context swap between sessions; a handoff missing its
+# required sections silently drops carry-over (the background-leak tax's cousin). This
+# asserts the required sections are present BEFORE the next session trusts the swap.
+#
+# Required section categories (each satisfied by ANY ## / ### heading whose text
+# matches the pattern, case-insensitive). Override the whole set with NHQ_HANDOFF_SECTIONS
+# ("label:regex" entries, one per line).
+set -uo pipefail
+
+DEFAULT_SECTIONS='shipped:shipped|done|completed|ship
+open-threads:open|carry|thread
+pending:pending|push|blocked|next|todo'
+
+handoff_default_file() { printf '%s' "${NHQ_HANDOFF:-${1:-ai/session-handoff.md}}"; }
+
+# hv_validate <file> — sets HV_MISSING (newline list of missing labels); 0 ok / 1 fail.
+HV_MISSING=""; HV_PRESENT=""
+hv_validate() {
+  local file="$1"
+  [[ -f "$file" ]] || { HV_MISSING="(file-not-found:$file)"; return 1; }
+  local headings; headings="$(grep -E '^#{1,3} ' "$file" 2>/dev/null || true)"
+  local secs="${NHQ_HANDOFF_SECTIONS:-$DEFAULT_SECTIONS}"
+  HV_MISSING=""; HV_PRESENT=""
+  local line label rx
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    label="${line%%:*}"; rx="${line#*:}"
+    if printf '%s' "$headings" | grep -qiE "$rx"; then
+      HV_PRESENT+="$label"$'\n'
+    else
+      HV_MISSING+="$label"$'\n'
+    fi
+  done <<< "$secs"
+  HV_PRESENT="${HV_PRESENT%$'\n'}"; HV_MISSING="${HV_MISSING%$'\n'}"
+  [[ -z "$HV_MISSING" ]]
+}
+
+case "${1:-}" in
+  validate)
+    shift
+    JSON=0; [[ "${1:-}" == "--json" ]] && { JSON=1; shift; }
+    FILE="$(handoff_default_file "${1:-}")"
+    if hv_validate "$FILE"; then
+      if [[ "$JSON" -eq 1 ]]; then
+        jq -n --arg f "$FILE" --argjson p "$(printf '%s' "$HV_PRESENT" | jq -R . | jq -s .)" \
+          '{file:$f, valid:true, present:$p, missing:[]}'
+      else
+        echo "✅ handoff valid: $FILE (sections: $(printf '%s' "$HV_PRESENT" | tr '\n' ' '))"
+      fi
+      exit 0
+    else
+      if [[ "$JSON" -eq 1 ]]; then
+        jq -n --arg f "$FILE" \
+          --argjson p "$(printf '%s' "$HV_PRESENT" | jq -R . | jq -s 'map(select(.!=""))')" \
+          --argjson m "$(printf '%s' "$HV_MISSING" | jq -R . | jq -s 'map(select(.!=""))')" \
+          '{file:$f, valid:false, present:$p, missing:$m}'
+      else
+        echo "❌ handoff INVALID: $FILE — missing section(s): $(printf '%s' "$HV_MISSING" | tr '\n' ' ')" >&2
+      fi
+      exit 1
+    fi
+    ;;
+  *) echo "usage: nhq-handoff validate [--json] [file]" >&2; exit 2 ;;
+esac

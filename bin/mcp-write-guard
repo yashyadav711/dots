@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# mcp-write-guard — gate Railway infra-mutating MCP tools (P4 safety, D3 TIERED).
+#
+# D3 (locked) — gate by REVERSIBILITY, not by caller:
+#   • HARD   (irreversible) → token-gated. remove_service, remove_volume,
+#            delete_domain, remove_bucket, delete_project. DENIED unless
+#            VFRAME_MCP_OK=1 is present (Director/human places the token). Logged.
+#   • ROUTINE(mutating, reversible) → ALLOWED + logged, never blocked. deploy,
+#            set_variables, create_*, update_*, scale_*, link_*, generate_domain …
+#            This keeps the live-test-fix fast-deploy loop fast.
+#   • READ   → allowed silently. list_*, get_*, *_status, *_metrics, http_*, docs_* …
+#   • non-Railway MCP / non-MCP tool → ignored.
+#
+# Modes (auto-detected):
+#   1. PreToolUse hook  — hook JSON on stdin; emits deny JSON for a hard op w/o token.
+#   2. classify <tool>  — prints the tier (hard|routine|read|ignore) for tests.
+#   3. check <tool>     — evaluate as if invoked; prints verdict; rc 0 allow / 1 deny.
+#
+# Wiring (Director owns the harness side): settings.json → hooks.PreToolUse with a
+# matcher on "mcp__.*railway.*" (or "*") → this script. The script self-filters.
+#
+# Overrides (selftest): VFRAME_MCP_OK, NHQ_AUDIT_BIN.
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+
+# mcp_classify <tool> → hard|routine|read|ignore
+mcp_classify() {
+  local t="$1" base
+  [[ "$t" == mcp__*railway* ]] || { echo ignore; return; }
+  base="${t##*__}"
+  case "$base" in
+    remove_service|remove_volume|delete_domain|remove_bucket|delete_project|project_delete)
+      echo hard ;;
+    list_*|get_*|*_status|*_metrics|http_*|whoami|docs_*|search_*)
+      echo read ;;
+    *)
+      echo routine ;;
+  esac
+}
+
+# mcp_audit <decision> <tool> <tier>
+mcp_audit() {
+  local ab="${NHQ_AUDIT_BIN:-$BIN/nhq-audit}"
+  [[ -x "$ab" ]] || ab="$(command -v nhq-audit 2>/dev/null || true)"
+  [[ -n "$ab" && -x "$ab" ]] || return 0
+  "$ab" append --tool mcp-write-guard --bucket "mcp:$3:$1" --file "$2" \
+    --cmd "railway-mcp $2 ($3) → $1" 2>/dev/null || true
+}
+
+MCP_VERDICT=""
+# mcp_evaluate <tool> → sets MCP_VERDICT; 0 allow / 1 deny
+mcp_evaluate() {
+  local t="$1" tier; tier="$(mcp_classify "$t")"
+  case "$tier" in
+    ignore) MCP_VERDICT="ALLOW(not-railway-mcp)"; return 0 ;;
+    read)   MCP_VERDICT="ALLOW(read)"; return 0 ;;
+    routine) MCP_VERDICT="ALLOW(routine-logged)"; mcp_audit allow "$t" routine; return 0 ;;
+    hard)
+      if [[ "${VFRAME_MCP_OK:-}" == "1" ]]; then
+        MCP_VERDICT="ALLOW(irreversible-token)"; mcp_audit allow "$t" hard; return 0
+      fi
+      MCP_VERDICT="DENY(irreversible-no-token)"; mcp_audit deny "$t" hard; return 1 ;;
+  esac
+}
+
+mcp_emit_deny() {
+  local t="$1"
+  "$HOME/.local/bin/nhq-notify" blocked "🛑 Railway MCP BLOCKED" "$t needs approval" 2>/dev/null || true
+  cat <<EOF
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "BLOCKED (D3): $t is an irreversible Railway infra op. To approve, re-run with VFRAME_MCP_OK=1 (Director/human only; the approval is logged)."
+  }
+}
+EOF
+}
+
+case "${1:-}" in
+  classify) mcp_classify "${2:-}"; exit 0 ;;
+  check)
+    if mcp_evaluate "${2:-}"; then echo "MCP: $MCP_VERDICT"; exit 0
+    else echo "MCP: $MCP_VERDICT"; exit 1; fi ;;
+  "")
+    [[ -t 0 ]] && { echo "usage: mcp-write-guard {classify|check} <tool>  (or pipe PreToolUse JSON)" >&2; exit 2; }
+    INPUT="$(cat)"
+    TOOL="$(printf '%s' "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)"
+    [[ -n "$TOOL" ]] || exit 0
+    if mcp_evaluate "$TOOL"; then exit 0; fi
+    mcp_emit_deny "$TOOL"
+    exit 0 ;;
+  *) echo "usage: mcp-write-guard {classify|check} <tool>" >&2; exit 2 ;;
+esac

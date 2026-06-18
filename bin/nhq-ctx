@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# nhq-ctx — context-hygiene scanner (P5). Flags the BACKGROUND-LEAK TAX
+# (replies.md Rule -4 / craft.md gotcha #16): lingering finished tasks and stale
+# running cards that burn context + quota until they're cleared.
+#
+#   nhq-ctx scan            human report of every leak + how to clear it
+#   nhq-ctx scan --json     machine list
+#
+# A "leak" is a marker/card whose work is OVER but whose state lingers:
+#   • lingering-done     — a <session>.done on a session no longer RUNNING (a finished
+#                          card still sitting in the UI; clear it by panel name).
+#   • orphan             — IDLE + a new commit since spawn + no .done (silent-complete;
+#                          verify the artifact, then it should report or be cleared).
+#   • stale-stalled /
+#     stale-blocked      — a .stalled/.blocked marker on a DEAD session (gate is moot;
+#                          rm the stale marker).
+#
+# Hermetic/testable: source-guarded; `ctx_collect` returns the leak list as JSON and
+# uses nhq_session_state / nhq_session_state_full (mockable in the selftest).
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+source "$BIN/nhq-lib.sh"
+
+CTX_GHOST_MIN="${CTX_GHOST_MIN:-5}"   # a done card older than this on an idle session = clearable
+
+_age_min() { local f="$1" now mt; now=$(date +%s); mt=$(stat -c %Y "$f" 2>/dev/null || echo "$now"); echo $(( (now - mt) / 60 )); }
+
+# ctx_collect → JSON array of leaks on stdout.
+ctx_collect() {
+  local leaks="[]" f session base age st
+  shopt -s nullglob
+  # lingering finished cards (.done on a non-RUNNING session)
+  for f in "$NHQ_STATE_DIR"/*.done; do
+    [[ -f "$f" ]] || continue
+    session="$(basename "$f" .done)"
+    base="$(nhq_session_state "$session")"
+    [[ "$base" == RUNNING ]] && continue
+    age="$(_age_min "$f")"
+    leaks="$(jq -c --arg s "$session" --arg b "$base" --argjson a "$age" --argjson g "$CTX_GHOST_MIN" \
+      '. += [{session:$s, kind:"lingering-done", base:$b, age_min:$a, stale:($a>=$g),
+              fix:"clear the completed task card by its exact panel name (clearing is not automatic)"}]' <<<"$leaks")"
+  done
+  # stale gate markers (.stalled / .blocked on a DEAD session)
+  for f in "$NHQ_STATE_DIR"/*.stalled "$NHQ_STATE_DIR"/*.blocked; do
+    [[ -f "$f" ]] || continue
+    local mk="${f##*.}"; session="$(basename "$f" ".$mk")"
+    base="$(nhq_session_state "$session")"
+    [[ "$base" == DEAD ]] || continue
+    age="$(_age_min "$f")"
+    leaks="$(jq -c --arg s "$session" --arg k "stale-$mk" --argjson a "$age" \
+      '. += [{session:$s, kind:$k, base:"DEAD", age_min:$a, stale:true,
+              fix:"rm the stale marker — the session is gone, the gate is moot"}]' <<<"$leaks")"
+  done
+  # silent-complete orphans (.meta whose derived state is ORPHAN)
+  for f in "$NHQ_STATE_DIR"/*.meta; do
+    [[ -f "$f" ]] || continue
+    session="$(jq -r '.session // empty' "$f" 2>/dev/null)"; [[ -z "$session" ]] && continue
+    st="$(nhq_session_state_full "$session" 2>/dev/null || echo "")"
+    [[ "$st" == ORPHAN ]] || continue
+    leaks="$(jq -c --arg s "$session" \
+      '. += [{session:$s, kind:"orphan", base:"IDLE", stale:true,
+              fix:"verify the artifact (it committed but never called nhq-done), then report or clear"}]' <<<"$leaks")"
+  done
+  printf '%s' "$leaks"
+}
+
+ctx_render() {
+  local leaks="$1" n; n="$(jq 'length' <<<"$leaks")"
+  echo "🧹 NHQ CONTEXT HYGIENE — background-leak scan"
+  echo "──────────────────────────────────────────────────────────────────────"
+  if [[ "$n" -eq 0 ]]; then
+    echo "  clean — no lingering cards or stale markers. (lowest context tax)"
+    return 0
+  fi
+  echo "  $n leak(s) burning context/quota until cleared:"
+  jq -r '.[] | "    • [\(.kind)] \(.session)\(if .age_min then " (\(.age_min)m old)" else "" end)\n        → \(.fix)"' <<<"$leaks"
+}
+
+# Dispatch only when executed; stay quiet when sourced (test harness gets the funcs).
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+  case "${1:-}" in
+    scan)
+      shift
+      JSON=0; [[ "${1:-}" == "--json" ]] && JSON=1
+      LEAKS="$(ctx_collect)"
+      if [[ "$JSON" -eq 1 ]]; then printf '%s\n' "$LEAKS"; else ctx_render "$LEAKS"; fi
+      # exit non-zero when leaks exist so a hook/cron can act on it
+      [[ "$(jq 'length' <<<"$LEAKS")" -eq 0 ]]
+      ;;
+    *) echo "usage: nhq-ctx scan [--json]" >&2; exit 2 ;;
+  esac
+fi

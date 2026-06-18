@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# nhq-audit — audit.jsonl v2: agent-stamped, hash-chained, secret-scrubbed append +
+# tamper-detecting verify. The single source of truth for the audit chain format,
+# consulted by the Director post_tool_use.js hook and the P4 guards.
+#
+#   nhq-audit append --tool T [--agent A] [--bucket B] [--file F] [--cmd C] [--session S]
+#   nhq-audit verify [file]          # rc 0 = intact, 1 = tampered
+#
+# Chain (language-agnostic, byte-exact): each line is compact JSON ending in a LAST
+# field  "h":"<sha256hex>"  where  h_i = sha256( prev_h || core_i ),  core_i = the
+# line with the trailing `,"h":"…"` removed, prev_h = the previous chained line's h
+# (or the literal "GENESIS" for the first chained line). Legacy v1 lines (no "h")
+# are tolerated ONLY before the chain begins — an unchained line after the chain
+# starts is treated as an insert/tamper and fails verification.
+#
+# Env: NHQ_AUDIT_FILE (default ~/Github/nhq-agentic-os/ai/state/audit.jsonl),
+#      NHQ_AGENT (default agent stamp).
+set -uo pipefail
+
+audit_file() { printf '%s' "${NHQ_AUDIT_FILE:-$HOME/Github/nhq-agentic-os/ai/state/audit.jsonl}"; }
+
+GENESIS="GENESIS"
+sha() { printf '%s' "$1" | sha256sum | awk '{print $1}'; }
+
+# Scrub secret-looking values from a command string before it is logged.
+scrub() {
+  printf '%s' "$1" | sed -E \
+    -e 's/(--?(token|password|passwd|pwd|secret|api[-_]?key|apikey|auth|bearer)[[:space:]=:]+)[^[:space:]"'"'"']+/\1***/Ig' \
+    -e 's/([A-Za-z0-9_]*(SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|PRIVATE_KEY)[A-Za-z0-9_]*=)[^[:space:]"'"'"']+/\1***/Ig' \
+    -e 's/(ghp_|gho_|ghu_|ghs_|github_pat_|sk-|xox[baprs]-|AKIA|AIza)[A-Za-z0-9_\-]{8,}/***/g' \
+    -e 's/([Bb]earer[[:space:]]+)[A-Za-z0-9._\-]+/\1***/g'
+}
+
+# Recover the core (no h field) from a stored line.
+line_core() { local l="$1"; printf '%s}' "${l%,\"h\":*}"; }
+# Extract the stored h hex from a line ("" if none).
+line_hash() {
+  local l="$1"
+  [[ "$l" == *'"h":"'* ]] || { printf ''; return; }
+  l="${l##*\"h\":\"}"; printf '%s' "${l%%\"*}"
+}
+
+cmd_append() {
+  local ts="" agent="${NHQ_AGENT:-}" tool="" bucket="" file="" cmd="" session=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ts) ts="$2"; shift 2;;
+      --agent) agent="$2"; shift 2;;
+      --tool) tool="$2"; shift 2;;
+      --bucket) bucket="$2"; shift 2;;
+      --file) file="$2"; shift 2;;
+      --cmd) cmd="$2"; shift 2;;
+      --session) session="$2"; shift 2;;
+      *) shift;;
+    esac
+  done
+  [[ -z "$ts" ]] && ts="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+  [[ -n "$cmd" ]] && cmd="$(scrub "$cmd")"
+  local AF; AF="$(audit_file)"
+  mkdir -p "$(dirname "$AF")"
+
+  local nullify='if .=="" then null else . end'
+  local core
+  core="$(jq -cn \
+    --arg ts "$ts" --arg agent "$agent" --arg tool "$tool" --arg bucket "$bucket" \
+    --arg file "$file" --arg cmd "$cmd" --arg session "$session" \
+    "{ts:\$ts, agent:(\$agent|$nullify), tool:\$tool, bucket:(\$bucket|$nullify), file:(\$file|$nullify), cmd:(\$cmd|$nullify), session:(\$session|$nullify)}")" || return 1
+
+  # Lock for the read-last-hash → append window so concurrent writers can't fork the chain.
+  exec 9>"$AF.lock"
+  flock 9 2>/dev/null || true
+  local prev="$GENESIS"
+  if [[ -s "$AF" ]]; then
+    local last lh; last="$(tail -n1 "$AF")"; lh="$(line_hash "$last")"
+    [[ -n "$lh" ]] && prev="$lh"
+  fi
+  local h; h="$(sha "$prev$core")"
+  printf '%s,"h":"%s"}\n' "${core%\}}" "$h" >> "$AF"
+  flock -u 9 2>/dev/null || true
+}
+
+cmd_verify() {
+  local AF="${1:-$(audit_file)}"
+  [[ -f "$AF" ]] || { echo "nhq-audit verify: no file at $AF"; return 1; }
+  local prev="$GENESIS" n=0 started=0 bad=0 chained=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n+1))
+    [[ -z "$line" ]] && continue
+    local sh; sh="$(line_hash "$line")"
+    if [[ -z "$sh" ]]; then
+      if [[ "$started" -eq 1 ]]; then
+        echo "nhq-audit verify: TAMPER — unchained line $n after chain started"; bad=1
+      fi
+      continue
+    fi
+    started=1; chained=$((chained+1))
+    local core exp; core="$(line_core "$line")"; exp="$(sha "$prev$core")"
+    if [[ "$exp" != "$sh" ]]; then
+      echo "nhq-audit verify: TAMPER — line $n hash mismatch (got $sh, expected $exp)"; bad=1
+    fi
+    prev="$sh"
+  done < "$AF"
+  if [[ "$bad" -eq 0 ]]; then
+    echo "nhq-audit verify: OK — $chained chained line(s) of $n intact"; return 0
+  fi
+  return 1
+}
+
+case "${1:-}" in
+  append) shift; cmd_append "$@";;
+  verify) shift; cmd_verify "$@";;
+  *) echo "usage: nhq-audit {append --tool T [--agent A --bucket B --file F --cmd C --session S] | verify [file]}" >&2; exit 2;;
+esac

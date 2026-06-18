@@ -7,41 +7,17 @@
 #
 # Install: Add to .claude/settings.json under hooks.PreToolUse
 # Requires: jq
+#
+# TESTABILITY (P4): `check_dangerous` is a pure function (reason on stdout, rc 0
+# if dangerous). The stdin-reading main logic is guarded by a sourced-vs-executed
+# check at the bottom, so nhq-fleet-selftest can `source` this file and unit-test
+# `check_dangerous` against a case table WITHOUT the hook trying to read stdin.
 
 # --- Configuration ---
 # Approval token directory (change if needed)
 DANGEROUS_DIR="/tmp/claude-dangerous"
 PENDING_DIR="$DANGEROUS_DIR/pending"
 APPROVED_DIR="$DANGEROUS_DIR/approved"
-
-mkdir -p "$PENDING_DIR" "$APPROVED_DIR" 2>/dev/null
-
-# --- Read hook input ---
-INPUT=$(cat)
-
-TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty')
-SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
-
-# Only intercept Bash tool calls
-if [[ "$TOOL_NAME" != "Bash" ]]; then
-    exit 0
-fi
-
-COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
-
-if [[ -z "$COMMAND" ]]; then
-    exit 0
-fi
-
-# Cleanup stale tokens (pending: 5 min, approved: 60s)
-find "$PENDING_DIR" -type f -mmin +5 -delete 2>/dev/null
-find "$APPROVED_DIR" -type f -mmin +1 -delete 2>/dev/null
-
-# --- Hash generation ---
-# Each approval token is scoped to a specific command in a specific session
-generate_hash() {
-    echo -n "${SESSION_ID}:${COMMAND}" | md5sum | cut -d' ' -f1
-}
 
 # --- Pattern matching ---
 # Returns a human-readable reason if the command is dangerous, empty otherwise.
@@ -104,6 +80,16 @@ check_dangerous() {
         return 0
     fi
 
+    # Recursive rm of an ENTIRE project tree: a direct child of a Github/ dir
+    # (rm -rf ~/Github/heydaddy, /home/yash/Github/mirror, ./Github/foo). Wiping a whole
+    # repo is the catastrophic case the operator constitution calls out. A path BELOW a
+    # project (~/Github/foo/build) is normal authority and stays allowed: the target must
+    # be the project root itself (Github/<name> with nothing but an optional trailing /).
+    if echo "$cmd" | grep -qiE "${RM}${FL}${RECUR}${FL}('|\")?([^[:space:]'\"]*/)?Github/[^/[:space:]'\"]+/?([[:space:]'\"]|\$)"; then
+        echo "recursively delete an entire Github project tree"
+        return 0
+    fi
+
     # Recursive rm of a bare top-level glob: `rm -rf *` (would wipe the whole cwd).
     if echo "$cmd" | grep -qiE "${RM}${FL}${RECUR}${FL}('|\")?[*]+([[:space:]]|$)"; then
         echo "recursively delete everything matched by a bare glob"
@@ -128,9 +114,37 @@ check_dangerous() {
         return 0
     fi
 
-    # Direct disk write with dd
-    if echo "$cmd" | grep -qiE '(^|[[:space:]])dd[[:space:]]+.*of=/dev/'; then
-        echo "write directly to disk device"
+    # Erase filesystem signatures with wipefs (makes a disk/partition unmountable).
+    # Command-position-anchored (like rm) so a wipefs mentioned in quoted text doesn't fire.
+    if echo "$cmd" | grep -qiE '(^|[;&|(])[[:space:]]*(sudo[[:space:]]+)?wipefs([[:space:]]|$)'; then
+        echo "erase filesystem signatures with wipefs"
+        return 0
+    fi
+
+    # Direct disk write with dd (dd ... of=/dev/sdX — overwrites a raw device). Anchored to
+    # command position so a dd-of-device string quoted inside another command isn't a match.
+    if echo "$cmd" | grep -qiE '(^|[;&|(])[[:space:]]*(sudo[[:space:]]+)?dd[[:space:]]+.*of=/dev/'; then
+        echo "write directly to a disk device with dd"
+        return 0
+    fi
+
+    # pacman cascade remove: -R with the recursive-deps flag (-Rns, -Rs, -Rsn ...). Can
+    # uninstall dependency chains and break the boot/desktop stack. Command-position-anchored.
+    if echo "$cmd" | grep -qiE '(^|[;&|(])[[:space:]]*(sudo[[:space:]]+)?pacman[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-R[a-z]*s'; then
+        echo "cascade-remove packages with pacman -R...s (can break the system)"
+        return 0
+    fi
+
+    # Railway infra mutation: up / deploy / down / delete (a spawned agent could silently
+    # ship or tear down production infra). Routine read ops (logs/status) are untouched.
+    if echo "$cmd" | grep -qiE '(^|[;&|(])[[:space:]]*railway[[:space:]]+(up|deploy|down|delete|remove)([[:space:]]|$)'; then
+        echo "mutate Railway infrastructure (railway up/deploy/down)"
+        return 0
+    fi
+
+    # Supabase destructive DB ops: db push (apply migrations) / db reset (drop + recreate).
+    if echo "$cmd" | grep -qiE '(^|[;&|(])[[:space:]]*supabase[[:space:]]+db[[:space:]]+(push|reset)([[:space:]]|$)'; then
+        echo "push or reset the Supabase database schema"
         return 0
     fi
 
@@ -146,8 +160,8 @@ check_dangerous() {
         return 0
     fi
 
-    # Destructive git: force push
-    if echo "$cmd" | grep -qiE '(^|[[:space:]])git[[:space:]]+push[[:space:]]+.*--force([[:space:]]|$)|(^|[[:space:]])git[[:space:]]+push[[:space:]]+-f([[:space:]]|$)'; then
+    # Destructive git: force push (--force, -f, OR --force-with-lease)
+    if echo "$cmd" | grep -qiE '(^|[[:space:]])git[[:space:]]+push[[:space:]]+.*(--force(-with-lease)?([[:space:]=]|$)|-f([[:space:]]|$))'; then
         echo "force push and potentially destroy remote history"
         return 0
     fi
@@ -162,26 +176,59 @@ check_dangerous() {
     return 1
 }
 
-# --- Main logic ---
-REASON=$(check_dangerous "$COMMAND")
-if [[ -z "$REASON" ]]; then
-    exit 0  # Not dangerous, allow
-fi
+# --- Hash generation ---
+# Each approval token is scoped to a specific command in a specific session
+generate_hash() {
+    echo -n "${SESSION_ID}:${COMMAND}" | md5sum | cut -d' ' -f1
+}
 
-# Check for pre-existing approval token
-HASH=$(generate_hash)
-APPROVAL_FILE="$APPROVED_DIR/$HASH"
-PENDING_FILE="$PENDING_DIR/$HASH.json"
+# --- Main hook logic (only runs when EXECUTED, not when sourced for testing) ---
+main() {
+    mkdir -p "$PENDING_DIR" "$APPROVED_DIR" 2>/dev/null
 
-if [[ -f "$APPROVAL_FILE" ]]; then
-    # Consume the single-use approval token
-    rm -f "$APPROVAL_FILE"
-    rm -f "$PENDING_FILE"
-    exit 0  # Allow
-fi
+    # --- Read hook input ---
+    local INPUT TOOL_NAME
+    INPUT=$(cat)
 
-# Write pending file (for external approval systems to read)
-cat > "$PENDING_FILE" << PENDING_EOF
+    TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty')
+    SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
+
+    # Only intercept Bash tool calls
+    if [[ "$TOOL_NAME" != "Bash" ]]; then
+        exit 0
+    fi
+
+    COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+
+    if [[ -z "$COMMAND" ]]; then
+        exit 0
+    fi
+
+    # Cleanup stale tokens (pending: 5 min, approved: 60s)
+    find "$PENDING_DIR" -type f -mmin +5 -delete 2>/dev/null
+    find "$APPROVED_DIR" -type f -mmin +1 -delete 2>/dev/null
+
+    local REASON
+    REASON=$(check_dangerous "$COMMAND")
+    if [[ -z "$REASON" ]]; then
+        exit 0  # Not dangerous, allow
+    fi
+
+    # Check for pre-existing approval token
+    local HASH APPROVAL_FILE PENDING_FILE
+    HASH=$(generate_hash)
+    APPROVAL_FILE="$APPROVED_DIR/$HASH"
+    PENDING_FILE="$PENDING_DIR/$HASH.json"
+
+    if [[ -f "$APPROVAL_FILE" ]]; then
+        # Consume the single-use approval token
+        rm -f "$APPROVAL_FILE"
+        rm -f "$PENDING_FILE"
+        exit 0  # Allow
+    fi
+
+    # Write pending file (for external approval systems to read)
+    cat > "$PENDING_FILE" << PENDING_EOF
 {
   "hash": "$HASH",
   "session_id": "$SESSION_ID",
@@ -191,23 +238,12 @@ cat > "$PENDING_FILE" << PENDING_EOF
 }
 PENDING_EOF
 
-# --- Notification hook point ---
-# This is where you'd add your own notification system.
-# In production, we send a Discord message with Approve/Deny buttons.
-# You could also:
-#   - Send a Slack message
-#   - Trigger a webhook
-#   - Send a desktop notification (notify-send, osascript)
-#   - Write to a log file for manual review
-#
-# To approve externally, create the approval token file:
-#   touch /tmp/claude-dangerous/approved/$HASH
-#
-# Desktop notification so Yash sees the block (NHQ: wired to dunst via notify-send)
-"$HOME/.local/bin/nhq-notify" blocked "🛑 Dangerous command BLOCKED" "Would $REASON" 2>/dev/null || true
+    # --- Notification hook point ---
+    # Desktop notification so Yash sees the block (NHQ: wired to dunst via notify-send)
+    "$HOME/.local/bin/nhq-notify" blocked "🛑 Dangerous command BLOCKED" "Would $REASON" 2>/dev/null || true
 
-# Deny the command with a clear explanation
-cat << EOF
+    # Deny the command with a clear explanation
+    cat << EOF
 {
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
@@ -216,4 +252,10 @@ cat << EOF
   }
 }
 EOF
-exit 0
+    exit 0
+}
+
+# Run main only when executed directly; stay quiet when sourced (test harness).
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+    main
+fi

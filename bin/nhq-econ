@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# nhq-econ — fleet economics, OBSERVE + RECOMMEND only (D6: never auto-switches).
+#
+# Reads every ~/.nhq-fleet/<session>.meta cost record (filled by nhq-cost) and:
+#   • totals fleet spend, by agent + by model;
+#   • measures the AGY-FLOOR SHARE — the fraction of sessions that rode the free
+#     Antigravity rotation rather than paid tokens (the agy-floor, measured for the
+#     first time, plan §P5);
+#   • flags MODE-DRIFT — a session whose actual model ≠ the agent's registry-default
+#     model (an up- or down-shift from the lane the agent is supposed to run in);
+#   • flags CEILING BREACHES — cost_usd over the routing-policy price ceiling for the
+#     route that model maps to.
+#
+# It only flags/recommends. Switching modes or models stays a human/Director call.
+#
+#   nhq-econ            human report + writes the econ-state.json snapshot
+#   nhq-econ --json     machine snapshot to stdout (no file write)
+#   nhq-econ --no-write human report only
+#
+# Env: NHQ_STATE_DIR, NHQ_REGISTRY, NHQ_ROUTING_POLICY, NHQ_ECON_STATE.
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+source "$BIN/nhq-lib.sh"
+
+routing_policy() { printf '%s' "${NHQ_ROUTING_POLICY:-$BIN/routing-policy.json}"; }
+econ_state_file() { printf '%s' "${NHQ_ECON_STATE:-$NHQ_STATE_DIR/econ-state.json}"; }
+
+# Price rank for up/down-shift classification (higher = pricier). Free floor = 0.
+model_rank() {
+  case "$1" in
+    *Opus*) echo 4 ;;
+    *Sonnet*) echo 3 ;;
+    *Haiku*) echo 2 ;;
+    *Gemini*|*Antigravity*|agy*) echo 0 ;;
+    *) echo 3 ;;
+  esac
+}
+is_agy_floor() {
+  local pol; pol="$(routing_policy)"
+  local m="$1"
+  jq -e --arg m "$m" '(.agy_floor.models // []) as $f | any($f[]; . as $x | ($m|ascii_downcase|contains($x|ascii_downcase)))' "$pol" >/dev/null 2>&1
+}
+
+# Build the snapshot JSON on stdout.
+econ_compute() {
+  local pol; pol="$(routing_policy)"
+  local total="0" n=0 agy=0
+  local drift_json="[]" breach_json="[]" by_agent="{}" by_model="{}"
+
+  shopt -s nullglob
+  local f
+  for f in "$NHQ_STATE_DIR"/*.meta; do
+    [[ -f "$f" ]] || continue
+    local session agent model cost
+    session="$(jq -r '.session // empty' "$f" 2>/dev/null)"
+    agent="$(jq -r '.agent // "?"' "$f" 2>/dev/null)"
+    model="$(jq -r '.model // "?"' "$f" 2>/dev/null)"
+    cost="$(jq -r '.cost_usd // 0' "$f" 2>/dev/null)"
+    [[ -z "$session" ]] && continue
+    n=$((n+1))
+    total="$(awk -v a="$total" -v b="$cost" 'BEGIN{printf "%.4f", a+b}')"
+
+    by_agent="$(jq -c --arg a "$agent" --argjson c "${cost:-0}" '.[$a] = ((.[$a]//0) + $c)' <<<"$by_agent")"
+    by_model="$(jq -c --arg m "$model" --argjson c "${cost:-0}" '.[$m] = ((.[$m]//0) + $c)' <<<"$by_model")"
+
+    if is_agy_floor "$model"; then agy=$((agy+1)); fi
+
+    # mode-drift: actual model vs the agent's registry default
+    local def; def="$(nhq_agent_model "$agent" 2>/dev/null || true)"
+    if [[ -n "$def" && "$model" != "$def" && "$model" != "?" ]]; then
+      local ra rd kind; ra="$(model_rank "$model")"; rd="$(model_rank "$def")"
+      if [[ "$ra" -gt "$rd" ]]; then kind="upshift"; elif [[ "$ra" -lt "$rd" ]]; then kind="downshift"; else kind="sideshift"; fi
+      drift_json="$(jq -c --arg s "$session" --arg a "$agent" --arg act "$model" --arg def "$def" --arg k "$kind" \
+        '. += [{session:$s, agent:$a, actual:$act, default:$def, kind:$k}]' <<<"$drift_json")"
+    fi
+
+    # ceiling breach: cost vs routing-policy ceiling for this model's route
+    local route ceil; route="$(jq -r --arg m "$model" '.model_to_tasktype[$m] // empty' "$pol" 2>/dev/null)"
+    if [[ -n "$route" ]]; then
+      ceil="$(jq -r --arg r "$route" '.routes[$r].price_ceiling_usd // empty' "$pol" 2>/dev/null)"
+      if [[ -n "$ceil" ]] && awk -v c="$cost" -v l="$ceil" 'BEGIN{exit !(c>l)}'; then
+        breach_json="$(jq -c --arg s "$session" --arg a "$agent" --arg m "$model" --arg r "$route" --argjson c "${cost:-0}" --argjson l "$ceil" \
+          '. += [{session:$s, agent:$a, model:$m, route:$r, cost_usd:$c, ceiling_usd:$l}]' <<<"$breach_json")"
+      fi
+    fi
+  done
+
+  local share="0"
+  [[ "$n" -gt 0 ]] && share="$(awk -v a="$agy" -v b="$n" 'BEGIN{printf "%.3f", a/b}')"
+
+  jq -n --argjson total "${total:-0}" --argjson n "$n" --argjson agy "$agy" \
+    --argjson share "$share" --argjson by_agent "$by_agent" --argjson by_model "$by_model" \
+    --argjson drift "$drift_json" --argjson breach "$breach_json" \
+    '{total_cost_usd:$total, total_sessions:$n, agy_floor_sessions:$agy, agy_floor_share:$share,
+      by_agent:$by_agent, by_model:$by_model, mode_drift:$drift, ceiling_breaches:$breach}'
+}
+
+render_human() {
+  local snap="$1"
+  echo "💰 NHQ FLEET ECONOMICS  (observe + recommend only — nothing auto-switches)"
+  echo "──────────────────────────────────────────────────────────────────────"
+  printf "  total spend     : \$%s across %s session(s)\n" \
+    "$(jq -r '.total_cost_usd' <<<"$snap")" "$(jq -r '.total_sessions' <<<"$snap")"
+  printf "  agy-floor share : %s  (%s of %s session(s) rode the free Antigravity floor)\n" \
+    "$(jq -r '.agy_floor_share' <<<"$snap")" "$(jq -r '.agy_floor_sessions' <<<"$snap")" "$(jq -r '.total_sessions' <<<"$snap")"
+  echo "  by agent        : $(jq -c '.by_agent' <<<"$snap")"
+  echo "  by model        : $(jq -c '.by_model' <<<"$snap")"
+  local nd; nd="$(jq -r '.mode_drift | length' <<<"$snap")"
+  if [[ "$nd" -gt 0 ]]; then
+    echo "  ⚠ mode-drift    : $nd session(s) off their lane —"
+    jq -r '.mode_drift[] | "      \(.session): \(.agent) ran \(.actual) (default \(.default)) [\(.kind)]"' <<<"$snap"
+    echo "      → RECOMMEND: review whether the up/down-shift was intended (not auto-corrected)."
+  else
+    echo "  mode-drift      : none — every session on its lane's default model"
+  fi
+  local nb; nb="$(jq -r '.ceiling_breaches | length' <<<"$snap")"
+  if [[ "$nb" -gt 0 ]]; then
+    echo "  ⚠ ceiling breach: $nb session(s) over the routing-policy price ceiling —"
+    jq -r '.ceiling_breaches[] | "      \(.session): \(.model) cost $\(.cost_usd) > $\(.ceiling_usd) [\(.route)]"' <<<"$snap"
+  fi
+}
+
+# ---- dispatch ----
+MODE="report"
+case "${1:-}" in
+  --json) MODE="json" ;;
+  --no-write) MODE="report-nowrite" ;;
+  "" ) MODE="report" ;;
+  *) echo "usage: nhq-econ [--json|--no-write]" >&2; exit 2 ;;
+esac
+
+SNAP="$(econ_compute)"
+case "$MODE" in
+  json) printf '%s\n' "$SNAP" ;;
+  report)
+    render_human "$SNAP"
+    es="$(econ_state_file)"; mkdir -p "$(dirname "$es")"
+    jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {snapshot_ts:$ts}' <<<"$SNAP" > "$es"
+    echo "  (snapshot → $es)"
+    ;;
+  report-nowrite) render_human "$SNAP" ;;
+esac
