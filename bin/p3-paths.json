@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "description": "Protocol-3 (P3) protected path globs. A git commit that stages ANY file matching these is the irreversible/sensitive class: it is DENIED unless an approval token is present (D4: Director may inline-self-approve with VFRAME_P3_OK=1; fleet/relay agents are HARD-blocked, no self-approve). Globs are matched against the repo-relative staged path with bash extglob/globstar semantics (** = any depth).",
+  "categories": {
+    "auth": [
+      "**/auth/**",
+      "**/*auth*.*",
+      "**/.env",
+      "**/.env.*",
+      "**/secrets/**",
+      "**/secret*.*",
+      "**/credentials*",
+      "**/private.fish",
+      "**/*.pem",
+      "**/*.key",
+      "**/id_rsa*",
+      "**/service-account*.json",
+      "**/serviceAccount*.json",
+      "**/*service_account*.json",
+      "**/token*.*",
+      "**/jwt*.*",
+      "**/session*.*",
+      "**/middleware/**"
+    ],
+    "payments": [
+      "**/billing/**",
+      "**/payment*/**",
+      "**/payments/**",
+      "**/*stripe*",
+      "**/*invoice*",
+      "**/*checkout*",
+      "**/*nowpayments*",
+      "**/*payment_provider*"
+    ],
+    "pii": [
+      "**/pii/**",
+      "**/*pii*",
+      "**/*personal-data*",
+      "**/customer-data/**",
+      "**/models/user*",
+      "**/models/account*"
+    ],
+    "migrations": [
+      "**/migrations/**"
+    ],
+    "audit": [
+      "ai/state/audit.jsonl",
+      "**/audit.jsonl",
+      "**/audit/**"
+    ],
+    "security": [
+      ".claude/settings.json",
+      ".claude/settings.local.json",
+      "**/claude/hooks/**",
+      "**/.claude/hooks/**",
+      "ai/p3-paths.json"
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "description": "Declarative routing policy: task-type → preferred model → fallback chain → price/quota ceiling. RECOMMEND-ONLY (D6): nhq-econ reads this to flag mode-drift and ceiling breaches; nothing here auto-switches or auto-downshifts a live agent. The hybrid posture (plan §P5): layer this routing formalism on top of NHQ's zero-quota Antigravity rotator — keep the subscription-rotation economics, do NOT layer pay-per-token billing on top.",
+  "routes": {
+    "research": { "preferred": "Gemini 2.5 Pro",                 "fallback": ["Claude Sonnet 4.6 (Thinking)", "agy-floor"], "price_ceiling_usd": 2.0, "quota_ceiling_pct": 80 },
+    "code":     { "preferred": "Claude Sonnet 4.6 (Thinking)",   "fallback": ["Claude Haiku 4.5", "agy-floor"],            "price_ceiling_usd": 3.0, "quota_ceiling_pct": 80 },
+    "ops":      { "preferred": "Claude Haiku 4.5",               "fallback": ["agy-floor"],                                "price_ceiling_usd": 0.5, "quota_ceiling_pct": 90 },
+    "arch":     { "preferred": "Claude Opus 4.8",                "fallback": ["Claude Sonnet 4.6 (Thinking)"],             "price_ceiling_usd": 6.0, "quota_ceiling_pct": 70 }
+  },
+  "model_to_tasktype": {
+    "Claude Opus 4.8": "arch",
+    "Claude Sonnet 4.6 (Thinking)": "code",
+    "Claude Sonnet 4.6": "code",
+    "Claude Haiku 4.5": "ops",
+    "Gemini 2.5 Pro": "research",
+    "Gemini 2.5 Pro (Antigravity)": "research"
+  },
+  "agy_floor": {
+    "models": ["Gemini 2.5 Pro (Antigravity)", "agy", "Antigravity"],
+    "note": "The zero-quota Antigravity rotation — the free floor. agy-floor share = the fraction of fleet sessions that rode the free floor rather than paid tokens. The first time the agy-floor is measured at all (plan §P5)."
+  }
+}

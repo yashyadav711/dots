@@ -10,6 +10,13 @@
 # Usage:  nhq-notify needs-you "🔴 PM needs you" "Gate 3 test · Mirror merge"
 #         nhq-notify deploy    "🚀 Shipped"       "HeyDaddy PR #42 → prod"
 
+# Test-hygiene: suppress ALL desktop toasts when running under the selftest / CI, so
+# fixtures never fire real dunst popups at Yash. Honored even by hardcoded-path callers
+# (guards) because they all invoke THIS binary. Set NHQ_NOTIFY_SUPPRESS=1 or NHQ_TEST=1.
+if [ "${NHQ_NOTIFY_SUPPRESS:-}" = "1" ] || [ "${NHQ_TEST:-}" = "1" ]; then
+  exit 0
+fi
+
 TYPE="${1:-info}"
 TITLE="${2:-NHQ}"
 BODY="${3:-}"

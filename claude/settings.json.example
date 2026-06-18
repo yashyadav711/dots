@@ -5,6 +5,7 @@
     ],
     "defaultMode": "dontAsk"
   },
+    "_p4_safety_note": "P4 enforcement needs BOTH layers. (1) PreToolUse hooks below catch the harness-issued command. (2) MANDATORY per-repo git pre-commit hook is the real P3 defense (H1: PreToolUse fires before `git add`, so `git add x && git commit` stages nothing at check time). On heydaddy, mirror, AND nhq-agentic-os install it: printf '#!/bin/sh\\nexec ~/.local/bin/nhq-p3-guard pre-commit\\n' > <repo>/.git/hooks/pre-commit && chmod +x <repo>/.git/hooks/pre-commit . The pre-commit gate never trusts inline env (H2).",
   "hooks": {
     "PreToolUse": [
       {
@@ -13,6 +14,19 @@
           {
             "type": "command",
             "command": "bash /home/yash/.claude/hooks/dangerous-command-guard.sh"
+          },
+          {
+            "type": "command",
+            "command": "/home/yash/.local/bin/nhq-p3-guard"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*railway.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/yash/.local/bin/mcp-write-guard"
           }
         ]
       }

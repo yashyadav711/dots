@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# nhq-audit-verify — thin named wrapper around `nhq-audit verify`. Verifies the
+# audit.jsonl hash-chain; rc 0 = intact, rc 1 = tampered (flipped/inserted line).
+#   nhq-audit-verify [file]
+set -uo pipefail
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+exec "$BIN/nhq-audit" verify "$@"

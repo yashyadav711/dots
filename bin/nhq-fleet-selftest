@@ -18,6 +18,16 @@ trap 'rm -rf "$TMP"; tmux kill-session -t fleet-selftest-fresh 2>/dev/null || tr
 export NHQ_STATE_DIR="$TMP/state"
 mkdir -p "$NHQ_STATE_DIR"
 
+# TEST HYGIENE: fixtures must NEVER fire a real desktop toast at Yash. Two layers:
+#  1. NHQ_NOTIFY → a no-op stub. Every guard resolves notify via ${NHQ_NOTIFY:-…}, so
+#     even before this branch is merged (when $HOME/.local/bin/nhq-notify is still the
+#     old live binary) the guards call the stub, not the live notifier.
+#  2. NHQ_NOTIFY_SUPPRESS=1 — once this branch is live, nhq-notify itself early-exits,
+#     covering any hardcoded-path call too.
+export NHQ_NOTIFY="$TMP/notify-noop"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$NHQ_NOTIFY"; chmod +x "$NHQ_NOTIFY"
+export NHQ_NOTIFY_SUPPRESS=1 NHQ_TEST=1
+
 pass=0; fail=0
 ok() { echo "  PASS: $1"; pass=$((pass + 1)); }
 no() { echo "  FAIL: $1"; fail=$((fail + 1)); }
@@ -320,6 +330,261 @@ eq ".blocked outranks .done" "$(status_of "$o3")" "NHQ-AWAIT-STATUS: BLOCKED"
 SD4="fleet-selftest-awaitstale"; echo z > "$NHQ_STATE_DIR/$SD4.stalled"; touch -d '5 minutes ago' "$NHQ_STATE_DIR/$SD4.stalled"
 o4="$("$BIN/nhq-await" "$SD4" --timeout 2 --poll 1 2>&1 || true)"
 if grep -q 'STALLED' <<<"$(status_of "$o4")"; then no "stale .stalled false-fired"; else ok "stale .stalled did not false-fire ($(status_of "$o4"))"; fi
+
+echo "── P4-a: dangerous-command guard (widened patterns, sourceable) ────────"
+# Source the guard; the bottom main-guard means check_dangerous loads without the
+# hook trying to read stdin. Pure function: reason on stdout if dangerous.
+# shellcheck source=/dev/null
+source "$BIN/../claude/hooks/dangerous-command-guard.sh"
+gb() { if [[ -n "$(check_dangerous "$1")" ]]; then ok "BLOCK: $1"; else no "should BLOCK but ALLOWED: $1"; fi; }
+ga() { if [[ -n "$(check_dangerous "$1")" ]]; then no "should ALLOW but BLOCKED: $1"; else ok "ALLOW: $1"; fi; }
+gb "rm -rf ~/Github/heydaddy"
+gb "rm -rf /home/yash/Github/mirror"
+gb "railway up"
+gb "railway deploy --service api"
+gb "railway down"
+gb "supabase db push"
+gb "supabase db reset"
+gb "sudo pacman -Rns hyprland"
+gb "wipefs -a /dev/sda"
+gb "dd if=x.img of=/dev/sda bs=4M"
+gb "git push --force-with-lease origin main"
+gb "rm -rf /"
+ga "rm -rf ~/Github/heydaddy/build"
+ga "rm -f ~/.nhq-fleet/done/x"
+ga "git push origin main"
+ga "railway logs"
+ga "supabase db diff"
+ga "dd if=/dev/zero of=test.img bs=1M count=10"
+ga 'nhq-spawn envy "keep blocking rm -rf ~ and rm -rf /"'
+
+echo "── P4-b: nhq-p3-guard commit gate (D4: director-token / fleet hard-block) ─"
+P3PF="$TMP/p3-paths.json"
+cat > "$P3PF" <<'JSON'
+{"version":1,"categories":{"auth":["**/.env","**/*.env"],"audit":["**/audit.jsonl"]}}
+JSON
+P3REPO="$TMP/p3repo"; git init -q "$P3REPO"; git_quiet "$P3REPO" commit --allow-empty -m base
+p3check() { # $@ = extra env assignments; echoes allow|deny for a commit at $P3REPO
+  if env NHQ_P3_PATHS="$P3PF" NHQ_AUDIT_BIN=/bin/true "$@" "$BIN/nhq-p3-guard" check "$P3REPO" >/dev/null 2>&1; then echo allow; else echo deny; fi
+}
+# stage a NON-protected file → allow regardless of caller
+echo hi > "$P3REPO/readme.md"; git_quiet "$P3REPO" add readme.md
+eq "non-p3 file → allow (fleet)" "$(p3check NHQ_AGENT=Envy NHQ_SESSION=fleet-envy-x)" "allow"
+# stage a PROTECTED file (.env)
+echo "SECRET=1" > "$P3REPO/.env"; git_quiet "$P3REPO" add .env
+eq "p3 file + fleet agent → DENY (hard)"        "$(p3check NHQ_AGENT=Envy NHQ_SESSION=fleet-envy-x)"            "deny"
+eq "p3 file + Director, no token → DENY"          "$(p3check NHQ_AGENT=Director NHQ_SESSION=main)"               "deny"
+eq "p3 file + Director, VFRAME_P3_OK=1 → ALLOW"   "$(p3check NHQ_AGENT=Director NHQ_SESSION=main VFRAME_P3_OK=1)" "allow"
+eq "p3 file + Director-in-fleet + token → DENY"   "$(p3check NHQ_AGENT=Director NHQ_SESSION=fleet-director-sub VFRAME_P3_OK=1)" "deny"
+
+echo "── P4-c: mcp-write-guard tiers (D3 tiered Railway gate) ────────────────"
+MG="$BIN/mcp-write-guard"
+eq "remove_service → hard"  "$("$MG" classify mcp__plugin_railway_railway__remove_service)" "hard"
+eq "remove_volume → hard"   "$("$MG" classify mcp__plugin_railway_railway__remove_volume)"  "hard"
+eq "delete_domain → hard"   "$("$MG" classify mcp__plugin_railway_railway__delete_domain)"  "hard"
+eq "deploy → routine"       "$("$MG" classify mcp__plugin_railway_railway__deploy)"         "routine"
+eq "set_variables → routine" "$("$MG" classify mcp__plugin_railway_railway__set_variables)" "routine"
+eq "list_services → read"   "$("$MG" classify mcp__plugin_railway_railway__list_services)"  "read"
+eq "non-railway tool → ignore" "$("$MG" classify Bash)" "ignore"
+mcpc() { if "$@" >/dev/null 2>&1; then echo allow; else echo deny; fi; }
+eq "irreversible w/o token → DENY" "$(mcpc env NHQ_AUDIT_BIN=/bin/true "$MG" check mcp__plugin_railway_railway__remove_volume)" "deny"
+eq "irreversible w/ token → ALLOW" "$(mcpc env NHQ_AUDIT_BIN=/bin/true VFRAME_MCP_OK=1 "$MG" check mcp__plugin_railway_railway__remove_volume)" "allow"
+eq "routine → ALLOW (logged)"      "$(mcpc env NHQ_AUDIT_BIN=/bin/true "$MG" check mcp__plugin_railway_railway__deploy)" "allow"
+
+echo "── P4-d: nhq-audit v2 — agent stamp + scrub + hash-chain tamper ────────"
+AF="$TMP/audit-chain.jsonl"
+env NHQ_AUDIT_FILE="$AF" NHQ_AGENT=Envy    "$BIN/nhq-audit" append --tool Edit --bucket .claude/ --file .claude/rules/core.md >/dev/null 2>&1
+env NHQ_AUDIT_FILE="$AF" NHQ_AGENT=Envy    "$BIN/nhq-audit" append --tool Bash --cmd "railway up --token sk-SUPERSECRETvalue123 && echo ok" >/dev/null 2>&1
+env NHQ_AUDIT_FILE="$AF" NHQ_AGENT=Director "$BIN/nhq-audit" append --tool Write --file ai/state/audit.jsonl --bucket audit >/dev/null 2>&1
+eq "audit stamps agent (NHQ_AGENT)" "$(jq -r 'select(.tool=="Edit").agent' "$AF" 2>/dev/null | head -1)" "Envy"
+if grep -q 'sk-SUPERSECRETvalue123' "$AF"; then no "secret leaked into audit log"; else ok "Bash command secret-scrubbed"; fi
+if env NHQ_AUDIT_FILE="$AF" "$BIN/nhq-audit-verify" >/dev/null 2>&1; then ok "intact chain verifies OK"; else no "intact chain failed verify"; fi
+cp "$AF" "$AF.bak"
+sed -i '1s/"tool":"Edit"/"tool":"EDIT"/' "$AF"   # flip a byte in line 1's core
+if env NHQ_AUDIT_FILE="$AF" "$BIN/nhq-audit-verify" >/dev/null 2>&1; then no "flipped line passed verify"; else ok "flipped line FAILS verify (tamper caught)"; fi
+cp "$AF.bak" "$AF"
+sed -i '1a {"ts":"x","agent":null,"tool":"INSERTED","bucket":null,"file":null,"cmd":null,"session":null}' "$AF"
+if env NHQ_AUDIT_FILE="$AF" "$BIN/nhq-audit-verify" >/dev/null 2>&1; then no "inserted line passed verify"; else ok "inserted line FAILS verify (tamper caught)"; fi
+
+echo "── P5-a: nhq-econ — agy-floor share + mode-drift (recommend-only) ──────"
+EST="$TMP/econ-state-dir"; mkdir -p "$EST"
+env NHQ_STATE_DIR="$EST" "$BIN/nhq-meta" init fleet-envy-e1   agent envy     model "Claude Opus 4.8"                  >/dev/null 2>&1
+env NHQ_STATE_DIR="$EST" "$BIN/nhq-meta" set --json fleet-envy-e1 cost_usd 1.5 >/dev/null 2>&1
+env NHQ_STATE_DIR="$EST" "$BIN/nhq-meta" init fleet-mirror-e2 agent mirror   model "Claude Sonnet 4.6 (Thinking)"    >/dev/null 2>&1
+env NHQ_STATE_DIR="$EST" "$BIN/nhq-meta" set --json fleet-mirror-e2 cost_usd 0.2 >/dev/null 2>&1
+env NHQ_STATE_DIR="$EST" "$BIN/nhq-meta" init fleet-hd-e3     agent heydaddy model "Gemini 2.5 Pro (Antigravity)"   >/dev/null 2>&1
+ESNAP="$(env NHQ_STATE_DIR="$EST" NHQ_REGISTRY="$BIN/fleet-registry.json" NHQ_ROUTING_POLICY="$BIN/routing-policy.json" "$BIN/nhq-econ" --json)"
+if jq -e '.total_sessions==3 and .agy_floor_sessions==1 and (.total_cost_usd==1.7)' <<<"$ESNAP" >/dev/null 2>&1; then
+  ok "econ: 3 sessions, agy-floor 1/3, total \$1.7"
+else
+  no "econ totals wrong ($(jq -c '{t:.total_sessions,a:.agy_floor_sessions,c:.total_cost_usd}' <<<"$ESNAP"))"
+fi
+if jq -e '.mode_drift[] | select(.session=="fleet-envy-e1" and .kind=="upshift")' <<<"$ESNAP" >/dev/null 2>&1; then
+  ok "econ flags envy→Opus upshift drift (recommend-only)"
+else
+  no "econ missed upshift drift"
+fi
+
+echo "── P5-b: nhq-handoff validate (required sections present) ──────────────"
+HV="$TMP/handoff-good.md"; printf '# Handoff\n## Shipped today\nx\n## Open / carry-over\ny\n## Pending pushes\nz\n' > "$HV"
+"$BIN/nhq-handoff" validate "$HV" >/dev/null 2>&1 && ok "complete handoff validates" || no "complete handoff failed validate"
+HVB="$TMP/handoff-bad.md"; printf '# Handoff\n## Shipped today\nx\n' > "$HVB"
+"$BIN/nhq-handoff" validate "$HVB" >/dev/null 2>&1 && no "incomplete handoff wrongly validated" || ok "incomplete handoff rejected"
+eq "handoff names the missing sections" \
+  "$("$BIN/nhq-handoff" validate --json "$HVB" 2>/dev/null | jq -r '.missing | sort | join(",")')" \
+  "open-threads,pending"
+
+echo "── P5-c: nhq-ctx — background-leak scan (lingering/stale cards) ────────"
+# shellcheck source=/dev/null
+source "$BIN/nhq-ctx"                  # source-guarded → exposes ctx_collect
+nhq_session_state() { echo DEAD; }     # all sessions dead → markers linger
+nhq_session_state_full() { echo IDLE; } # no ORPHANs in this fixture
+CTXD="$TMP/ctx-state"; mkdir -p "$CTXD"
+: > "$CTXD/fleet-envy-c.done"; touch -d '20 minutes ago' "$CTXD/fleet-envy-c.done"
+: > "$CTXD/fleet-mirror-c.blocked"
+CTX_OLD_SD="$NHQ_STATE_DIR"; export NHQ_STATE_DIR="$CTXD"
+CLEAKS="$(ctx_collect)"
+eq "ctx finds 2 leaks" "$(jq 'length' <<<"$CLEAKS")" "2"
+jq -e 'any(.[]; .kind=="lingering-done" and .session=="fleet-envy-c")' <<<"$CLEAKS" >/dev/null 2>&1 \
+  && ok "ctx flags lingering-done card" || no "ctx missed lingering-done"
+jq -e 'any(.[]; .kind=="stale-blocked")' <<<"$CLEAKS" >/dev/null 2>&1 \
+  && ok "ctx flags stale-blocked marker" || no "ctx missed stale-blocked"
+CLEAN="$TMP/ctx-clean"; mkdir -p "$CLEAN"; export NHQ_STATE_DIR="$CLEAN"
+eq "clean state → 0 leaks" "$(ctx_collect | jq 'length')" "0"
+export NHQ_STATE_DIR="$CTX_OLD_SD"
+unset -f nhq_session_state nhq_session_state_full 2>/dev/null || true
+
+echo "── SEC-C1/N1: out-of-band approval — no forgeable token, nothing in dunst ─"
+# The approval is synchronous + out-of-band (NHQ_APPROVE_CMD / interactive GUI). There is
+# NO token in any file, JSON, or notification, so the same-uid agent cannot forge it AND
+# nothing leaks via `dunstctl history` (round-2 N1). Hermetic: stub the approver + notify.
+GUARD="$BIN/../claude/hooks/dangerous-command-guard.sh"
+C1NL="$TMP/c1-notif.log"; C1NS="$TMP/c1-notify"
+printf '#!/usr/bin/env bash\necho "$@" >> "%s"\n' "$C1NL" > "$C1NS"; chmod +x "$C1NS"
+c1json='{"tool_name":"Bash","session_id":"sx","tool_input":{"command":"railway up"}}'
+# approver DENIES → command denied
+o="$(printf '%s' "$c1json" | env NHQ_NOTIFY="$C1NS" NHQ_APPROVE_CMD=/bin/false bash "$GUARD")"
+grep -q '"deny"' <<<"$o" && ok "C1: approver-deny → command DENIED" || no "C1: deny path broken"
+# approver APPROVES → allowed (no deny output)
+o="$(printf '%s' "$c1json" | env NHQ_NOTIFY="$C1NS" NHQ_APPROVE_CMD=/bin/true bash "$GUARD")"
+grep -q '"deny"' <<<"$o" && no "C1: approve path broke" || ok "C1: approver-approve → allowed"
+# no approver AND no GUI display → fail CLOSED (cannot self-approve)
+o="$(printf '%s' "$c1json" | env -u WAYLAND_DISPLAY -u DISPLAY -u NHQ_APPROVE_CMD NHQ_NOTIFY="$C1NS" bash "$GUARD")"
+grep -q '"deny"' <<<"$o" && ok "C1: no GUI + no approver → fail-closed deny" || no "C1: failed OPEN without an approver"
+# N1: the notification carries NO approval token / uuid / touch-path → nothing for dunst to leak
+if grep -qiE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|approved/|touch ' "$C1NL"; then
+  no "N1: notification leaks an approval token (would land in dunst history)"
+else
+  ok "N1: notification carries no token (nothing for dunstctl history to expose)"
+fi
+# N1a: reading/flushing the notification history is itself blocked
+gb "dunstctl history"
+gb "dunstctl close-all"
+gb "dunstctl history-pop"
+ga "dunstctl set-paused true"
+# NEW-B: a PATH-hijacked rofi (agent-planted, echoes Approve) must NOT auto-approve —
+# request_approval requires the binary's realpath to be the trusted /usr/bin/rofi.
+FAKER="$TMP/fakebin"; mkdir -p "$FAKER"
+printf '#!/usr/bin/env bash\necho "Approve (I understand the risk)"\n' > "$FAKER/rofi"; chmod +x "$FAKER/rofi"
+o="$(printf '%s' "$c1json" | env -u NHQ_APPROVE_CMD NHQ_NOTIFY="$C1NS" DISPLAY=:0 PATH="$FAKER:$PATH" bash "$GUARD")"
+grep -q '"deny"' <<<"$o" && ok "NEW-B: PATH-hijacked fake rofi rejected → DENY" || no "NEW-B: fake rofi AUTO-APPROVED (PATH hijack)"
+
+echo "── SEC-C2: eval / interpreter -c wrapper bypass blocked ────────────────"
+gb 'eval "rm -rf ~/Github/heydaddy"'
+gb 'bash -c "railway up"'
+gb "sh -c 'supabase db reset'"
+PYEVAL='python3 -c "import os; os.system(SQwipefs -a /dev/sdaSQ)"'; PYEVAL="${PYEVAL//SQ/\'}"
+gb "$PYEVAL"
+gb 'env FOO=1 bash -c "rm -rf /"'
+ga 'echo "; railway up"'
+ga 'bash -c "echo hello"'
+
+echo "── SEC-M1/M2: traversal + inline-env-prefix bypasses blocked ───────────"
+gb "rm -rf /tmp/../home/yash/Github/heydaddy"
+gb "RAILWAY_TOKEN=abc railway up"
+gb "A=1 sudo wipefs -a /dev/sda"
+gb "TOKEN=x dd if=z of=/dev/sda"
+ga "make FOO=bar all"
+
+echo "── SEC-N3/NEW-A: env(1)/runner-wrapper dangerous command blocked ───────"
+gb "env RAILWAY_TOKEN=x railway up"
+gb "env -i railway up"
+gb "env -u FOO railway up"
+gb "sudo env FOO=1 wipefs -a /dev/sda"
+# NEW-A: absolute-path env, command/exec runners, and the C2 compound
+gb "/usr/bin/env railway up"
+gb "/bin/env supabase db reset"
+gb "/usr/local/bin/env railway up"
+gb "command env railway up"
+gb "exec env railway up"
+gb "command railway up"
+gb "exec railway up"
+gb 'bash -c "/usr/bin/env railway up"'
+gb "sudo /usr/bin/env pacman -Rns foo"
+ga "env LANG=C echo hi"
+ga "environment_setup railway"
+ga "/usr/bin/env python script.py"
+ga "command -v rofi"
+ga "commander deploy"
+
+echo "── SEC-L1: quoted secrets scrubbed in audit log ────────────────────────"
+LAF="$TMP/l1-audit.jsonl"
+env NHQ_AUDIT_FILE="$LAF" "$BIN/nhq-audit" append --tool Bash --cmd 'railway up --token "sk-QUOTEDsecret999"' >/dev/null 2>&1
+env NHQ_AUDIT_FILE="$LAF" "$BIN/nhq-audit" append --tool Bash --cmd "deploy RAILWAY_TOKEN='abcQUOTEDtoken'" >/dev/null 2>&1
+if grep -qE 'QUOTEDsecret999|abcQUOTEDtoken' "$LAF"; then no "L1: quoted secret leaked into audit"; else ok "L1: quoted secrets scrubbed"; fi
+
+echo "── SEC-H1/H2/H3: nhq-p3-guard bypasses closed ──────────────────────────"
+# reuse the P4-b fixture policy file ($P3PF) + git_quiet
+p3c() { # p3c <repo> <mode> [env=val...] → echoes allow|deny
+  local repo="$1" mode="$2"; shift 2
+  if env NHQ_P3_PATHS="$P3PF" NHQ_AUDIT_BIN=/bin/true "$@" "$BIN/nhq-p3-guard" check "$repo" "$mode" >/dev/null 2>&1; then echo allow; else echo deny; fi
+}
+pre_decision() { # pre_decision <full-bash-cmd> → echoes allow|deny for a PreToolUse fleet-agent commit
+  local j out; j="$(jq -nc --arg c "$1" '{tool_name:"Bash",session_id:"s",cwd:"/tmp",tool_input:{command:$c}}')"
+  out="$(echo "$j" | env NHQ_P3_PATHS="$P3PF" NHQ_AUDIT_BIN=/bin/true NHQ_AGENT=Envy NHQ_SESSION=fleet-envy-x "$BIN/nhq-p3-guard")"
+  if grep -q '"deny"' <<<"$out"; then echo deny; else echo allow; fi
+}
+SECR="$TMP/sec-p3repo"; git init -q "$SECR"; git_quiet "$SECR" commit --allow-empty -m base
+echo "SECRET=1" > "$SECR/.env"; git_quiet "$SECR" add .env
+# H2: pre-commit mode never trusts inline env (spoofed director+token still blocked)
+eq "H2: pre-commit + spoofed director/token → DENY" "$(p3c "$SECR" precommit NHQ_AGENT=director NHQ_SESSION= VFRAME_P3_OK=1)" "deny"
+eq "H2: (control) pretooluse + director/token → ALLOW" "$(p3c "$SECR" pretooluse NHQ_AGENT=Director NHQ_SESSION=main VFRAME_P3_OK=1)" "allow"
+# H1: the pre-commit hook is the real defense for the staging-timing gap
+env NHQ_P3_PATHS="$P3PF" NHQ_AUDIT_BIN=/bin/true NHQ_AGENT=Envy NHQ_SESSION=fleet-envy-x \
+  bash -c 'cd "$1" && "$2" pre-commit' _ "$SECR" "$BIN/nhq-p3-guard" >/dev/null 2>&1 && r=allow || r=deny
+eq "H1: pre-commit hook DENIES staged p3 (real defense vs add&&commit)" "$r" "deny"
+# H3: GIT_DIR= and inline-env git commit are detected + validated
+eq "H3: GIT_DIR= git commit detected → deny"        "$(pre_decision "GIT_DIR=$SECR/.git git commit -m x")"        "deny"
+eq "H3: leading-env + GIT_DIR= still detected → deny" "$(pre_decision "FOO=1 GIT_DIR=$SECR/.git git commit -m x")" "deny"
+eq "H3: bogus GIT_DIR → fail-closed deny"            "$(pre_decision "GIT_DIR=/nonexistent/.git git commit -m x")" "deny"
+# N2: the env(1) utility wrapping a commit is also detected (defense-in-depth; pre-commit is the real gate)
+eq "N2: env GIT_DIR= git commit detected → deny"     "$(pre_decision "env GIT_DIR=$SECR/.git git commit -m x")"     "deny"
+eq "N2: env FOO=1 GIT_DIR= git commit → deny"        "$(pre_decision "env FOO=1 GIT_DIR=$SECR/.git git commit -m x")" "deny"
+# NEW-C: absolute-path env wrapping a commit is detected too (consistency)
+eq "NEW-C: /usr/bin/env GIT_DIR= git commit → deny"  "$(pre_decision "/usr/bin/env GIT_DIR=$SECR/.git git commit -m x")" "deny"
+eq "NEW-C: /bin/env GIT_DIR= git commit → deny"      "$(pre_decision "/bin/env GIT_DIR=$SECR/.git git commit -m x")"     "deny"
+
+echo "── SEC-M3: mcp-write-guard generic hard pattern (no fail-open) ─────────"
+eq "M3: remove_environment → hard" "$("$BIN/mcp-write-guard" classify mcp__plugin_railway_railway__remove_environment)" "hard"
+eq "M3: wipe_data → hard"          "$("$BIN/mcp-write-guard" classify mcp__plugin_railway_railway__wipe_data)"          "hard"
+eq "M3: reset_project → hard"      "$("$BIN/mcp-write-guard" classify mcp__plugin_railway_railway__reset_project)"      "hard"
+
+echo "── SEC-NOTIFY: fixtures are toast-silent (no real desktop popups) ───────"
+# (1) nhq-notify self-suppresses under NHQ_NOTIFY_SUPPRESS=1 (covers hardcoded-path callers).
+if NHQ_NOTIFY_SUPPRESS=1 bash "$BIN/nhq-notify" blocked X Y >/dev/null 2>&1; then
+  ok "nhq-notify honors NHQ_NOTIFY_SUPPRESS (exit 0, no toast)"
+else
+  no "nhq-notify did not honor NHQ_NOTIFY_SUPPRESS"
+fi
+# (2) every guard routes its notification via ${NHQ_NOTIFY:-…}, so a deny lands on the
+#     stub — never the live notifier — even on an unmerged branch. Prove with p3-guard.
+NCAP="$TMP/notify-cap"; NSTB="$TMP/notify-cap-stub"
+printf '#!/usr/bin/env bash\necho fired >> "%s"\n' "$NCAP" > "$NSTB"; chmod +x "$NSTB"
+NREPO="$TMP/notify-repo"; git init -q "$NREPO"; git_quiet "$NREPO" commit --allow-empty -m base
+echo "SECRET=1" > "$NREPO/.env"; git_quiet "$NREPO" add .env
+NJ="$(jq -nc --arg c "git commit -m x" --arg cwd "$NREPO" '{tool_name:"Bash",session_id:"s",cwd:$cwd,tool_input:{command:$c}}')"
+echo "$NJ" | env NHQ_P3_PATHS="$P3PF" NHQ_AUDIT_BIN=/bin/true NHQ_NOTIFY="$NSTB" NHQ_AGENT=Envy NHQ_SESSION=fleet-envy-x "$BIN/nhq-p3-guard" >/dev/null 2>&1
+[[ -s "$NCAP" ]] && ok "p3-guard deny routes notify via NHQ_NOTIFY override (not the live binary)" || no "p3-guard notify NOT overridable — could fire a real toast"
 
 echo "────────────────────────────────────────────────────────────────────────"
 echo "nhq-fleet-selftest: ${pass} passed, ${fail} failed"
