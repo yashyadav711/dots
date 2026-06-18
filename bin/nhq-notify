@@ -14,11 +14,12 @@ TYPE="${1:-info}"
 TITLE="${2:-NHQ}"
 BODY="${3:-}"
 
-# Test/selftest suppression — when NHQ_NOTIFY_SUPPRESS (or NHQ_TEST) is set, exit
-# silently so selftest fixtures + guard-under-test runs never fire a real desktop
-# toast. Normal operation (env unset) is unchanged. (Yash 2026-06-19: the P3-guard
-# fixtures were spamming the desktop during P4 selftest runs.)
-[ -n "${NHQ_NOTIFY_SUPPRESS:-}${NHQ_TEST:-}" ] && exit 0
+# Test/selftest suppression — exit silently (no real desktop toast) when either the
+# NHQ_NOTIFY_SUPPRESS/NHQ_TEST env is set (per-run, e.g. selftest fixtures) OR the
+# mute-file /tmp/nhq-notify-mute exists (a global kill-switch Director flips during a
+# build window so guard-under-test runs don't spam the desktop). Normal operation
+# (env unset + no mute file) is unchanged. (Yash 2026-06-19.)
+if [ -n "${NHQ_NOTIFY_SUPPRESS:-}${NHQ_TEST:-}" ] || [ -f /tmp/nhq-notify-mute ]; then exit 0; fi
 
 case "$TYPE" in
   needs-you) FR="#f38ba8"; IC="dialog-information";       T=12000 ;;  # 🔴 action needed
