@@ -25,6 +25,10 @@ _NHQ_LIB_LOADED=1
 
 NHQ_STATE_DIR="${NHQ_STATE_DIR:-$HOME/.nhq-fleet}"
 
+# Directory that holds this lib (and fleet-registry.json beside it). Resolved
+# through the ~/.local/bin symlink so the registry is found next to the REAL file.
+NHQ_LIB_DIR="${NHQ_LIB_DIR:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)}"
+
 # Minutes of IDLE before the reaper retires a session (RAM-aware; 7.5GB laptop).
 NHQ_IDLE_KILL_MIN="${NHQ_IDLE_KILL_MIN:-20}"
 
@@ -93,4 +97,68 @@ nhq_state_badge() {
     DEAD)    echo "⚫ DEAD (no claude / at fish)" ;;
     *)       echo "❓ UNKNOWN" ;;
   esac
+}
+
+# ── P1 · Fleet registry + .meta accessors ──────────────────────────────────
+# Single source of truth for the agent roster. The old hardcoded `case "$AGENT"`
+# rosters (nhq-spawn/nhq-fleet/nhq-reap/nhq-agent-name) all collapse onto these.
+# Registry path is overridable via $NHQ_REGISTRY; otherwise it sits beside this lib.
+
+# Path to a session's .meta record (the P1 per-session state file).
+nhq_meta() { printf '%s/%s.meta' "$NHQ_STATE_DIR" "${1:-}"; }
+
+# Path to the active fleet-registry.json ($NHQ_REGISTRY overrides).
+nhq_registry() { printf '%s' "${NHQ_REGISTRY:-$NHQ_LIB_DIR/fleet-registry.json}"; }
+
+# Canonicalize a spawn token (key OR alias, case-insensitive) → registry key.
+# Unknown / empty token → "" (never a junk value).
+nhq_agent_canon() {
+  local tok; tok="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  [[ -z "$tok" ]] && { printf ''; return 0; }
+  jq -r --arg t "$tok" '
+    .agents | to_entries
+    | map(select(.key == $t or ((.value.aliases // []) | index($t))))
+    | (.[0].key // "")
+  ' "$(nhq_registry)" 2>/dev/null || printf ''
+}
+
+# Read a scalar field of a registry KEY (already canonical). "" if absent.
+nhq_agent_field() {
+  local key="${1:-}" field="${2:-}"
+  [[ -z "$key" || -z "$field" ]] && { printf ''; return 0; }
+  jq -r --arg k "$key" --arg f "$field" '.agents[$k][$f] // ""' "$(nhq_registry)" 2>/dev/null || printf ''
+}
+
+# Absolute repo dir for a token (canon → $HOME/<repo>). "" if unknown.
+nhq_agent_repo() {
+  local key; key="$(nhq_agent_canon "${1:-}")"
+  [[ -z "$key" ]] && { printf ''; return 0; }
+  local rel; rel="$(nhq_agent_field "$key" repo)"
+  [[ -z "$rel" ]] && { printf ''; return 0; }
+  printf '%s/%s' "$HOME" "$rel"
+}
+
+# Canonical display name / default model / stall threshold for a token. "" if unknown.
+nhq_agent_name()      { local k; k="$(nhq_agent_canon "${1:-}")"; [[ -z "$k" ]] && { printf ''; return 0; }; nhq_agent_field "$k" name; }
+nhq_agent_model()     { local k; k="$(nhq_agent_canon "${1:-}")"; [[ -z "$k" ]] && { printf ''; return 0; }; nhq_agent_field "$k" model; }
+nhq_agent_stall_min() { local k; k="$(nhq_agent_canon "${1:-}")"; [[ -z "$k" ]] && { printf ''; return 0; }; nhq_agent_field "$k" stall_min; }
+
+# Resolve a fleet session name (fleet-<token>-<slug>) → registry KEY. The slug may
+# contain dashes, so match the longest accepted token (key or alias) that sits right
+# after "fleet-" at a "-" / end boundary — never a naive split-on-dash. "" if unknown.
+nhq_session_agent() {
+  local s="${1:-}" rest tok key
+  [[ "$s" == fleet-* ]] || { printf ''; return 0; }
+  rest="${s#fleet-}"
+  while IFS=$'\t' read -r tok key; do
+    [[ -z "$tok" ]] && continue
+    if [[ "$rest" == "$tok" || "$rest" == "$tok"-* ]]; then
+      printf '%s' "$key"; return 0
+    fi
+  done < <(jq -r '
+    [ .agents | to_entries[] | .key as $k | ([$k] + (.value.aliases // []))[] | {t: ., k: $k} ]
+    | sort_by(-(.t | length))[]
+    | "\(.t)\t\(.k)"
+  ' "$(nhq_registry)" 2>/dev/null)
+  printf ''
 }

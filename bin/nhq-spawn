@@ -28,22 +28,41 @@ if [[ -z "$AGENT" || -z "$TASK" ]]; then
   exit 1
 fi
 
-# Map agent -> repo dir
-case "$AGENT" in
-  heydaddy) REPO="$HOME/Github/heydaddy" ;;
-  mirror)   REPO="$HOME/Github/mirror" ;;
-  envy)     REPO="$HOME/Github/envy" ;;
-  director) REPO="$HOME/Github/product-manager" ;;
-  *)
-    echo "nhq-spawn: unknown agent '$AGENT' (want heydaddy|mirror|envy|director)" >&2
-    exit 1
-    ;;
-esac
-
-if [[ ! -d "$REPO" ]]; then
-  echo "nhq-spawn: repo dir not found: $REPO" >&2
+# Resolve agent -> canonical key + repo/name/model via the shared registry
+# (nhq-lib accessors; single source of truth — replaces the old hardcoded case).
+KEY="$(nhq_agent_canon "$AGENT")"
+if [[ -z "$KEY" ]]; then
+  echo "nhq-spawn: unknown agent '$AGENT' (want heydaddy|mirror|envy|director, or an alias)" >&2
   exit 1
 fi
+REPO="$(nhq_agent_repo "$KEY")"
+NAME="$(nhq_agent_name "$KEY")"
+MODEL="$(nhq_agent_model "$KEY")"
+
+if [[ -z "$REPO" || ! -d "$REPO" ]]; then
+  echo "nhq-spawn: repo dir not found for '$KEY': ${REPO:-<unresolved>}" >&2
+  exit 1
+fi
+
+# Capture spawn-time facts once; both the reuse and fresh paths write them into
+# the session's .meta. base_branch/base_commit let P3's warden later answer
+# "any new commit since spawn?" without re-deriving the baseline.
+NHQ_META_BIN="$(dirname "$SELF")/nhq-meta"
+SPAWN_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+SPAWN_EPOCH="$(date +%s)"
+BASE_BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+BASE_COMMIT="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo '')"
+
+# Write a complete spawn-owned .meta record for a session (fresh-spawn path).
+# nhq-meta fills the P2/P3-owned fields (branch/jsonl/done/tokens/cost) with
+# their defaults; we set everything nhq-spawn is the writer for.
+write_spawn_meta() {
+  "$NHQ_META_BIN" init "$1" \
+    agent "$KEY" agent_name "$NAME" repo "$REPO" task "$TASK" model "$MODEL" \
+    spawn_ts "$SPAWN_TS" spawn_epoch "$SPAWN_EPOCH" \
+    base_branch "$BASE_BRANCH" base_commit "$BASE_COMMIT" last_state RUNNING \
+    >/dev/null 2>&1 || echo "nhq-spawn: warning — could not write .meta for $1" >&2
+}
 
 CLAUDE_BIN="$HOME/.local/bin/claude"
 if [[ ! -x "$CLAUDE_BIN" ]]; then
@@ -71,6 +90,19 @@ done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -E "^fleet-$
 if [[ -n "$REUSE" ]]; then
   rm -f "$(nhq_marker "$REUSE")"          # clear any stale report so nhq-await waits for THIS task
   nhq_touch_activity "$REUSE"
+  # Refresh the session's .meta for the NEW task. Preserve an existing record's
+  # accumulated token/cost fields (nhq-cost recomputes from the JSONL anyway);
+  # if there's no record yet (session predates P1), write a full one.
+  if [[ -f "$(nhq_meta "$REUSE")" ]]; then
+    "$NHQ_META_BIN" set "$REUSE" task        "$TASK"        >/dev/null 2>&1 || true
+    "$NHQ_META_BIN" set "$REUSE" spawn_ts     "$SPAWN_TS"    >/dev/null 2>&1 || true
+    "$NHQ_META_BIN" set "$REUSE" spawn_epoch  "$SPAWN_EPOCH" >/dev/null 2>&1 || true
+    "$NHQ_META_BIN" set "$REUSE" base_branch  "$BASE_BRANCH" >/dev/null 2>&1 || true
+    "$NHQ_META_BIN" set "$REUSE" base_commit  "$BASE_COMMIT" >/dev/null 2>&1 || true
+    "$NHQ_META_BIN" set "$REUSE" last_state   RUNNING        >/dev/null 2>&1 || true
+  else
+    write_spawn_meta "$REUSE"
+  fi
   "$HOME/.local/bin/nhq-tell" "$REUSE" "$MESSAGE" >/dev/null
   echo "reused: $REUSE  (agent=$AGENT  was=${st})  — sent task via nhq-tell"
   echo "  watch:  tmux attach -t $REUSE"
@@ -95,12 +127,17 @@ done
 rm -f "$(nhq_marker "$SESSION")"
 nhq_touch_activity "$SESSION"
 
+# Write the complete spawn-owned .meta record for this fresh session.
+write_spawn_meta "$SESSION"
+
 # Launch interactive claude in a detached tmux session, in the repo dir. The
 # trailing `exec fish` is a safety net: if claude ever exits/crashes, the tmux
 # session survives (inspectable, shows DEAD) instead of vanishing. Interactive
 # claude itself stays alive idle-at-prompt after a task — that's the talkable
 # persistence; this just keeps the pane from disappearing on an unexpected exit.
-tmux new-session -d -s "$SESSION" -c "$REPO" \
+# tmux -e exports NHQ_AGENT into the session env (tmux ≥3.2) so the agent — and any
+# nhq-* callback it runs — knows its own canonical name without re-deriving it.
+tmux new-session -d -s "$SESSION" -e "NHQ_AGENT=$NAME" -c "$REPO" \
   "$CLAUDE_BIN --dangerously-skip-permissions; exec fish"
 
 # Wait for claude (node) to boot before sending the task. Poll the pane's

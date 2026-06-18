@@ -27,16 +27,6 @@ if [[ "${1:-}" != "--no-reap" && -x "$HOME/.local/bin/nhq-reap" ]]; then
   "$HOME/.local/bin/nhq-reap" >/dev/null 2>&1 || true
 fi
 
-repo_for_agent() {
-  case "${1:-}" in
-    HeyDaddy) echo "$HOME/Github/heydaddy" ;;
-    Mirror)   echo "$HOME/Github/mirror" ;;
-    Envy)     echo "$HOME/Github/envy" ;;
-    Director) echo "$HOME/Github/product-manager" ;;
-    *)        echo "" ;;
-  esac
-}
-
 mapfile -t SESSIONS < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^fleet-' || true)
 
 if [[ "${#SESSIONS[@]}" -eq 0 ]]; then
@@ -51,7 +41,9 @@ for S in "${SESSIONS[@]}"; do
   # session name: fleet-<agent>-<slug...> — resolve the REAL agent, not a fragment
   AGENT=""
   [[ -x "$RESOLVER" ]] && AGENT=$("$RESOLVER" --session "$S" 2>/dev/null)
-  REPO=$(repo_for_agent "$AGENT")
+  # Repo comes straight from the registry (nhq-lib), keyed off the session name —
+  # the single roster source, replacing the old display-name → repo case.
+  REPO=$(nhq_agent_repo "$(nhq_session_agent "$S")")
 
   STATE="$(nhq_state_badge "$(nhq_session_state "$S")")"
 

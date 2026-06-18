@@ -18,7 +18,14 @@
 #
 # Usage:
 #   nhq-agent-name [--dir DIR] [--session SESSION]
+#
+# P1: the roster is no longer hardcoded here — canon()/from_session() delegate to
+# the shared registry accessors in nhq-lib.sh (single source of truth).
 set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+# shellcheck source=/dev/null
+source "$(dirname "$SELF")/nhq-lib.sh"
 
 DIR=""; SESSION=""
 while [[ $# -gt 0 ]]; do
@@ -32,29 +39,18 @@ done
 
 # Map a known agent token / repo basename (case-insensitive) → canonical name.
 # Anything not a real NHQ agent returns "" so it can never leak as a name.
-canon() {
-  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
-    heydaddy)                     printf 'HeyDaddy' ;;
-    mirror)                       printf 'Mirror' ;;
-    envy)                         printf 'Envy' ;;
-    director|pm|product-manager)  printf 'Director' ;;
-    *)                            printf '' ;;
-  esac
-}
+# Delegates to the registry (nhq-lib): nhq_agent_name canonicalizes key/alias and
+# returns the display name, or "" for an unknown token.
+canon() { nhq_agent_name "${1:-}"; }
 
 # A fleet session is fleet-<agent>-<slug>; <slug> may itself contain dashes, so
-# match the agent as the KNOWN token right after "fleet-" (prefix match), not by
-# splitting on dashes (which breaks on "product-manager" and multi-word slugs).
+# match the agent as the KNOWN token right after "fleet-" (prefix/longest match),
+# not by splitting on dashes (which breaks on "product-manager" and multi-word
+# slugs). nhq_session_agent does the longest-token match against the registry.
 from_session() {
   local s="${1:-}"
   [[ "$s" == fleet-* ]] || return 0
-  case "${s#fleet-}" in
-    heydaddy|heydaddy-*)                                   canon heydaddy ;;
-    mirror|mirror-*)                                       canon mirror ;;
-    envy|envy-*)                                           canon envy ;;
-    director|director-*|product-manager|product-manager-*) canon director ;;
-    *)                                                     printf '' ;;
-  esac
+  nhq_agent_name "$(nhq_session_agent "$s")"
 }
 
 name=""

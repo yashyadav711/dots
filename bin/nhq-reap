@@ -35,20 +35,6 @@ IDLE_LIMIT=$(( NHQ_IDLE_KILL_MIN * 60 ))
 # Minutes of recent repo modification that spares an idle session from reaping.
 NHQ_REAP_RECENT_MIN="${NHQ_REAP_RECENT_MIN:-10}"
 
-# Map a fleet session name (fleet-<agent>-<slug>) to its repo dir — same mapping
-# nhq-spawn uses. Echoes "" for an unknown/unmappable agent.
-nhq_session_repo() {
-  local s="${1:-}" agent
-  agent=$(printf '%s' "$s" | sed -E 's/^fleet-([a-z0-9]+).*/\1/')
-  case "$agent" in
-    heydaddy) echo "$HOME/Github/heydaddy" ;;
-    mirror)   echo "$HOME/Github/mirror" ;;
-    envy)     echo "$HOME/Github/envy" ;;
-    director) echo "$HOME/Github/product-manager" ;;
-    *)        echo "" ;;
-  esac
-}
-
 # Should an otherwise-reapable IDLE session be SPARED? Echoes the reason and returns
 # 0 (protected) if the repo has uncommitted work OR was modified within the recency
 # window; returns 1 (not protected) otherwise. An unknown/missing repo can't be
@@ -81,7 +67,7 @@ nhq_reap_run() {
       IDLE)
         idle=$(nhq_idle_seconds "$S")
         if [[ "$idle" -ge "$IDLE_LIMIT" ]]; then
-          repo="$(nhq_session_repo "$S")"
+          repo="$(nhq_agent_repo "$(nhq_session_agent "$S")")"   # registry-resolved repo dir
           if reason="$(nhq_reap_protected "$repo")"; then
             echo "skip-reap: $S — IDLE ${idle}s but SPARED ($reason)"
           else

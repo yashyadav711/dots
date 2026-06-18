@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# nhq-meta — atomic, jq-backed CRUD for ~/.nhq-fleet/<session>.meta records.
+#
+# The .meta record is the P1 per-session state file every downstream tool reads
+# (P2 nhq-cost/nhq-status, P3 nhq-warden). Schema + writer-map live in
+# nhq-agentic-os/kernel/SCHEMA.md. nhq-spawn is the only P1 writer (init).
+#
+# All writes are atomic (jq → tmpfile → mv) so a concurrent reader never sees a
+# half-written record. Field typing is schema-aware: numeric/bool fields are
+# written as JSON numbers/bools, everything else as JSON strings, so the record
+# stays well-typed without the caller having to know jq.
+#
+# Usage:
+#   nhq-meta init <session> [FIELD VALUE]...   # write full record (defaults + overrides)
+#   nhq-meta get  <session> <field>            # print one field (raw scalar; null/absent → "")
+#   nhq-meta set  [--json] <session> <field> <value>
+#                                              #   default: typed by schema (str unless numeric/bool)
+#                                              #   --json : <value> is raw JSON, written verbatim
+#   nhq-meta all  <session>                    # print the whole record (pretty JSON)
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+# shellcheck source=/dev/null
+source "$(dirname "$SELF")/nhq-lib.sh"
+
+die() { echo "nhq-meta: $*" >&2; exit 1; }
+
+command -v jq >/dev/null 2>&1 || die "jq not found (install: sudo pacman -S jq)"
+
+# Schema-known numeric and boolean fields (everything else is a string).
+_meta_is_number() { case "$1" in spawn_epoch|tokens_in|tokens_out|cost_usd) return 0 ;; *) return 1 ;; esac; }
+_meta_is_bool()   { case "$1" in p3_flag) return 0 ;; *) return 1 ;; esac; }
+
+# Atomic write: read jq filter on $FILE, land result via tmpfile + mv.
+_meta_atomic() {
+  local file="$1"; shift
+  local tmp; tmp="$(mktemp "${file}.XXXXXX")"
+  if jq "$@" "$file" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$file"
+  else
+    rm -f "$tmp"; die "jq write failed on $file"
+  fi
+}
+
+# Set one field on an existing record, typed (string | number | bool | raw json).
+_meta_set_field() {
+  local file="$1" field="$2" value="$3" json="${4:-0}"
+  if [[ "$json" == "1" ]] || _meta_is_number "$field" || _meta_is_bool "$field"; then
+    _meta_atomic "$file" --arg f "$field" --argjson v "$value" '.[$f] = $v'
+  else
+    _meta_atomic "$file" --arg f "$field" --arg v "$value" '.[$f] = $v'
+  fi
+}
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  init)
+    session="${1:-}"; shift || true
+    [[ -z "$session" ]] && die "usage: nhq-meta init <session> [field value]..."
+    file="$(nhq_meta "$session")"
+    nhq_ensure_state_dir
+    # Full default record (matches kernel/SCHEMA.md). spawn fills the spawn-owned
+    # fields via the override pairs; the rest stay null/0 for P2/P3 writers.
+    local_tmp="$(mktemp "${file}.XXXXXX")"
+    jq -n --arg s "$session" '{
+      session:      $s,
+      agent:        null,
+      agent_name:   null,
+      repo:         null,
+      task:         null,
+      model:        null,
+      spawn_ts:     null,
+      spawn_epoch:  0,
+      base_branch:  null,
+      base_commit:  null,
+      branch:       null,
+      jsonl:        null,
+      done_ts:      null,
+      result:       null,
+      p3_flag:      false,
+      tokens_in:    0,
+      tokens_out:   0,
+      cost_usd:     0.0,
+      last_state:   null,
+      last_cost_ts: null
+    }' > "$local_tmp" || { rm -f "$local_tmp"; die "failed to build record"; }
+    mv -f "$local_tmp" "$file"
+    # Apply FIELD VALUE override pairs (schema-typed).
+    while [[ $# -ge 2 ]]; do
+      _meta_set_field "$file" "$1" "$2"
+      shift 2
+    done
+    [[ $# -ne 0 ]] && die "init: dangling field '$1' with no value"
+    ;;
+
+  get)
+    session="${1:-}"; field="${2:-}"
+    [[ -z "$session" || -z "$field" ]] && die "usage: nhq-meta get <session> <field>"
+    file="$(nhq_meta "$session")"
+    [[ -f "$file" ]] || die "no .meta for session '$session'"
+    # NB: `.[$f] // empty` is wrong here — jq's // treats `false` as null-like, so a
+    # false boolean would print as "". Distinguish genuine null/absent from false.
+    jq -r --arg f "$field" 'if .[$f] == null then empty else .[$f] end' "$file"
+    ;;
+
+  set)
+    json=0
+    if [[ "${1:-}" == "--json" ]]; then json=1; shift; fi
+    session="${1:-}"; field="${2:-}"; value="${3:-}"
+    [[ -z "$session" || -z "$field" || $# -lt 3 ]] && die "usage: nhq-meta set [--json] <session> <field> <value>"
+    file="$(nhq_meta "$session")"
+    [[ -f "$file" ]] || die "no .meta for session '$session'"
+    _meta_set_field "$file" "$field" "$value" "$json"
+    ;;
+
+  all)
+    session="${1:-}"
+    [[ -z "$session" ]] && die "usage: nhq-meta all <session>"
+    file="$(nhq_meta "$session")"
+    [[ -f "$file" ]] || die "no .meta for session '$session'"
+    jq '.' "$file"
+    ;;
+
+  ""|-h|--help|help)
+    sed -n '2,20p' "$SELF"
+    ;;
+
+  *)
+    die "unknown command '$cmd' (want: init|get|set|all)"
+    ;;
+esac

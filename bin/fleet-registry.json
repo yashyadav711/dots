@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "agents": {
+    "heydaddy": { "name": "HeyDaddy", "repo": "Github/heydaddy",        "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": ["hd"] },
+    "mirror":   { "name": "Mirror",   "repo": "Github/mirror",          "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": [] },
+    "envy":     { "name": "Envy",     "repo": "Github/envy",            "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": [] },
+    "director": { "name": "Director", "repo": "Github/nhq-agentic-os", "model": "Claude Opus 4.8",              "stall_min": 20, "aliases": ["pm", "product-manager"] }
+  }
+}

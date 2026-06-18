@@ -98,10 +98,70 @@ else
 fi
 
 # 2d. Unknown/unmappable session => repo "" => not protected (idle policy applies).
-if [[ -z "$(nhq_session_repo "fleet-bogusagent-x")" ]]; then
+#     (P1: repo now resolved via the registry accessor, not the old nhq_session_repo.)
+if [[ -z "$(nhq_agent_repo "$(nhq_session_agent "fleet-bogusagent-x")")" ]]; then
   ok "unknown agent maps to empty repo (idle policy applies)"
 else
   no "unknown agent unexpectedly mapped to a repo"
+fi
+
+echo "── P1-a: fleet registry accessors (nhq-lib) ────────────────────────────"
+# nhq-reap (sourced above) pulled in nhq-lib, so the registry accessors are live.
+# Pin the registry to the worktree copy beside the scripts under test.
+export NHQ_REGISTRY="$BIN/fleet-registry.json"
+
+eq() { # eq <label> <got> <want>
+  if [[ "$2" == "$3" ]]; then ok "$1 ($2)"; else no "$1 — got '$2' want '$3'"; fi
+}
+eq "canon hd → heydaddy"            "$(nhq_agent_canon hd)"                       "heydaddy"
+eq "canon pm → director"            "$(nhq_agent_canon pm)"                       "director"
+eq "canon product-manager → director" "$(nhq_agent_canon product-manager)"       "director"
+eq "canon bogus → ''"               "$(nhq_agent_canon bogus)"                    ""
+eq "repo director abs dir"          "$(nhq_agent_repo director)"                  "$HOME/Github/nhq-agentic-os"
+eq "alias product-manager → director repo" "$(nhq_agent_repo product-manager)"    "$HOME/Github/nhq-agentic-os"
+eq "session fleet-director-x-y"     "$(nhq_session_agent fleet-director-x-y)"     "director"
+eq "session fleet-product-manager-z" "$(nhq_session_agent fleet-product-manager-z)" "director"
+
+echo "── P1-b: nhq-meta CRUD round-trip ──────────────────────────────────────"
+SM="fleet-selftest-meta"
+"$BIN/nhq-meta" init "$SM" agent envy agent_name Envy repo "$HOME/Github/envy" \
+  task "Add retry cap to the upload queue" model "Claude Sonnet 4.6 (Thinking)" \
+  spawn_epoch 1750284000 base_commit abc1234 last_state RUNNING >/dev/null 2>&1
+eq "meta get task"        "$("$BIN/nhq-meta" get "$SM" task)"        "Add retry cap to the upload queue"
+eq "meta get agent"       "$("$BIN/nhq-meta" get "$SM" agent)"       "envy"
+eq "meta get spawn_epoch" "$("$BIN/nhq-meta" get "$SM" spawn_epoch)" "1750284000"
+eq "meta get p3_flag (false, not '')" "$("$BIN/nhq-meta" get "$SM" p3_flag)" "false"
+"$BIN/nhq-meta" set --json "$SM" tokens_in 500 >/dev/null 2>&1
+eq "meta set --json tokens_in → get" "$("$BIN/nhq-meta" get "$SM" tokens_in)" "500"
+# atomicity: record still parses as valid JSON after the in-place set
+if jq -e . "$NHQ_STATE_DIR/${SM}.meta" >/dev/null 2>&1; then
+  ok "meta record is valid JSON after set (atomic)"
+else
+  no "meta record corrupted after set"
+fi
+
+echo "── P1-c: spawn .meta + NHQ_AGENT contract (tmux-gated) ──────────────────"
+# Verifies the two mechanisms nhq-spawn relies on, hermetically — WITHOUT booting a
+# real claude agent (RAM-heavy on this laptop, and it would launch a live agent).
+# (1) the .meta a spawn writes is well-formed with agent==envy; (2) tmux -e exports
+# NHQ_AGENT into the session env. Self-skips if tmux is unavailable.
+if command -v tmux >/dev/null 2>&1; then
+  SS="fleet-selftest-spawnmeta"
+  # (1) spawn-shaped .meta write
+  "$BIN/nhq-meta" init "$SS" agent envy agent_name Envy repo "$HOME/Github/envy" \
+    model "Claude Sonnet 4.6 (Thinking)" spawn_epoch 1 base_commit deadbeef last_state RUNNING >/dev/null 2>&1
+  eq "spawn .meta agent==envy" "$("$BIN/nhq-meta" get "$SS" agent)" "envy"
+  # (2) tmux -e NHQ_AGENT export (the exact flag nhq-spawn uses on launch)
+  tmux kill-session -t "$SS" 2>/dev/null || true
+  if tmux new-session -d -s "$SS" -e "NHQ_AGENT=Envy" "sleep 30" 2>/dev/null; then
+    got="$(tmux show-environment -t "$SS" NHQ_AGENT 2>/dev/null)"
+    eq "tmux session exports NHQ_AGENT" "$got" "NHQ_AGENT=Envy"
+    tmux kill-session -t "$SS" 2>/dev/null || true
+  else
+    echo "  SKIP: P1-c NHQ_AGENT export (tmux new-session -e unsupported here)"
+  fi
+else
+  echo "  SKIP: P1-c spawn-meta/NHQ_AGENT (tmux unavailable)"
 fi
 
 echo "────────────────────────────────────────────────────────────────────────"
