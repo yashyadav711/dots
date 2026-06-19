@@ -564,6 +564,23 @@ eq "N2: env FOO=1 GIT_DIR= git commit → deny"        "$(pre_decision "env FOO=
 eq "NEW-C: /usr/bin/env GIT_DIR= git commit → deny"  "$(pre_decision "/usr/bin/env GIT_DIR=$SECR/.git git commit -m x")" "deny"
 eq "NEW-C: /bin/env GIT_DIR= git commit → deny"      "$(pre_decision "/bin/env GIT_DIR=$SECR/.git git commit -m x")"     "deny"
 
+echo "── SEC-D4: PreToolUse identity-aware Director self-approve (inline token) ─"
+# pre_decision_as <cmd> <harness-env NAME=VALUE…> — IDENTITY comes from the harness env we
+# pass to `env`; the inline VFRAME_P3_OK / NHQ_AGENT live in the COMMAND string (.env staged).
+pre_decision_as() {
+  local cmd="$1"; shift
+  local j; j="$(jq -nc --arg c "$cmd" --arg cwd "$SECR" '{tool_name:"Bash",session_id:"s",cwd:$cwd,tool_input:{command:$c}}')"
+  if echo "$j" | env NHQ_P3_PATHS="$P3PF" NHQ_AUDIT_BIN=/bin/true "$@" "$BIN/nhq-p3-guard" | grep -q '"deny"'; then echo deny; else echo allow; fi
+}
+eq "D4: Director harness + inline VFRAME_P3_OK=1 → ALLOW (self-approve)" \
+  "$(pre_decision_as "VFRAME_P3_OK=1 git commit -m x" NHQ_AGENT= NHQ_SESSION=main)" "allow"
+eq "D4: Director harness + NO inline token → DENY" \
+  "$(pre_decision_as "git commit -m x" NHQ_AGENT= NHQ_SESSION=main)" "deny"
+eq "D4: fleet harness + inline VFRAME_P3_OK=1 → DENY (token ignored)" \
+  "$(pre_decision_as "VFRAME_P3_OK=1 git commit -m x" NHQ_AGENT=Envy NHQ_SESSION=fleet-envy-x)" "deny"
+eq "D4 anti-spoof: fleet harness, command fakes NHQ_AGENT=director+token → DENY" \
+  "$(pre_decision_as "NHQ_AGENT=director VFRAME_P3_OK=1 git commit -m x" NHQ_AGENT=Envy NHQ_SESSION=fleet-envy-x)" "deny"
+
 echo "── SEC-M3: mcp-write-guard generic hard pattern (no fail-open) ─────────"
 eq "M3: remove_environment → hard" "$("$BIN/mcp-write-guard" classify mcp__plugin_railway_railway__remove_environment)" "hard"
 eq "M3: wipe_data → hard"          "$("$BIN/mcp-write-guard" classify mcp__plugin_railway_railway__wipe_data)"          "hard"

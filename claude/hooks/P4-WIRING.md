@@ -40,13 +40,26 @@ chmod +x <repo>/.git/hooks/pre-commit
 ```
 
 D4 behavior:
-- **PreToolUse mode** (harness env): Director-direct (NHQ_AGENT unset or canon==director,
-  NOT in a fleet-* session) may self-approve with `VFRAME_P3_OK=1` (logged). Fleet/relay
-  agents HARD-blocked.
+- **PreToolUse mode** — IDENTITY is read from the HARNESS env only (NHQ_AGENT + fleet-tmux
+  membership of the hook process), NEVER from the command's inline env (anti-spoof, same
+  principle as H2). The self-approval TOKEN, however, is read from the command's INLINE
+  `VFRAME_P3_OK=1` env-prefix — because Director-the-agent can only signal intent inline,
+  not in the hook's already-running env. The token is honored ONLY when identity is Director
+  (main session, not fleet-*); a fleet agent that puts `VFRAME_P3_OK=1` — or even fakes
+  `NHQ_AGENT=director` — inline is still fleet by identity → HARD-blocked. The self-approval
+  is logged to audit.jsonl.
 - **pre-commit mode** NEVER trusts inline `NHQ_AGENT`/`NHQ_SESSION`/`VFRAME_P3_OK` (H2: an
   agent can set them inline before `git commit`). ALWAYS treats the caller as an agent,
-  NO self-approve. A legitimate Director p3 commit is approved at the PreToolUse layer; to
-  deliberately bypass the hook a human uses `git commit --no-verify` (a conscious override).
+  NO self-approve.
+
+**Director's exact p3-commit command** (end-to-end — clears BOTH gates):
+```
+VFRAME_P3_OK=1 git commit --no-verify -m "…"
+```
+`VFRAME_P3_OK=1` self-approves at the PreToolUse layer (only because identity is Director);
+`--no-verify` is the conscious override of the always-hard pre-commit hook — reachable only
+*after* PreToolUse approved Director. A fleet agent running the same line is blocked at
+PreToolUse (wrong identity) and, on a hooked repo, by the pre-commit hook regardless.
 - A misdirected `GIT_DIR=` / `git -C <empty-repo>` not resolving to a real repo fails
   CLOSED (H3). Protected globs: `dots/bin/p3-paths.json` (override `NHQ_P3_PATHS`).
 

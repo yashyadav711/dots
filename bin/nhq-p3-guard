@@ -67,11 +67,16 @@ p3_match_file() {
   return 1
 }
 
-# p3_caller_privileged — 0 if the caller may self-approve (Director/human), 1 if fleet.
+# p3_caller_privileged — 0 if the caller is Director/human (may self-approve), 1 if fleet.
+# IDENTITY IS DERIVED FROM THE HARNESS ENV ONLY (NHQ_AGENT + fleet-tmux membership) — the
+# variables this reads belong to the already-running hook process, which a guarded agent
+# CANNOT change via a command-inline `NHQ_AGENT=… cmd` (that env reaches only the command's
+# own subprocess, never this hook). Same anti-spoof principle as H2. NEVER derive identity
+# from anything parsed out of the command string.
 p3_caller_privileged() {
   local agent="${NHQ_AGENT:-}" sess="${NHQ_SESSION:-}"
   if [[ -z "$sess" && -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
-    sess="$(tmux display-message -p '#S' 2>/dev/null || true)"
+    sess="$(tmux display-message -p '#S' 2>/dev/null || true)"   # real tmux membership
   fi
   [[ "$sess" == fleet-* ]] && return 1          # any fleet-* session ⇒ fleet agent
   local canon=""
@@ -118,9 +123,14 @@ p3_evaluate() {
   if [[ "$mode" == "precommit" ]]; then
     P3_VERDICT="DENY(precommit-no-selfapprove)"; p3_audit deny; return 1
   fi
+  # PreToolUse self-approval (D4). IDENTITY is harness-env (p3_caller_privileged); the TOKEN
+  # is P3_TOKEN, set by the caller from the COMMAND's inline `VFRAME_P3_OK=1` env-prefix —
+  # because Director-the-agent can only signal intent inline, not via the hook's env. The
+  # token is honored ONLY for a harness-proven Director: a fleet agent that puts
+  # VFRAME_P3_OK=1 (or fakes NHQ_AGENT=director) inline is still fleet by identity → blocked.
   if p3_caller_privileged; then
-    if [[ "${VFRAME_P3_OK:-}" == "1" ]]; then
-      P3_VERDICT="ALLOW(director-token)"; p3_audit allow; return 0
+    if [[ "${P3_TOKEN:-}" == "1" ]]; then
+      P3_VERDICT="ALLOW(director-inline-token)"; p3_audit allow; return 0
     fi
     P3_VERDICT="DENY(director-no-token)"; p3_audit deny; return 1
   fi
@@ -156,7 +166,7 @@ p3_deny_reason() {
   local m; m="$(printf '%s' "$P3_MATCHED" | tr '\n' ' ')"
   case "$P3_VERDICT" in
     DENY\(fleet-hard-block\)) echo "this commit stages protected path(s) [$m]; fleet/relay agents are hard-blocked from auth/payments/PII/audit/security commits — escalate to Yash via nhq-blocked." ;;
-    DENY\(director-no-token\)) echo "this commit stages protected path(s) [$m]; Director must self-approve in PreToolUse with VFRAME_P3_OK=1 (logged to audit.jsonl)." ;;
+    DENY\(director-no-token\)) echo "this commit stages protected path(s) [$m]; Director self-approves by prefixing the commit inline: 'VFRAME_P3_OK=1 git commit --no-verify …' (the --no-verify clears the hard pre-commit hook; the approval is logged to audit.jsonl)." ;;
     DENY\(precommit-no-selfapprove\)) echo "this commit stages protected path(s) [$m]; the pre-commit gate never trusts inline env — no self-approve here. A legitimate Director p3 commit is approved at the PreToolUse layer (harness env); to bypass the hook deliberately use 'git commit --no-verify' as a conscious human override." ;;
     DENY\(unresolvable-repo\)) echo "the git target (-C / GIT_DIR) does not resolve to a real repository — refusing to evaluate a misdirected commit." ;;
     DENY\(no-policy-file\)) echo "p3-paths.json policy file not found at $(p3_paths_file) — refusing to commit blind. Restore the policy file." ;;
@@ -179,8 +189,9 @@ p3_set_git_ctx_from_cmd() {
 case "${1:-}" in
   check)
     # nhq-p3-guard check <repo> [pretooluse|precommit]
+    # In `check`, env VFRAME_P3_OK stands in for the inline token the dispatch would parse.
     repo="${2:-$PWD}"; mode="${3:-pretooluse}"
-    P3_GIT_ARGS=(-C "$repo")
+    P3_GIT_ARGS=(-C "$repo"); P3_TOKEN="${VFRAME_P3_OK:-}"
     if p3_evaluate "$mode"; then
       echo "P3: $P3_VERDICT"; [[ -n "$P3_MATCHED" ]] && echo "matched:"$'\n'"$P3_MATCHED"
       exit 0
@@ -214,6 +225,10 @@ case "${1:-}" in
     echo "$CMD" | grep -qE '(^|[;&|]|&&)[[:space:]]*((([^[:space:]]*/)?env)[[:space:]]+([^[:space:]]+[[:space:]]+)*)?([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git[[:space:]]+([^|;&]*[[:space:]])?commit([[:space:]]|$)' || exit 0
     CWD="$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)"; CWD="${CWD:-$PWD}"
     p3_set_git_ctx_from_cmd "$CMD" "$CWD"
+    # The self-approval TOKEN comes from the COMMAND's inline env-prefix (Director can only
+    # set it inline, not in this hook's env). IDENTITY still comes from the harness env, so a
+    # fleet agent putting VFRAME_P3_OK=1 (or NHQ_AGENT=director) inline is still blocked.
+    if echo "$CMD" | grep -qE '(^|[[:space:]])VFRAME_P3_OK=1([[:space:]]|$)'; then P3_TOKEN=1; else P3_TOKEN=""; fi
     if p3_evaluate pretooluse; then exit 0; fi
     p3_emit_deny "$(p3_deny_reason)"
     exit 0   # decision carried in the JSON, not the exit code
