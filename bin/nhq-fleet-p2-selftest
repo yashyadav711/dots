@@ -194,6 +194,111 @@ else
   note "LIVE TTSR mid-stream fire not run (set NHQ_P2_LIVE=1 with a live omp to exercise)"
 fi
 
+echo "── H2(f): ROUND-2 FIX regressions (the exact reviewed bypass vectors) ────"
+gitc() { git -C "$1" -c user.email=t@t -c user.name=t -c commit.gpgsign=false "${@:2}"; }
+
+# (P2-01) push/merge command-shape evasions — ALL must be BRANCHES-ONLY blocked for fleet.
+for atk in \
+  "command git -C $REPO push origin main" \
+  "/usr/bin/git -C $REPO push origin main" \
+  "sh -c 'git push origin main'" ; do
+  r="$(NHQ_FLEET=1 drive p3-bash "$atk")"
+  [ "$(echo "$r" | jget blocked)" = "true" ] && ok "push evasion BLOCKED: [$atk]" || no "push evasion SLIPPED: [$atk] → $r"
+done
+r="$(NHQ_FLEET=1 drive p3-bash 'git${IFS}push${IFS}origin${IFS}main')"
+[ "$(echo "$r" | jget blocked)" = "true" ] && ok 'push evasion BLOCKED: [git${IFS}push…]' || no "push \${IFS} evasion SLIPPED: $r"
+
+# (P2-03) commit command-shape evasions — staged p3 file in $REPO ⇒ all must be denied.
+r="$(NHQ_FLEET=1 drive p3-bash "command git -C $REPO commit -m x")"
+[ "$(echo "$r" | jget blocked)" = "true" ] && ok "commit evasion BLOCKED: [command git commit]" || no "commit 'command' evasion SLIPPED: $r"
+r="$(NHQ_FLEET=1 HOOK_CWD="$REPO" drive p3-bash 'git${IFS}commit${IFS}-m${IFS}x')"
+[ "$(echo "$r" | jget blocked)" = "true" ] && ok 'commit evasion BLOCKED: [git${IFS}commit…]' || no "commit \${IFS} evasion SLIPPED: $r"
+
+# (P2-02) TOCTOU repo: a TRACKED p3 file, MODIFIED but NOT staged. commit -a / <pathspec> stage
+# only at commit time, so the PreToolUse cached snapshot is blind — the EFFECTIVE-set eval catches.
+TR="$TMP/toctou"; mkdir -p "$TR/src/auth"
+git init -q "$TR"
+gitc "$TR" commit -q --allow-empty -m init
+echo "v1" > "$TR/src/auth/login.ts"; gitc "$TR" add -A; gitc "$TR" commit -q -m "add login (tracked)"
+echo "v2-BACKDOOR" > "$TR/src/auth/login.ts"   # modified, NOT staged
+r="$(NHQ_FLEET=1 drive p3-bash "git -C $TR commit -a -m x")"
+[ "$(echo "$r" | jget blocked)" = "true" ] && ok "commit -a of a modified tracked p3 file BLOCKED (effective-set)" || no "commit -a TOCTOU SLIPPED: $r"
+r="$(NHQ_FLEET=1 drive p3-bash "git -C $TR commit src/auth/login.ts -m x")"
+[ "$(echo "$r" | jget blocked)" = "true" ] && ok "commit <pathspec> of a tracked p3 file BLOCKED (effective-set)" || no "commit pathspec TOCTOU SLIPPED: $r"
+
+# (P2-02) fleet --no-verify on a commit would SKIP the pre-commit backstop → refused.
+r="$(NHQ_FLEET=1 drive p3-bash "git -C $REPO commit --no-verify -m x")"
+[ "$(echo "$r" | jget blocked)" = "true" ] && ok "fleet 'git commit --no-verify' REFUSED (would skip the backstop)" || no "fleet --no-verify NOT refused: $r"
+
+# (P2-01/02) re-arm guard: fleet cannot reconfigure remotes / hooks to undo the out-of-band controls.
+r="$(NHQ_FLEET=1 drive p3-bash "git -C $REPO remote set-url --push origin http://evil")"
+[ "$(echo "$r" | jget blocked)" = "true" ] && ok "fleet 'git remote set-url --push' BLOCKED (no push re-arm)" || no "remote re-arm SLIPPED: $r"
+r="$(NHQ_FLEET=1 drive p3-bash "git -C $REPO config core.hooksPath /tmp/x")"
+[ "$(echo "$r" | jget blocked)" = "true" ] && ok "fleet 'git config core.hooksPath' BLOCKED (no backstop disable)" || no "hooksPath disable SLIPPED: $r"
+
+# (P2-04) ast_edit on a p3 path is gated like edit/write; a plain path is not (no false positive).
+r="$(NHQ_FLEET=1 drive p3-astedit "src/auth/login.ts")"
+[ "$(echo "$r" | jget blocked)" = "true" ] && ok "fleet ast_edit of a p3 path BLOCKED" || no "ast_edit p3 NOT blocked: $r"
+r="$(NHQ_FLEET=1 drive p3-astedit "src/util/format.ts")"
+[ "$(echo "$r" | jget blocked)" = "false" ] && ok "fleet ast_edit of a PLAIN path ALLOWED (no false positive)" || no "ast_edit plain wrongly blocked: $r"
+
+# (P2-04) ast_edit mutations are AUDITED (were previously invisible).
+rowsA=$([ -f "$NHQ_AUDIT_FILE" ] && wc -l < "$NHQ_AUDIT_FILE" || echo 0)
+FAKE_SESSION="$TMP/sess-astedit.jsonl" drive audit-astedit "src/auth/login.ts" >/dev/null
+rowsB=$(wc -l < "$NHQ_AUDIT_FILE")
+if [ "$((rowsB - rowsA))" -eq 1 ] && grep -q '"tool":"ast_edit"' "$NHQ_AUDIT_FILE"; then ok "ast_edit mutation is AUDITED"; else no "ast_edit not audited (added $((rowsB - rowsA)))"; fi
+
+# (P2-02) the REAL pre-commit backstop: a bash-written p3 mutation, committed via `commit -a`, is
+# REJECTED post-staging by the driver-installed hook (the hard control bash writes rely on).
+"$DRIVER" install-lane-guards "$TR" >/dev/null 2>&1
+if [ -x "$TR/.git/hooks/pre-commit" ]; then
+  ok "driver install-lane-guards installed an executable pre-commit backstop"
+else
+  no "pre-commit backstop not installed"
+fi
+printf 'const password="bash-write-backdoor";\n' >> "$TR/src/auth/login.ts"   # bash write (un-path-gateable)
+before="$(gitc "$TR" rev-parse HEAD)"
+gitc "$TR" commit -a -m "sneak via bash write" >/dev/null 2>"$TMP/backstop.err"; brc=$?
+after="$(gitc "$TR" rev-parse HEAD)"
+if [ "$brc" -ne 0 ] && [ "$before" = "$after" ]; then
+  ok "pre-commit backstop REJECTED a real 'commit -a' of a bash-written p3 file (HEAD unchanged)"
+else
+  no "backstop did NOT reject (rc=$brc before=$before after=$after)"
+fi
+
+# (P2-01) out-of-band push disable: a repo WITH a remote has its pushurl neutered (push impossible).
+PR="$TMP/pushrepo"; mkdir -p "$PR"
+git init -q "$PR"; gitc "$PR" commit -q --allow-empty -m init
+gitc "$PR" remote add origin "https://example.invalid/repo.git"
+"$DRIVER" install-lane-guards "$PR" >/dev/null 2>&1
+pu="$(git -C "$PR" config --local --get remote.origin.pushurl || true)"
+if [ "$pu" = "nhq-fleet://push-disabled-BRANCHES-ONLY" ]; then ok "lane push DISABLED out-of-band (bogus pushurl set; fetch URL intact)"; else no "pushurl not neutered (got '$pu')"; fi
+"$DRIVER" restore-lane-push "$PR" >/dev/null 2>&1
+pu2="$(git -C "$PR" config --local --get remote.origin.pushurl || echo NONE)"
+if [ "$pu2" = "NONE" ]; then ok "lane push RESTORED on release (human push works again)"; else no "pushurl not restored (got '$pu2')"; fi
+
+# (P2-05) audit forgery: a HMAC-keyed chain is unforgeable by a keyless worker; --agent is ignored.
+KF="$TMP/audit.key"; printf 'fleet-hmac-key-xyz' > "$KF"
+AF2="$TMP/keyed-audit.jsonl"
+NHQ_AUDIT_FILE="$AF2" NHQ_AUDIT_HMAC_KEYFILE="$KF" NHQ_AUDIT_AGENT=director "$BIN/nhq-audit" append --tool p3-guard --agent fleet --bucket "p3:ALLOW" --file x >/dev/null
+NHQ_AUDIT_FILE="$AF2" NHQ_AUDIT_HMAC_KEYFILE="$KF" "$BIN/nhq-audit" append --tool bash --cmd "echo hi" >/dev/null
+if NHQ_AUDIT_FILE="$AF2" NHQ_AUDIT_HMAC_KEYFILE="$KF" "$BIN/nhq-audit" verify | grep -q 'OK'; then ok "keyed audit chain verifies (HMAC)"; else no "keyed chain failed verify"; fi
+if grep -q '"agent":"director"' "$AF2"; then ok "audit stamp IGNORES --agent (driver NHQ_AUDIT_AGENT wins, anti-spoof)"; else no "audit --agent anti-spoof failed"; fi
+NHQ_AUDIT_FILE="$AF2" "$BIN/nhq-audit" append --tool p3-guard --agent director --bucket "p3:ALLOW(director-inline-token)" --file src/auth/login.ts >/dev/null  # FORGE: no key
+if NHQ_AUDIT_FILE="$AF2" NHQ_AUDIT_HMAC_KEYFILE="$KF" "$BIN/nhq-audit" verify >/dev/null 2>&1; then no "forged keyless 'nhq-audit append --agent director' NOT caught"; else ok "forged 'nhq-audit append --agent director' CAUGHT by keyed verify"; fi
+r="$("$DRIVER" audit-selftest 2>/dev/null)"
+if [ "$(echo "$r" | jget keyIsolated)" = "true" ] && [ "$(echo "$r" | jget stampIgnoresClient)" = "true" ]; then
+  ok "driver isolates the HMAC key from the host/worker env + stamps lane identity (anti-spoof)"
+else
+  no "driver audit isolation/stamp failed: $r"
+fi
+
+# (P2-06) dangerous-command guard FAILS CLOSED when its script path is unreachable.
+for cmd in "rm -rf ~" "railway up"; do
+  r="$(NHQ_GUARD_PATH=/nonexistent/guard.sh drive danger "$cmd")"
+  [ "$(echo "$r" | jget blocked)" = "true" ] && ok "guard FAIL-CLOSED blocks '$cmd' when guard path missing" || no "guard FAILED OPEN on missing path: '$cmd' → $r"
+done
+
 echo "── live ~/.omp/agent/hooks untouched? ───────────────────────────────────"
 [ "$(live_sig)" = "$SIG_BEFORE" ] && ok "live ~/.omp/agent/hooks UNCHANGED (hooks stay inert)" || no "live omp hooks dir changed!"
 

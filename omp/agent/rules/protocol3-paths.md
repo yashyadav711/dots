@@ -1,6 +1,6 @@
 ---
 name: protocol3-paths
-description: Protocol-3 mid-stream reminder when a fleet lane writes auth / payment / PII-shaped content.
+description: "ADVISORY / defense-in-depth ONLY (not a security control): Protocol-3 mid-stream reminder when a fleet lane writes auth / payment / PII-shaped content. The HARD gate is the p3-guard hook + pre-commit backstop."
 condition:
   - "([Pp]assword|[Ss]ecret|[Aa]pi[_-]?[Kk]ey|[Aa]pi[Kk]ey|[Cc]lient[_-]?[Ss]ecret|[Pp]rivate[_-]?[Kk]ey|[Aa]ccess[_-]?[Tt]oken|[Bb]earer |[Oo][Aa]uth|[Cc]redential|[Ss]tripe|[Nn]owpayments|sk-[A-Za-z0-9]{6}|sk-ant-)"
 scope:
@@ -22,6 +22,8 @@ secret, token, Stripe/payment, OAuth, or similar) into a file. This is the Proto
   `{status:"blocked", need:"<the exact P3 decision required from Yash>"}`.
 - Never hardcode a real secret. If you reached this by scope drift, back out.
 
-This reminder is advisory; the hard gate is the commit/path-write block in `p3-guard`.
-It fires on sensitive CONTENT because omp's TTSR cannot yet path-gate edit/write streams
-(see the hooks' notes) — so it complements, rather than duplicates, the path-based hook.
+This reminder is ADVISORY / defense-in-depth ONLY — it is a model-context nudge an adversarial
+worker can simply ignore, so the THREAT MODEL must NOT count it as a security control (P2-08).
+The HARD controls are the `p3-guard` hook's path-block (incl. ast_edit) and the driver-installed
+pre-commit commit backstop. It fires on sensitive CONTENT because omp's TTSR cannot yet path-gate
+edit/write streams — so it complements, never replaces, the path-based hook.

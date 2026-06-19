@@ -150,6 +150,10 @@ p3_evaluate() {
 # Best-effort audit line (never fatal).
 p3_audit() {
   local decision="$1" ab="${NHQ_AUDIT_BIN:-$BIN/nhq-audit}"
+  # P2-05: when a fleet daemon owns a HMAC-KEYED audit chain (NHQ_OMP_SOCK set) but this process
+  # has NO key (it was stripped from the worker/host env), a direct unkeyed append would corrupt
+  # the keyed chain — the driver's keyed sink owns it. Skip; the BLOCK still stands & is surfaced.
+  if [[ -n "${NHQ_OMP_SOCK:-}" && -z "${NHQ_AUDIT_HMAC_KEY:-}" && -z "${NHQ_AUDIT_HMAC_KEYFILE:-}" ]]; then return 0; fi
   [[ -x "$ab" ]] || ab="$(command -v nhq-audit 2>/dev/null || true)"
   [[ -n "$ab" && -x "$ab" ]] || return 0
   "$ab" append --tool p3-guard --bucket "p3:${decision}" \

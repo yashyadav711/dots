@@ -171,6 +171,23 @@ async function main(): Promise<void> {
       console.log(JSON.stringify({ appended: true }));
       break;
     }
+    // P2 round-2 regressions: an arbitrary bash command (the exact evasion strings), an ast_edit
+    // target path, and an ast_edit audit append.
+    case "p3-bash": {
+      const r = await fireToolCall(p3, { toolName: "bash", input: { command: arg } });
+      console.log(JSON.stringify({ blocked: !!r, reason: r?.reason ?? "" }));
+      break;
+    }
+    case "p3-astedit": {
+      const r = await fireToolCall(p3, { toolName: "ast_edit", input: { paths: [arg] } });
+      console.log(JSON.stringify({ blocked: !!r, reason: r?.reason ?? "" }));
+      break;
+    }
+    case "audit-astedit": {
+      await fireToolResult(aud, { toolName: "ast_edit", input: { paths: [arg] }, content: [], isError: false });
+      console.log(JSON.stringify({ appended: true }));
+      break;
+    }
     default:
       console.error(`unknown scenario: ${scenario}`);
       process.exit(2);

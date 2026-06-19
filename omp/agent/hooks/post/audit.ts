@@ -10,8 +10,10 @@
 // Two jobs, both on the post-execution surface:
 //   1. AUDIT  — every mutating tool call (bash command, edit, write) appends one chained,
 //      agent-stamped line. A `turn_end` marker delimits each agent turn in the chain.
-//   2. REDACT — secret-looking values in tool OUTPUT are masked before the model sees them
-//      (defense-in-depth against a `read`/`bash` result leaking a key into context).
+//   2. REDACT — secret-looking values in tool OUTPUT are masked before the model sees them.
+//      ADVISORY / best-effort ONLY — NOT a security control (P2-07): it is trivially evadable
+//      (split across chunks, isError results, non-text chunks, custom encodings). It reduces
+//      accidental key leakage into context; it does NOT defend against a motivated worker.
 //
 // Agent stamp: the omp session/agent id (the canonical per-session identity, derived from
 // the active session file), falling back to the driver-injected NHQ_AGENT lane name, then
@@ -21,6 +23,7 @@
 
 import type { HookAPI } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
 import { execFileSync } from "node:child_process";
+import { connect } from "node:net";
 import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
@@ -66,8 +69,19 @@ interface AuditArgs {
   session?: string;
 }
 
-// Best-effort, never-throwing append. nhq-audit scrubs `--cmd` and computes the chain hash.
-function appendAudit(a: AuditArgs): void {
+// P2-05: the HMAC key that makes the chain unforgeable lives in the nhq-omp-driver process,
+// NOT in this host's env (the worker bash inherits the host env). So when a driver is present
+// we ROUTE the append to its socket sink: the driver stamps the lane identity (ignoring any
+// agent we pass) and HMAC-keys the line with its key. Standalone (Claude-Code / no driver) we
+// append directly to an UNKEYED chain — unchanged behavior. Both paths are best-effort.
+function driverSock(): string {
+  const explicit = process.env.NHQ_OMP_SOCK;
+  if (explicit) return explicit;
+  const home = process.env.NHQ_OMP_HOME || join(homedir(), ".nhq-omp");
+  return join(home, "driver.sock");
+}
+
+function appendDirect(a: AuditArgs): void {
   const args = ["append", "--tool", a.tool, "--agent", a.agent];
   if (a.session) args.push("--session", a.session);
   if (a.bucket) args.push("--bucket", a.bucket);
@@ -80,8 +94,35 @@ function appendAudit(a: AuditArgs): void {
   }
 }
 
-// ── secret redaction (tool OUTPUT) ───────────────────────────────────────────
-// Mask common credential shapes so a tool result never carries a live secret into context.
+// Best-effort, never-throwing append. Routes through the driver's keyed sink when present.
+function appendAudit(a: AuditArgs): void {
+  const sock = driverSock();
+  if (existsSync(sock)) {
+    try {
+      const c = connect(sock);
+      let routed = false;
+      c.on("error", () => {
+        try { c.destroy(); } catch { /* */ }
+        if (!routed) appendDirect(a); // stale socket / dead daemon → don't lose the line
+      });
+      c.on("connect", () => {
+        routed = true;
+        try {
+          c.write(JSON.stringify({ cmd: "audit", tool: a.tool, bucket: a.bucket, file: a.file, acmd: a.cmd }) + "\n");
+          c.end();
+        } catch { /* best-effort */ }
+      });
+      return;
+    } catch {
+      /* fall through to a direct append */
+    }
+  }
+  appendDirect(a);
+}
+
+// ── secret redaction (tool OUTPUT) — ADVISORY / defense-in-depth ONLY (P2-07) ─────────────
+// Mask common credential shapes so a tool result does not ACCIDENTALLY carry a live secret
+// into context. This is NOT a security control: it is best-effort and trivially evadable.
 const SECRET_PATTERNS: RegExp[] = [
   /\bsk-ant-[A-Za-z0-9_-]{16,}/g, // Anthropic
   /\b(?:sk|pk)-[A-Za-z0-9]{20,}/g, // OpenAI / Stripe
@@ -128,6 +169,11 @@ export default function (pi: HookAPI) {
     } else if (tool === "edit") {
       const file = firstEditPath(String(event.input?.input ?? ""));
       if (file) appendAudit({ tool: "edit", agent, session, bucket: "write", file });
+    } else if (tool === "ast_edit") {
+      // P2-04: ast_edit is a first-class mutating tool — audit its target paths too.
+      const raw = event.input?.paths;
+      const file = Array.isArray(raw) && raw.length ? String(raw[0]) : "";
+      if (file) appendAudit({ tool: "ast_edit", agent, session, bucket: "write", file });
     }
 
     // 2. REDACT secrets from successful tool output before the model sees it.
