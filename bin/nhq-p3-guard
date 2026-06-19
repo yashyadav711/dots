@@ -91,7 +91,17 @@ p3_caller_privileged() {
 # Git invocation context for the repo under evaluation (set by each caller). Using the
 # real GIT_DIR/-C the commit targets defeats H3 misdirection.
 P3_GIT_ARGS=()
-p3_staged_files() { git "${P3_GIT_ARGS[@]}" diff --cached --name-only 2>/dev/null; }
+# The set of paths the commit will write. The cached index is the precise set a normal
+# `git commit` writes. P2-02: `git commit -a` / `git commit <pathspec>` stage at commit time,
+# so at PreToolUse the cached set is blind to them — when NHQ_P3_EFFECTIVE=1 (set by the omp
+# hook for fleet lanes) we ALSO consider tracked working-tree changes vs HEAD, the superset of
+# what `-a`/pathspec would stage. (The installed pre-commit hook remains the precise post-
+# staging backstop; this widens the PreToolUse evaluation as defense-in-depth.) De-duplicated.
+p3_staged_files() {
+  { git "${P3_GIT_ARGS[@]}" diff --cached --name-only 2>/dev/null
+    [[ "${NHQ_P3_EFFECTIVE:-}" == "1" ]] && git "${P3_GIT_ARGS[@]}" diff HEAD --name-only 2>/dev/null
+  } | awk 'NF && !seen[$0]++'
+}
 
 # p3_evaluate <mode>  (mode = pretooluse | precommit)
 # sets P3_MATCHED + P3_VERDICT; returns 0 allow / 1 deny. Reads P3_GIT_ARGS.

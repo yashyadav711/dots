@@ -22,6 +22,20 @@ audit_file() { printf '%s' "${NHQ_AUDIT_FILE:-$HOME/Github/nhq-agentic-os/ai/sta
 GENESIS="GENESIS"
 sha() { printf '%s' "$1" | sha256sum | awk '{print $1}'; }
 
+# Chain-integrity key (P2-05): when a key is present, each line is HMAC-SHA256-keyed instead
+# of a bare sha256, so a worker WITHOUT the key cannot forge a chain-valid append (the public
+# sha algorithm forge is closed). The key is held by the nhq-omp-driver process and injected
+# into nhq-audit ONLY for the driver's own append/verify invocations — it is kept OUT of the
+# fleet worker's environment (the host spawn env strips it). See nhq-omp-driver's audit sink.
+audit_key() {
+  if [[ -n "${NHQ_AUDIT_HMAC_KEY:-}" ]]; then printf '%s' "$NHQ_AUDIT_HMAC_KEY"; return 0; fi
+  local kf="${NHQ_AUDIT_HMAC_KEYFILE:-}"
+  if [[ -n "$kf" && -f "$kf" ]]; then printf '%s' "$(cat "$kf")"; return 0; fi
+  return 1
+}
+# HMAC-SHA256(key, data) — hex digest (matches sha()'s shape for the chain).
+mac() { printf '%s' "$2" | openssl dgst -sha256 -hmac "$1" 2>/dev/null | awk '{print $NF}'; }
+
 # Scrub secret-looking values from a command string before it is logged.
 # L1: also handle QUOTED values — --token "sk-x" / RAILWAY_TOKEN='abc' — by consuming an
 # optional opening quote before the value (the value class still stops at the closing quote).
@@ -61,12 +75,19 @@ cmd_append() {
   local AF; AF="$(audit_file)"
   mkdir -p "$(dirname "$AF")"
 
+  # P2-05 anti-spoof: a driver/host-injected NHQ_AUDIT_AGENT OVERRIDES any caller-supplied
+  # --agent, so an agent-issued `nhq-audit append --agent director` cannot forge attribution;
+  # identity is stamped the same anti-spoof way the hook derives it (trusted env, not argv).
+  [[ -n "${NHQ_AUDIT_AGENT:-}" ]] && agent="$NHQ_AUDIT_AGENT"
+  local KEY=""; KEY="$(audit_key 2>/dev/null)" || true
+
   local nullify='if .=="" then null else . end'
+  local kfield=""; [[ -n "$KEY" ]] && kfield=", k:1"
   local core
   core="$(jq -cn \
     --arg ts "$ts" --arg agent "$agent" --arg tool "$tool" --arg bucket "$bucket" \
     --arg file "$file" --arg cmd "$cmd" --arg session "$session" \
-    "{ts:\$ts, agent:(\$agent|$nullify), tool:\$tool, bucket:(\$bucket|$nullify), file:(\$file|$nullify), cmd:(\$cmd|$nullify), session:(\$session|$nullify)}")" || return 1
+    "{ts:\$ts, agent:(\$agent|$nullify), tool:\$tool, bucket:(\$bucket|$nullify), file:(\$file|$nullify), cmd:(\$cmd|$nullify), session:(\$session|$nullify)$kfield}")" || return 1
 
   # Lock for the read-last-hash → append window so concurrent writers can't fork the chain.
   exec 9>"$AF.lock"
@@ -76,7 +97,7 @@ cmd_append() {
     local last lh; last="$(tail -n1 "$AF")"; lh="$(line_hash "$last")"
     [[ -n "$lh" ]] && prev="$lh"
   fi
-  local h; h="$(sha "$prev$core")"
+  local h; if [[ -n "$KEY" ]]; then h="$(mac "$KEY" "$prev$core")"; else h="$(sha "$prev$core")"; fi
   printf '%s,"h":"%s"}\n' "${core%\}}" "$h" >> "$AF"
   flock -u 9 2>/dev/null || true
 }
@@ -84,7 +105,8 @@ cmd_append() {
 cmd_verify() {
   local AF="${1:-$(audit_file)}"
   [[ -f "$AF" ]] || { echo "nhq-audit verify: no file at $AF"; return 1; }
-  local prev="$GENESIS" n=0 started=0 bad=0 chained=0
+  local KEY=""; KEY="$(audit_key 2>/dev/null)" || true
+  local prev="$GENESIS" n=0 started=0 bad=0 chained=0 keyseen=0
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n+1))
     [[ -z "$line" ]] && continue
@@ -96,21 +118,37 @@ cmd_verify() {
       continue
     fi
     started=1; chained=$((chained+1))
-    local core exp; core="$(line_core "$line")"; exp="$(sha "$prev$core")"
+    local core exp lkeyed=0; core="$(line_core "$line")"
+    [[ "$line" == *'"k":1'* ]] && lkeyed=1
+    # P2-05 downgrade guard: once the chain is HMAC-keyed, a later UNKEYED chained line is a
+    # forge (a keyless worker can only produce plain-sha lines) — flag it as tamper.
+    if [[ "$keyseen" -eq 1 && "$lkeyed" -eq 0 ]]; then
+      echo "nhq-audit verify: TAMPER — unkeyed line $n after the chain went HMAC-keyed (forge/downgrade)"; bad=1
+    fi
+    if [[ "$lkeyed" -eq 1 ]]; then
+      keyseen=1
+      if [[ -z "$KEY" ]]; then
+        echo "nhq-audit verify: CANNOT VERIFY — line $n is HMAC-keyed but no key (NHQ_AUDIT_HMAC_KEY/KEYFILE) is available"; bad=1; prev="$sh"; continue
+      fi
+      exp="$(mac "$KEY" "$prev$core")"
+    else
+      exp="$(sha "$prev$core")"
+    fi
     if [[ "$exp" != "$sh" ]]; then
       echo "nhq-audit verify: TAMPER — line $n hash mismatch (got $sh, expected $exp)"; bad=1
     fi
     prev="$sh"
   done < "$AF"
   if [[ "$bad" -eq 0 ]]; then
-    echo "nhq-audit verify: OK — $chained chained line(s) of $n intact"
-    # L3 (documented limit): the chain detects EDIT / DELETE / REORDER of existing lines,
-    # but NOT a newly-APPENDED forged entry — an attacker who can write the file knows the
-    # last h (prev_h) and can extend the chain. This is acceptable for the threat model:
-    # appends to audit.jsonl are themselves gated by the P3 commit guard (audit/ is a
-    # protected path), so a forged append cannot be committed without an approval token.
-    echo "nhq-audit verify: note — chain proves no edit/delete/reorder; forged APPENDS are"
-    echo "  out of scope (defended by the P3 gate on the audit path). See L3."
+    if [[ "$keyseen" -eq 1 ]]; then
+      echo "nhq-audit verify: OK — $chained chained line(s) of $n intact (HMAC-keyed)"
+      echo "nhq-audit verify: note — chain is HMAC-keyed; a worker without the driver-held key"
+      echo "  (kept out of the worker env) cannot forge a chain-valid append. See P2-05."
+    else
+      echo "nhq-audit verify: OK — $chained chained line(s) of $n intact"
+      echo "nhq-audit verify: note — UNKEYED (sha256) chain: detects edit/delete/reorder. A"
+      echo "  forged APPEND is closed only once the driver-keyed (HMAC) audit sink is active."
+    fi
     return 0
   fi
   return 1

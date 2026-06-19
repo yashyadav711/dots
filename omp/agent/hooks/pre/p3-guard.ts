@@ -7,15 +7,27 @@
 // which owns the p3-paths.json glob set and the D4 caller-tier rule. One source of
 // truth — fix the policy once in the bash script, this hook inherits it. Zero drift.
 //
-// What it gates (the `tool_call` events a fleet worker can issue):
-//   • bash `git commit …`  → delegate to `nhq-p3-guard check <repo> pretooluse`. If the
-//     commit stages an auth/payments/PII/audit/security path without approval, the gate
-//     denies (exit 1) and this hook BLOCKS with the gate's reason. Director-on-omp may
-//     self-approve by prefixing `VFRAME_P3_OK=1` inline (the existing D4 token).
-//   • bash `git push` / `git merge`  → BRANCHES-ONLY (D4): a fleet lane is HARD-blocked;
-//     Director-direct is allowed. Integration to main is a human step.
-//   • edit / write on a p3-paths.json glob  → omp-side hardening: catch the protected-path
-//     MUTATION before it is even staged. Fleet HARD-blocked; Director allowed.
+// What it gates (the `tool_call` events a fleet worker can issue) — this is the EARLY signal
+// layer; the HARD controls live OUT-OF-BAND in the driver (a `.git/hooks/pre-commit` backstop
+// that runs on the real staged set, and a stripped push remote), so a detection miss here is
+// non-fatal:
+//   • bash `git commit …`  → the git SUBCOMMAND is detected ROBUSTLY (normalized for
+//     `command`, absolute `/usr/bin/git`, `${IFS}`, `sh -c '…'`/`eval`, leading-newline, and
+//     inline-env / `env`-wrapper prefixes — P2-03) and delegated to `nhq-p3-guard check`. For
+//     a FLEET lane the EFFECTIVE commit set is evaluated (cached ∪ tracked working-tree changes
+//     vs HEAD), so `commit -a` / `commit <pathspec>` — which stage only when git runs (P2-02
+//     TOCTOU) — are caught here too, and a fleet `--no-verify` (which would skip the pre-commit
+//     backstop) is refused. Director may self-approve inline with `VFRAME_P3_OK=1`.
+//   • bash `git push` / `git merge`  → BRANCHES-ONLY: a fleet lane is HARD-blocked (robust
+//     subcommand detection — P2-01). The driver ALSO strips the push remote out-of-band so a
+//     push is impossible regardless of phrasing. Fleet `git remote`/`git config` mutations that
+//     would re-arm push or disable a hook (remote url / pushurl / core.hooksPath) are blocked.
+//   • edit / write / ast_edit on a p3-paths.json glob → omp-side hardening: catch the
+//     protected-path MUTATION before it is staged. Fleet HARD-blocked; Director allowed (P2-04).
+//
+// LIMIT (P2-04, by design): a bash file write (`sed -i`, `printf >`, `tee`, `python -c`) to a
+// protected path CANNOT be path-gated here — it is opaque shell. The HARD control for those is
+// the commit-gate backstop: the pre-commit hook re-evaluates the real staged set post-staging.
 //
 // Caller tier (anti-spoof): identity is read from the HOST process env — which a guarded
 // worker CANNOT change via a command-inline `NHQ_AGENT=… cmd` (that env reaches only the
@@ -56,16 +68,98 @@ function isFleetCaller(): boolean {
   return agent !== "" && agent !== "director";
 }
 
-// ── command shape detectors (ported from nhq-p3-guard's PreToolUse detection) ──
-// Each tolerates inline env assignments and an `env`/`/usr/bin/env` wrapper before `git`.
-const PREFIX = "(?:^|[;&|]|&&)\\s*(?:(?:[^\\s]*/)?env\\s+(?:[^\\s]+\\s+)*)?(?:[A-Za-z_]\\w*=[^\\s]*\\s+)*git\\s+";
-const COMMIT_RE = new RegExp(PREFIX + "(?:[^|;&]*\\s)?commit(?:\\s|$)");
-const PUSH_RE = new RegExp(PREFIX + "(?:[^|;&]*\\s)?push(?:\\s|$)");
-const MERGE_RE = new RegExp(PREFIX + "(?:[^|;&]*\\s)?merge(?:\\s|$)");
+// ── git command normalization (P2-01 / P2-03) ────────────────────────────────
+// Robust subcommand detection, NOT a single mega-regex: we find the git SUBCOMMAND invoked
+// anywhere in the (recursively unwrapped) command. This defeats the reviewed evasions —
+// `command git push`, `/usr/bin/git push`, `git${IFS}push`, `sh -c 'git push'`, `eval '…'`, a
+// leading-newline segment, and inline-env / `env`-wrapper prefixes. It is the EARLY signal; the
+// HARD controls are the driver-installed pre-commit backstop + the stripped push remote.
 const TOKEN_RE = /(?:^|\s)VFRAME_P3_OK=1(?:\s|$)/;
 const DASH_C_RE = /\bgit\s+(?:-[^\s]+\s+)*-C\s+([^\s]+)/;
 // Hashline section headers: `[path#TAG]` (TAG = four hex). Capture the path of each section.
 const HASHLINE_PATH_RE = /\[([^\]\r\n]+?)#[0-9A-Fa-f]{4}\]/g;
+
+const IFS_RE = /\$\{IFS[^}]*\}|\$IFS\b/g;            // ${IFS}, ${IFS%??}, $IFS → a separator
+const SEG_RE = /[\n;&|()`]+/;                         // shell command-segment boundaries
+const ENV_ASSIGN_RE = /^[A-Za-z_]\w*=/;               // VAR=val command-position prefix
+const RUNNER_PREFIX = new Set(["sudo", "command", "exec", "builtin", "nohup", "time"]);
+const ENV_ARG_FLAGS = new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"]);
+const GIT_ARG_OPTS = new Set(["-C", "--git-dir", "--work-tree", "-c", "--namespace", "--exec-path", "--super-prefix"]);
+// `sh -c '…'` / `bash -c "…"` / `eval '…'` — capture the quoted payload to re-scan.
+const INTERP_RE = /(?:^|[\s;&|(`])(?:eval|(?:[^\s'"]*\/)?(?:sh|bash|zsh|dash|ksh|ash))(?:\s+-[A-Za-z]+)*\s+(['"])([\s\S]*?)\1/g;
+
+function basenameOf(t: string): string {
+  const i = t.lastIndexOf("/");
+  return i >= 0 ? t.slice(i + 1) : t;
+}
+
+// The git subcommand invoked by ONE already-segmented simple command (or "").
+function segGitSub(seg: string): string {
+  const tok = seg.trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < tok.length) {
+    const t = tok[i];
+    if (ENV_ASSIGN_RE.test(t)) { i++; continue; }     // VAR=val
+    const b = basenameOf(t);
+    if (RUNNER_PREFIX.has(b)) { i++; continue; }       // sudo/command/exec/builtin/…
+    if (b === "env") {                                 // env [opts] [VAR=val] …
+      i++;
+      while (i < tok.length) {
+        const a = tok[i];
+        if (ENV_ASSIGN_RE.test(a)) { i++; continue; }
+        if (ENV_ARG_FLAGS.has(a)) { i += 2; continue; } // arg-taking flag swallows its value
+        if (a.startsWith("-")) { i++; continue; }
+        break;
+      }
+      continue;
+    }
+    break;
+  }
+  if (i >= tok.length || basenameOf(tok[i]) !== "git") return "";  // matches /usr/bin/git too
+  i++;
+  while (i < tok.length) {                             // skip git GLOBAL options to the subcommand
+    const o = tok[i];
+    if (GIT_ARG_OPTS.has(o)) { i += 2; continue; }     // -C dir, -c k=v, --git-dir d, …
+    if (o.startsWith("-")) { i++; continue; }          // -p, --no-pager, --bare, …
+    break;
+  }
+  return i < tok.length ? tok[i] : "";
+}
+
+// All git subcommands invoked anywhere in `cmd`, after unwrapping ${IFS} and interpreter
+// (`sh -c '…'` / `eval '…'`) payloads. Bounded recursion defeats nested wrappers.
+function gitSubcommands(cmd: string, depth = 0): Set<string> {
+  const found = new Set<string>();
+  if (depth > 6 || !cmd) return found;
+  const s = cmd.replace(IFS_RE, " ");
+  for (const seg of s.split(SEG_RE)) {
+    const sub = segGitSub(seg);
+    if (sub) found.add(sub);
+  }
+  INTERP_RE.lastIndex = 0;
+  for (const m of s.matchAll(INTERP_RE)) {
+    for (const sub of gitSubcommands(m[2], depth + 1)) found.add(sub);
+  }
+  return found;
+}
+
+// A fleet `--no-verify` (or `-n` / clustered `-an`) on a commit would SKIP the pre-commit
+// backstop — refuse it from fleet lanes.
+function commitHasNoVerify(cmd: string): boolean {
+  const s = cmd.replace(IFS_RE, " ");
+  if (/(?:^|\s)--no-verify(?:\s|$)/.test(s)) return true;
+  for (const t of s.split(/\s+/)) if (/^-[A-Za-z]*n[A-Za-z]*$/.test(t)) return true;
+  return false;
+}
+
+// A fleet git command that would re-arm push or disable a backstop hook (defends the driver's
+// out-of-band controls): `git remote add/set-url/…` or `git config …(pushurl|url|hooksPath)`.
+function tampersWithGuards(cmd: string, subs: Set<string>): boolean {
+  const s = cmd.replace(IFS_RE, " ");
+  if (subs.has("remote") && /\bremote\s+(?:-[A-Za-z]+\s+)*(?:add|set-url|set-head|set-branches|rm|remove|rename|prune|update)\b/.test(s)) return true;
+  if (subs.has("config") && /(?:core\.)?hooksPath|\.pushurl\b|\.url\b|pushurl/i.test(s)) return true;
+  return false;
+}
 
 // Narrow the fields we read off a thrown execFileSync error without trusting a shape.
 function execErr(e: unknown): { status?: number; stdout: string; code?: string } {
@@ -81,17 +175,14 @@ function execErr(e: unknown): { status?: number; stdout: string; code?: string }
 }
 
 // Delegate the commit decision to the bash gate. Returns a block reason, or "" to allow.
-// Fails CLOSED (blocks) when the gate binary itself cannot be invoked — a P3 commit must
-// never slip through an unconfigured gate (mirrors nhq-p3-guard's "never commit blind").
-//
-// The delegated `check` derives its caller tier from NHQ_AGENT (it predates NHQ_FLEET). So
-// when THIS hook has already concluded the caller is fleet (NHQ_FLEET=1 / fleet session),
-// we propagate that by forcing NHQ_AGENT=fleet for the delegated call — otherwise an empty
-// NHQ_AGENT would let `check` treat the fleet host as Director and honor an inline token.
-function commitBlockReason(cmd: string, repo: string, fleet: boolean): string {
+// Fails CLOSED (blocks) when the gate binary itself cannot be invoked. When `effective` is set
+// (fleet lanes) the gate evaluates the EFFECTIVE commit set (cached ∪ tracked working-tree
+// changes vs HEAD) so `-a`/pathspec commits are caught at PreToolUse time too.
+function commitBlockReason(cmd: string, repo: string, fleet: boolean, effective: boolean): string {
   const env = { ...process.env, VFRAME_P3_OK: TOKEN_RE.test(cmd) ? "1" : "" };
   const agent = (process.env.NHQ_AGENT ?? "").toLowerCase();
   if (fleet && (agent === "" || agent === "director")) env.NHQ_AGENT = "fleet";
+  if (effective) env.NHQ_P3_EFFECTIVE = "1";
   try {
     execFileSync(guardBin(), ["check", repo, "pretooluse"], { env, encoding: "utf8" });
     return ""; // exit 0 ⇒ ALLOW (no protected paths, or Director self-approved)
@@ -104,7 +195,7 @@ function commitBlockReason(cmd: string, repo: string, fleet: boolean): string {
         .join(" ")
         .trim();
       const verdict = (stdout.match(/P3:\s*(\S+)/) ?? [])[1] ?? "DENY";
-      return `Protocol-3: this git commit is denied (${verdict})${matched ? ` — staged protected path(s): ${matched}` : ""}. Fleet lanes cannot commit auth/payments/PII/audit/security paths; escalate the decision to Yash.`;
+      return `Protocol-3: this git commit is denied (${verdict})${matched ? ` — protected path(s): ${matched}` : ""}. Fleet lanes cannot commit auth/payments/PII/audit/security paths; escalate the decision to Yash.`;
     }
     return `Protocol-3 gate could not be evaluated (nhq-p3-guard ${code ?? "failed"}). Failing CLOSED: refusing the commit until the gate is reachable.`;
   }
@@ -139,24 +230,40 @@ export default function (pi: HookAPI) {
     if (event.toolName === "bash") {
       const cmd = String(event.input?.command ?? "");
       if (!cmd) return;
+      const subs = gitSubcommands(cmd);
 
-      if (fleet && PUSH_RE.test(cmd)) {
+      if (fleet && (subs.has("push") || subs.has("merge"))) {
+        const what = subs.has("push") ? "push" : "merge";
         return {
           block: true,
           reason:
-            "BLOCKED (BRANCHES ONLY): fleet lanes never `git push`. Commit to your task branch; integration to a remote/main is a human (Director/Yash) step.",
+            `BLOCKED (BRANCHES ONLY): fleet lanes never \`git ${what}\`. Commit to your task ` +
+            `branch; integration to a remote/main is a human (Director/Yash) step. The push ` +
+            `remote is also stripped out-of-band, so this is impossible regardless of phrasing.`,
         };
       }
-      if (fleet && MERGE_RE.test(cmd)) {
+      if (fleet && tampersWithGuards(cmd, subs)) {
         return {
           block: true,
           reason:
-            "BLOCKED (BRANCHES ONLY): fleet lanes never `git merge`. Keep work on your task branch; merges are a human (Director/Yash) step.",
+            "BLOCKED (Protocol-3): fleet lanes cannot reconfigure git remotes or hooks " +
+            "(remote url / pushurl / core.hooksPath) — that would re-arm push or disable the " +
+            "pre-commit backstop. Escalate to Yash.",
         };
       }
-      if (COMMIT_RE.test(cmd)) {
+      if (subs.has("commit")) {
+        if (fleet && commitHasNoVerify(cmd)) {
+          return {
+            block: true,
+            reason:
+              "BLOCKED (Protocol-3): fleet lanes cannot `git commit --no-verify` — that would " +
+              "skip the pre-commit P3 backstop. Commit normally; a protected-path commit is a " +
+              "human (Director/Yash) decision.",
+          };
+        }
         const repo = (cmd.match(DASH_C_RE) ?? [])[1] ?? ctx?.cwd ?? process.cwd();
-        const reason = commitBlockReason(cmd, repo, fleet);
+        // Fleet lanes get the EFFECTIVE-set evaluation (defeats the -a/pathspec TOCTOU).
+        const reason = commitBlockReason(cmd, repo, fleet, fleet);
         if (reason) return { block: true, reason: `BLOCKED — ${reason}` };
       }
       return;
@@ -183,6 +290,21 @@ export default function (pi: HookAPI) {
         return {
           block: true,
           reason: `BLOCKED (Protocol-3): editing the protected path '${hit}' (auth/payments/PII/audit/security). Fleet lanes cannot mutate P3 paths; escalate to Yash.`,
+        };
+      }
+      return;
+    }
+
+    // P2-04: ast_edit is a first-class mutating tool — gate its resolved target paths too.
+    if (event.toolName === "ast_edit") {
+      const raw = event.input?.paths;
+      const paths = Array.isArray(raw) ? raw.map((p) => String(p)) : [];
+      if (paths.length === 0) return;
+      const hit = protectedPath(paths);
+      if (hit && fleet) {
+        return {
+          block: true,
+          reason: `BLOCKED (Protocol-3): ast_edit on the protected path '${hit}' (auth/payments/PII/audit/security). Fleet lanes cannot mutate P3 paths; escalate to Yash.`,
         };
       }
       return;
