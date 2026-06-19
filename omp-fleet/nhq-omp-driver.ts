@@ -241,9 +241,13 @@ class FleetHost {
     const sessionDir = process.env.NHQ_OMP_SESSION_DIR;
     const ompArgs = ["--mode", "rpc", "--cwd", cwd, "--no-title"];
     if (sessionDir) ompArgs.push("--session-dir", sessionDir);
+    // NHQ_FLEET=1 marks the whole fleet-host (and its in-process subagents) as the
+    // non-privileged fleet tier for the P2 safety hooks: the p3-guard hook reads it to
+    // HARD-block P3 commits/pushes/writes, and propagates it into `nhq-p3-guard check` so
+    // a worker can never self-approve with an inline token. The host is never Director.
     const child = spawn(OMP_BIN, ompArgs, {
       stdio: ["pipe", "pipe", log],
-      env: process.env,
+      env: { ...process.env, NHQ_FLEET: "1" },
     }) as ChildProcessWithoutNullStreams;
     this.proc = child;
     this.cwd = cwd;

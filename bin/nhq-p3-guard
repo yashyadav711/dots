@@ -200,6 +200,20 @@ case "${1:-}" in
       exit 1
     fi
     ;;
+  match-path)
+    # nhq-p3-guard match-path <path> [<path> ...]
+    # Single-path policy probe for the omp edit/write pre-hook: reuses the EXACT
+    # p3_match_file matcher (no policy duplication). Prints + exit 0 on the FIRST
+    # protected match; exit 1 if none match; exit 2 if the policy file is missing
+    # (fail-closed — the caller treats an unparseable policy as "protected").
+    shift
+    if ! p3_load_globs; then echo "DENY(no-policy-file)" >&2; exit 2; fi
+    for f in "$@"; do
+      [[ -z "$f" ]] && continue
+      if p3_match_file "$f"; then echo "$f"; exit 0; fi
+    done
+    exit 1
+    ;;
   pre-commit)
     # The git pre-commit hook — fires after `git add`, before the commit is written.
     # ALWAYS precommit mode → never trusts inline env (H2). Uses the ambient repo.
@@ -234,7 +248,7 @@ case "${1:-}" in
     exit 0   # decision carried in the JSON, not the exit code
     ;;
   *)
-    echo "usage: nhq-p3-guard {check <repo> [pretooluse|precommit]|pre-commit}  (or pipe PreToolUse hook JSON)" >&2
+    echo "usage: nhq-p3-guard {check <repo> [pretooluse|precommit]|match-path <path>...|pre-commit}  (or pipe PreToolUse hook JSON)" >&2
     exit 2
     ;;
 esac

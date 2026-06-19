@@ -56,7 +56,7 @@ for cmd in nhq-agent-name nhq-await nhq-blocked nhq-cost nhq-done nhq-fleet \
            nhq-status nhq-tell nhq-warden \
            nhq-audit nhq-audit-verify nhq-ctx nhq-econ nhq-handoff nhq-p3-guard \
            mcp-write-guard \
-           nhq-omp-driver nhq-fleet-p1-selftest; do
+           nhq-omp-driver nhq-fleet-p1-selftest nhq-fleet-p2-selftest nhq-omp-hooks-install; do
   link "bin/$cmd" "$HOME/.local/bin/$cmd"
 done
 
@@ -68,6 +68,12 @@ done
 for agent in envy; do
   link "omp/agent/agents/$agent.md" "$HOME/.omp/agent/agents/$agent.md"
 done
+
+# NHQ Fleet v1 P2 (omp safety port) — the tool_call/​tool_result hooks + TTSR rules live in
+# dots/omp/agent/{hooks,rules}. They are SECURITY-CONTROL code and are intentionally NOT
+# symlinked here: activating them is a reviewed, human step via `nhq-omp-hooks-install
+# --activate` (dry-run by default). The hooks DELEGATE to nhq-p3-guard / nhq-audit (linked
+# above) and the dangerous-command guard in claude/hooks — no policy is reimplemented.
 
 
 echo "==> [4/4] System config (apply manually with sudo or per-user as noted)"
@@ -90,6 +96,9 @@ cat <<'NOTE'
         mkdir -p ~/.claude && ln -s ~/Github/home-bt/store ~/.claude/bt
   • AppImages (~/Applications/): see packages/appimage.txt — download each and chmod +x.
         Desktop entries live in dots/appimage/ — link: ln -sfn $DOTS/appimage/kun.desktop ~/.local/share/applications/kun.desktop
+  • NHQ omp P2 safety hooks (SECURITY — reviewed human step, NOT auto-activated):
+        nhq-omp-hooks-install              # dry-run: preview what it would symlink
+        nhq-omp-hooks-install --activate   # go live after reviewing the hook diff
   • Log out / reboot to apply Hyprland + shell changes.
 ───────────────────────────────────────────────────────────────
 NOTE
