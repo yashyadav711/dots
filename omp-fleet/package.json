@@ -1,0 +1,14 @@
+{
+  "name": "nhq-omp-driver",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "NHQ Fleet v1 host controller — drives a persistent omp --mode rpc fleet-host over RPC (Phase P1). Runs under Bun (preferred) or Node 22+ (native TS).",
+  "bin": {
+    "nhq-omp-driver": "./nhq-omp-driver.ts"
+  },
+  "engines": {
+    "bun": ">=1.0.0",
+    "node": ">=22.6.0"
+  }
+}

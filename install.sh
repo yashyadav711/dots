@@ -55,8 +55,18 @@ for cmd in nhq-agent-name nhq-await nhq-blocked nhq-cost nhq-done nhq-fleet \
            nhq-fleet-selftest nhq-kill nhq-meta nhq-notify nhq-reap nhq-spawn \
            nhq-status nhq-tell nhq-warden \
            nhq-audit nhq-audit-verify nhq-ctx nhq-econ nhq-handoff nhq-p3-guard \
-           mcp-write-guard; do
+           mcp-write-guard \
+           nhq-omp-driver nhq-fleet-p1-selftest; do
   link "bin/$cmd" "$HOME/.local/bin/$cmd"
+done
+
+# NHQ Fleet v1 (omp) — the Bun/TS driver lives in dots/omp-fleet and is resolved as
+# a sibling of dots/bin by the nhq-omp-driver launcher, so it is NOT linked itself.
+# Source-of-truth omp agent configs live in dots/omp/agent/agents and are symlinked
+# into ~/.omp/agent/agents (omp's user agents dir; same per-file pattern as the
+# rest of this repo). Add new roster files here as later phases author them.
+for agent in envy; do
+  link "omp/agent/agents/$agent.md" "$HOME/.omp/agent/agents/$agent.md"
 done
 
 

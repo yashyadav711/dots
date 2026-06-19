@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# nhq-omp-driver — thin launcher for the NHQ Fleet v1 host controller (P1).
+#
+# The driver itself is Bun/TS (dots/omp-fleet/nhq-omp-driver.ts). Per F3 the bash
+# front-door stays thin: this just picks a TS runtime and execs the driver.
+#   • Bun preferred (the omp runtime; what the driver was written for).
+#   • Node 22.6+ falls back via native TS type-stripping (no transpile step).
+# Resolves the .ts as a sibling of dots/bin via dots/omp-fleet, even when this
+# launcher is symlinked into ~/.local/bin (matches the nhq-* sibling-resolve idiom).
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+DRIVER="$BIN/../omp-fleet/nhq-omp-driver.ts"
+
+if [[ ! -f "$DRIVER" ]]; then
+  echo "nhq-omp-driver: driver not found at $DRIVER" >&2
+  exit 1
+fi
+
+if command -v bun >/dev/null 2>&1; then
+  exec bun "$DRIVER" "$@"
+elif command -v node >/dev/null 2>&1; then
+  # Node >=23.6 strips types by default; 22.6–23.5 needs the flag. Pass it
+  # unconditionally — it is a no-op (with --no-warnings) on versions that
+  # already strip types.
+  exec node --no-warnings --experimental-strip-types "$DRIVER" "$@"
+else
+  echo "nhq-omp-driver: neither bun nor node found on PATH" >&2
+  exit 127
+fi

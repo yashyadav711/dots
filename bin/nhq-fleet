@@ -1,14 +1,33 @@
 #!/usr/bin/env bash
-# nhq-fleet — dashboard of every live NHQ fleet agent.
+# nhq-fleet — NHQ fleet front-door.
 #
-# P2: this is now a thin alias over `nhq-status`, the single fleet-state surface.
+# v0 behavior (UNCHANGED): a thin alias over `nhq-status`, the single fleet-state
+# surface. A bare `nhq-fleet` (or any flag) renders the dashboard:
 #   nhq-fleet            → nhq-status --human   (dashboard + tokens/cost per session)
 #   nhq-fleet --json     → nhq-status --json    (Control Center feed)
-#   nhq-fleet --no-reap  → nhq-status --human --no-reap   (skip the opportunistic reap)
-# nhq-status defaults to --human, so a bare `nhq-fleet` renders the dashboard; an
-# explicit mode flag (e.g. --json) overrides it. All state/repo/usage resolution
-# now lives in nhq-status + nhq-lib (registry + .meta), not here.
+#   nhq-fleet --no-reap  → nhq-status --human --no-reap
+#
+# v1 ADDITIVE (Phase P1): subcommands route to the omp driver. The old kit is
+# untouched — only the bareword subcommands below are intercepted; every flag and
+# the bare invocation still fall through to nhq-status exactly as before.
+#   nhq-fleet spawn <lane> "<task>"   → nhq-omp-driver spawn  (RPC task-spawn one lane)
+#   nhq-fleet kill  <id|lane>         → nhq-omp-driver kill
+#   nhq-fleet driver <args…>          → nhq-omp-driver (passthrough: status/stop/daemon/…)
 set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
-exec "$(dirname "$SELF")/nhq-status" "$@"
+DIR="$(dirname "$SELF")"
+
+case "${1:-}" in
+  spawn|kill)
+    exec "$DIR/nhq-omp-driver" "$@"
+    ;;
+  driver)
+    shift
+    exec "$DIR/nhq-omp-driver" "$@"
+    ;;
+  *)
+    # v0 path, byte-for-byte: alias → nhq-status (defaults to --human).
+    exec "$DIR/nhq-status" "$@"
+    ;;
+esac

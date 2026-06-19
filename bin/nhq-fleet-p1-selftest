@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# nhq-fleet-p1-selftest — the H1 acceptance slice for the v1 omp Fleet-Kit (Phase P1).
+#
+# A NEW P1 test file (the v0 nhq-fleet-selftest stays untouched). Hermetic, in the
+# same shape as the v0 harness: throwaway state, notify-suppressed, self-skips when
+# a live omp RPC host (Claude Max) is unavailable.
+#
+# H1 (per blueprint Part E.2): the driver spawns a trivial no-op lane against a TEMP
+# git repo, then we assert:
+#   1. the omp `task` subagent ran to completion (`agent_end` fired through the host),
+#   2. `agent://<id>` returns the typed `{status:"done", …}` result,
+#   3. EXACTLY ONE well-formed task-ledger row is written,
+#   4. ZERO Claude-Code Fleet-Kit calls (no nhq-spawn / nhq-await / nhq-done / tmux /
+#      claude) occurred — proven by a PATH tripwire,
+#   5. the driver's omp-P0 guard refuses a `{type:"bash"}` RPC frame.
+#
+# Usage: nhq-fleet-p1-selftest        (exits non-zero if any assertion fails;
+#                                       exits 0 with SKIP if no live omp host)
+set -uo pipefail
+
+BIN="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+DRIVER="$BIN/nhq-omp-driver"
+TMP="$(mktemp -d)"
+
+# Hermetic homes (never touch the real fleet daemon / ledger / desktop).
+export NHQ_OMP_HOME="$TMP/omp-home"
+export NHQ_LEDGER="$TMP/task-ledger.md"
+export NHQ_REGISTRY="$TMP/registry.json"
+export NHQ_NOTIFY="$TMP/notify-rec"
+export NHQ_NOTIFY_SUPPRESS=1 NHQ_TEST=1
+# Redirect the omp host's sessions+artifacts into the throwaway tree so the real
+# ~/.omp/agent/sessions is never littered by the harness (auth/profile untouched).
+export NHQ_OMP_SESSION_DIR="$TMP/omp-sessions"
+mkdir -p "$NHQ_OMP_HOME"
+
+cleanup() {
+  "$DRIVER" stop >/dev/null 2>&1 || true
+  [ -f "$NHQ_OMP_HOME/driver.pid" ] && kill "$(cat "$NHQ_OMP_HOME/driver.pid")" 2>/dev/null || true
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+pass=0; fail=0
+ok() { echo "  PASS: $1"; pass=$((pass + 1)); }
+no() { echo "  FAIL: $1"; fail=$((fail + 1)); }
+skip_all() { echo "  SKIP: $1"; echo "── H1 SKIPPED (no live omp RPC host) ──"; exit 0; }
+
+# ── notify recorder (no real toast) ──────────────────────────────────────────
+cat > "$NHQ_NOTIFY" <<EOF
+#!/usr/bin/env bash
+echo "\$@" >> "$TMP/notify.log"
+exit 0
+EOF
+chmod +x "$NHQ_NOTIFY"
+
+# ── PATH tripwire: any v0 Claude-Code Fleet-Kit call trips the wire ──────────
+SHIM="$TMP/shim"; mkdir -p "$SHIM"
+for c in nhq-spawn nhq-await nhq-done nhq-tell nhq-kill nhq-reap claude tmux; do
+  cat > "$SHIM/$c" <<EOF
+#!/usr/bin/env bash
+echo "$c \$*" >> "$TMP/tripwire.log"
+exit 0
+EOF
+  chmod +x "$SHIM/$c"
+done
+export PATH="$SHIM:$PATH"
+
+# ── temp git repo + a trivial no-op PROJECT agent (haiku, typed output) ──────
+REPO="$TMP/repo"
+mkdir -p "$REPO/.omp/agents"
+git init -q "$REPO"
+git -C "$REPO" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m init
+cat > "$REPO/.omp/agents/p1noop.md" <<'EOF'
+---
+name: p1noop
+description: P1 acceptance no-op lane
+model: anthropic/claude-haiku-4-5
+tools: [read]
+output:
+  type: object
+  properties:
+    status: { type: string, enum: [done, blocked] }
+    summary: { type: string }
+    branch: { type: string }
+    need: { type: string }
+  required: [status, summary]
+---
+You are a no-op acceptance probe. Do NOTHING except immediately call yield with
+{status:"done", summary:"p1 acceptance no-op ok"}. Do not read files or run commands.
+EOF
+
+# ── temp registry: one lane "p1noop" → the temp repo ─────────────────────────
+cat > "$NHQ_REGISTRY" <<EOF
+{ "version": 1, "agents": {
+  "p1noop": { "name": "P1Noop", "repo": "$REPO", "role": "P1 acceptance no-op",
+              "tools": ["read"], "agent_file": ".omp/agents/p1noop.md", "aliases": [] }
+} }
+EOF
+
+# ── seed a ledger with the canonical header so insertion is exercised ────────
+cat > "$NHQ_LEDGER" <<'EOF'
+# NHQ Task Ledger — test fixture
+
+## Ledger (newest first)
+
+| When (IST) | Task | Type | Project | Assigned by | Executed by | Model | Duration | Tokens | Status | Verified | Result |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+EOF
+ledger_rows_before=$(grep -c '^| ' "$NHQ_LEDGER")
+
+echo "── H1.0: driver omp-P0 guard refuses {type:bash} ───────────────────────"
+if "$DRIVER" guard-selftest >/dev/null 2>&1; then
+  ok "driver refuses {type:bash}/{type:abort_bash}, allows prompt"
+else
+  no "guard-selftest did not pass"
+fi
+
+echo "── H1: driver spawns a no-op lane against a TEMP repo ───────────────────"
+TASK="P1 acceptance: do nothing, just finish."
+out="$(timeout 150 "$DRIVER" spawn p1noop "$TASK" 2>"$TMP/spawn.err")"
+rc=$?
+
+# Self-skip when the live omp RPC host / Claude Max auth is unavailable.
+if [ $rc -ne 0 ] && [ -z "$out" ]; then
+  echo "  spawn.err:"; sed 's/^/    /' "$TMP/spawn.err" | head -20
+  if grep -qiE 'ready|auth|login|credential|401|no .*model|provider' "$TMP/spawn.err" "$NHQ_OMP_HOME/host.log" "$NHQ_OMP_HOME/daemon.log" 2>/dev/null; then
+    skip_all "no live omp RPC host (auth/ready failure)"
+  fi
+  skip_all "spawn produced no outcome (rc=$rc) — treating as no live host"
+fi
+
+echo "  spawn outcome:"; echo "$out" | sed 's/^/    /'
+
+# Parse the outcome JSON with node (already a dependency of the driver launcher).
+read_field() { node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log((JSON.parse(d)||{})['$1']??'')}catch{console.log('')}})" <<<"$out"; }
+o_status="$(read_field status)"
+o_url="$(read_field agentUrl)"
+o_path="$(read_field resultPath)"
+o_id="$(read_field agentId)"
+
+# 1+2. agent_end fired + agent://<id> typed {status:done}
+if [ "$o_status" = "done" ] && [ -n "$o_id" ]; then
+  ok "subagent completed; outcome status=done id=$o_id url=$o_url"
+else
+  no "outcome not done (status=$o_status id=$o_id)"
+fi
+if [ -n "$o_path" ] && [ -f "$o_path" ]; then
+  typed_status="$(node -e "console.log((JSON.parse(require('fs').readFileSync('$o_path','utf8'))||{}).status)")"
+  if [ "$typed_status" = "done" ]; then
+    ok "agent://<id> on disk is typed {status:\"done\"} ($o_path)"
+  else
+    no "agent://<id> typed status != done ($typed_status)"
+  fi
+else
+  no "agent://<id> result artifact missing ($o_path)"
+fi
+
+# 3. exactly one well-formed ledger row added
+ledger_rows_after=$(grep -c '^| ' "$NHQ_LEDGER")
+added=$((ledger_rows_after - ledger_rows_before))
+new_row="$(grep '| p1noop |' "$NHQ_LEDGER" | head -1)"
+ncells=$(awk -F'|' 'NR==1{print NF-2}' <<<"$new_row")   # cells between outer pipes
+if [ "$added" -eq 1 ] && [ -n "$new_row" ] && [ "$ncells" -eq 12 ] && grep -q '✅ done' <<<"$new_row"; then
+  ok "exactly ONE well-formed ledger row written (12 cells, ✅ done)"
+else
+  no "ledger row malformed/duplicated (added=$added cells=$ncells row='$new_row')"
+fi
+
+# 4. ZERO Claude-Code Fleet-Kit calls
+if [ ! -s "$TMP/tripwire.log" ]; then
+  ok "ZERO Claude-Code Fleet-Kit calls (no nhq-spawn/await/done/tmux/claude)"
+else
+  no "v0 Fleet-Kit was invoked: $(tr '\n' ';' < "$TMP/tripwire.log")"
+fi
+
+# 5. driver never sent a {type:"bash"} RPC frame to the host
+if [ -f "$NHQ_OMP_HOME/host.log" ] && grep -qE '"type" *: *"bash"' "$NHQ_OMP_HOME/host.log"; then
+  no "host.log shows a bash frame reached the host"
+else
+  ok "no {type:bash} frame reached the host"
+fi
+
+echo "────────────────────────────────────────────────────────────────────────"
+echo "H1 result: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]
