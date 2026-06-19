@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# nhq-cap — the v1 capability registry + router (RECOMMEND-ONLY).
+#
+# The deferred v1 "Tools" item (kernel/ROADMAP.md "What is deferred to v1":
+# "full capability-registry.jsonl + nhq-cap router"). Maps a free-text task — or a
+# bare capability type — onto a recommended fleet routing: which agent lane, which
+# model tier (omp modelRoles: smol|default|slow), and which tool posture.
+#
+# RECOMMEND-ONLY, like nhq-econ / routing-policy.json (plan decision D6): nhq-cap
+# never spawns, switches, or downshifts a live agent. It prints a suggestion a human
+# (or nhq-spawn caller) reads. Nothing here is load-bearing on a running session.
+#
+# Registry = JSONL, one routing per line: {type, agent, model_tier, tools, notes}.
+#   • Seed (version-controlled baseline): capability-registry.jsonl beside this script.
+#   • Runtime overlay (user `add`s):      $NHQ_STATE_DIR/capability-registry.jsonl
+#   reads merge seed + overlay; `add` only ever writes the overlay, so the seed stays
+#   pristine and runtime data lives under the same state dir the rest of the kit uses.
+#
+# Usage:
+#   nhq-cap suggest <free-text task or type> [--json]   # best routing + WHY it matched
+#   nhq-cap list [--json]                                # every known routing
+#   nhq-cap add <type> <agent> [--tier T] [--tools X] [--notes "..."]   # append a routing
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+# shellcheck source=/dev/null
+source "$(dirname "$SELF")/nhq-lib.sh"
+
+die() { echo "nhq-cap: $*" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || die "jq not found (install: sudo pacman -S jq)"
+
+# Seed sits beside the real script (resolved through the ~/.local/bin symlink);
+# runtime additions land under the shared state dir. $NHQ_CAP_SEED overrides the
+# seed path for hermetic tests; otherwise it is the committed baseline.
+CAP_SEED="${NHQ_CAP_SEED:-$(dirname "$SELF")/capability-registry.jsonl}"
+CAP_RUNTIME="$NHQ_STATE_DIR/capability-registry.jsonl"
+
+# Stream the merged registry (seed first, then runtime overlay). Missing files are
+# simply skipped, so an empty registry yields no lines (jq -s → []).
+_cap_read() {
+  local f
+  for f in "$CAP_SEED" "$CAP_RUNTIME"; do
+    [[ -f "$f" ]] && cat "$f"
+  done
+  return 0   # never let a missing overlay fail the pipeline under `set -e`
+}
+
+# ── suggest: keyword/substring score over type+notes(+tools), best routing wins ──
+cap_suggest() {
+  local json=0; local -a words=()
+  local a
+  for a in "$@"; do
+    if [[ "$a" == "--json" ]]; then json=1; else words+=("$a"); fi
+  done
+  [[ ${#words[@]} -eq 0 ]] && die "usage: nhq-cap suggest <free-text task or type> [--json]"
+  local query="${words[*]}"
+
+  # Scorer: a query token (≥3 chars) hitting the entry's TYPE scores highest, a type
+  # segment appearing literally in the query scores highest too, notes/tools are weak
+  # signals. Highest score wins; ties break alphabetically by type for determinism.
+  local best
+  best="$(_cap_read | jq -s --arg q "$query" '
+    ($q | ascii_downcase) as $ql
+    | ([ $ql | scan("[a-z0-9]+") ] | map(select(length >= 3)) | unique) as $qtoks
+    | map(
+        . as $e
+        | (($e.type  // "") | ascii_downcase) as $t
+        | (($e.notes // "") | ascii_downcase) as $n
+        | (($e.tools // "") | ascii_downcase) as $w
+        | ([ $t | scan("[a-z0-9]+") ]) as $ttoks
+        | ([ $ttoks[] as $tok | select($ql | contains($tok)) | $tok ]) as $type_in_q
+        | ([ $qtoks[] as $tok | select($t  | contains($tok)) | $tok ]) as $q_in_type
+        | ([ $qtoks[] as $tok | select($n  | contains($tok)) | $tok ]) as $q_in_notes
+        | ([ $qtoks[] as $tok | select($w  | contains($tok)) | $tok ]) as $q_in_tools
+        | ($e + {
+            _score:   (($type_in_q|length)*5 + ($q_in_type|length)*4 + ($q_in_notes|length)*1 + ($q_in_tools|length)*1),
+            _matched: (($type_in_q + $q_in_type + $q_in_notes + $q_in_tools) | unique)
+          })
+      )
+    | map(select(._score > 0))
+    | sort_by([ -(._score), (.type // "") ])
+    | .[0] // null
+  ')"
+
+  # No keyword hit → fall back to the general implementation lane (code-fix).
+  if [[ "$best" == "null" || -z "$best" ]]; then
+    best="$(_cap_read | jq -s '
+      (map(select(.type == "code-fix")) | .[0]
+        // {type:"code-fix", agent:"task", model_tier:"default", tools:"edit", notes:"general implementation lane"})
+      + {_score:0, _matched:[], _fallback:true}
+    ')"
+  fi
+
+  if [[ "$json" == "1" ]]; then
+    jq -n --arg q "$query" --argjson e "$best" '{
+      query:      $q,
+      type:       $e.type,
+      agent:      $e.agent,
+      model_tier: ($e.model_tier // "default"),
+      tools:      ($e.tools // null),
+      notes:      ($e.notes // null),
+      score:      $e._score,
+      matched:    $e._matched,
+      fallback:   ($e._fallback // false)
+    }'
+    return 0
+  fi
+
+  # Human report.
+  local type agent tier tools score fallback matched why
+  type="$(jq -r '.type'                    <<<"$best")"
+  agent="$(jq -r '.agent'                  <<<"$best")"
+  tier="$(jq -r '.model_tier // "default"' <<<"$best")"
+  tools="$(jq -r '.tools // "-"'           <<<"$best")"
+  score="$(jq -r '._score'                 <<<"$best")"
+  fallback="$(jq -r '._fallback // false'  <<<"$best")"
+  matched="$(jq -r '._matched | join(", ")' <<<"$best")"
+  if [[ "$fallback" == "true" ]]; then
+    why="no keyword match — defaulting to the general implementation lane"
+  else
+    why="matched [$matched] (score $score)"
+  fi
+  printf 'suggest: "%s"\n' "$query"
+  printf '  → agent:  %s\n'  "$agent"
+  printf '    tier:   %s\n'  "$tier"
+  printf '    tools:  %s\n'  "$tools"
+  printf '    type:   %s\n'  "$type"
+  printf '    why:    %s\n'  "$why"
+}
+
+# ── list: every known routing ────────────────────────────────────────────────
+cap_list() {
+  local json=0; [[ "${1:-}" == "--json" ]] && json=1
+  if [[ "$json" == "1" ]]; then
+    _cap_read | jq -s '.'
+    return 0
+  fi
+  printf '%-16s   %-10s %-8s %-12s %s\n' TYPE AGENT TIER TOOLS NOTES
+  local type agent tier tools notes
+  while IFS=$'\t' read -r type agent tier tools notes; do
+    [[ -z "$type" ]] && continue
+    printf '%-16s → %-10s %-8s %-12s %s\n' "$type" "$agent" "$tier" "$tools" "$notes"
+  done < <(_cap_read | jq -r '[.type, .agent, (.model_tier // "default"), (.tools // "-"), (.notes // "")] | @tsv')
+}
+
+# ── add: append a routing to the RUNTIME overlay (never the seed) ─────────────
+cap_add() {
+  local type="${1:-}" agent="${2:-}"
+  [[ -z "$type" || -z "$agent" ]] && die "usage: nhq-cap add <type> <agent> [--tier T] [--tools X] [--notes \"...\"]"
+  shift 2
+  local tier="default" tools="" notes=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tier)  tier="${2:-}";  shift 2 ;;
+      --tools) tools="${2:-}"; shift 2 ;;
+      --notes) notes="${2:-}"; shift 2 ;;
+      *) die "add: unknown flag '$1' (want --tier|--tools|--notes)" ;;
+    esac
+  done
+
+  nhq_ensure_state_dir
+  local line
+  line="$(jq -nc --arg type "$type" --arg agent "$agent" --arg tier "$tier" \
+             --arg tools "$tools" --arg notes "$notes" \
+             '{type:$type, agent:$agent, model_tier:$tier, tools:$tools, notes:$notes}')"
+  printf '%s\n' "$line" >> "$CAP_RUNTIME"
+  echo "nhq-cap: added $type → $agent (tier $tier) to $CAP_RUNTIME"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  suggest) cap_suggest "$@" ;;
+  list)    cap_list "$@" ;;
+  add)     cap_add "$@" ;;
+  ""|-h|--help|help) sed -n '2,21p' "$SELF" ;;
+  *) die "unknown command '$cmd' (want: suggest|list|add)" ;;
+esac
