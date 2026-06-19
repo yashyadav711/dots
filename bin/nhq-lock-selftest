@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# nhq-lock-selftest — proves the per-path advisory write-lock end to end:
+#   1. acquire a free path                         → succeeds (exit 0), lock written
+#   2. a DIFFERENT live holder acquires same path  → fails (exit 1), names the holder
+#   3. the holder releases it                       → now free
+#   4. acquire again                                → succeeds (held-by-dead-pid not in play)
+#   5. an EXPIRED lock                              → status shows STALE → reap removes it
+#   6. a DEAD-PID lock                              → status shows STALE → reap removes it
+#
+# Hermetic: runs entirely against a throwaway $NHQ_STATE_DIR; never touches ~/.nhq-fleet.
+# Usage: nhq-lock-selftest        (prints PASS/FAIL per check; exit 0 all-pass / 1 any-fail)
+set -uo pipefail
+
+BIN="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+LOCK="$BIN/nhq-lock"
+
+TMP="$(mktemp -d)"
+export NHQ_STATE_DIR="$TMP/state"
+mkdir -p "$NHQ_STATE_DIR"
+
+# A real, live process to stand in for "another agent still working".
+sleep 600 & LIVE_PID=$!
+trap 'kill "$LIVE_PID" 2>/dev/null || true; rm -rf "$TMP"' EXIT
+
+pass=0; fail=0
+ok() { echo "  PASS: $1"; pass=$((pass + 1)); }
+no() { echo "  FAIL: $1"; fail=$((fail + 1)); }
+
+P="$TMP/shared/file.txt"   # a path that does not even exist yet (lock is path-keyed)
+ABS="$(realpath -m -- "$P")"
+KEY="$(printf '%s' "$ABS" | sha1sum | cut -d' ' -f1)"
+LF="$NHQ_STATE_DIR/locks/$KEY.json"
+
+echo "── 1. acquire a free path ──────────────────────────────────────────────"
+if NHQ_AGENT=alice NHQ_LOCK_PID="$LIVE_PID" "$LOCK" acquire "$P" >/dev/null 2>&1; then
+  ok "free path acquired (exit 0)"
+else
+  no "free path acquire failed"
+fi
+if [[ -f "$LF" ]] && [[ "$(jq -r .holder "$LF")" == "alice" ]]; then
+  ok "lock file written, keyed by sha1(abspath), holder=alice"
+else
+  no "lock file missing or wrong holder"
+fi
+
+echo "── 2. a different LIVE holder tries the same path ───────────────────────"
+out="$(NHQ_AGENT=bob NHQ_LOCK_PID=$$ "$LOCK" acquire "$P" 2>&1)"; rc=$?
+if (( rc == 1 )); then ok "second acquire failed with exit 1"; else no "second acquire exit was $rc (want 1)"; fi
+if grep -q "held by alice" <<<"$out"; then ok "conflict message names the holder (alice)"; else no "conflict message did not name the holder: $out"; fi
+if [[ "$(jq -r .holder "$LF")" == "alice" ]]; then ok "lock unchanged — still alice's"; else no "lock was clobbered by the loser"; fi
+
+echo "── 3. the holder releases ───────────────────────────────────────────────"
+if NHQ_AGENT=alice "$LOCK" release "$P" >/dev/null 2>&1 && [[ ! -f "$LF" ]]; then
+  ok "release by holder removed the lock"
+else
+  no "release by holder did not remove the lock"
+fi
+
+echo "── 3b. a non-holder cannot release (sanity) ────────────────────────────"
+NHQ_AGENT=alice NHQ_LOCK_PID="$LIVE_PID" "$LOCK" acquire "$P" >/dev/null 2>&1
+if NHQ_AGENT=bob "$LOCK" release "$P" >/dev/null 2>&1; then
+  no "non-holder release wrongly succeeded"
+else
+  [[ -f "$LF" ]] && ok "non-holder release refused (exit 1), lock survives" || no "non-holder release removed the lock"
+fi
+# --force lets a non-holder break it
+if NHQ_AGENT=bob "$LOCK" release "$P" --force >/dev/null 2>&1 && [[ ! -f "$LF" ]]; then
+  ok "--force release by non-holder removed the lock"
+else
+  no "--force release did not remove the lock"
+fi
+
+echo "── 4. path is acquirable again after release ───────────────────────────"
+if NHQ_AGENT=carol NHQ_LOCK_PID="$LIVE_PID" "$LOCK" acquire "$P" >/dev/null 2>&1 \
+   && [[ "$(jq -r .holder "$LF")" == "carol" ]]; then
+  ok "released path re-acquired by a new holder"
+else
+  no "released path was not re-acquirable"
+fi
+NHQ_AGENT=carol "$LOCK" release "$P" >/dev/null 2>&1 || true
+
+echo "── 5. an EXPIRED lock is stale → reap removes it ───────────────────────"
+EP="$TMP/expired-target"; EABS="$(realpath -m -- "$EP")"
+EKEY="$(printf '%s' "$EABS" | sha1sum | cut -d' ' -f1)"; EF="$NHQ_STATE_DIR/locks/$EKEY.json"
+NOW="$(date +%s)"
+jq -n --arg path "$EABS" --argjson pid "$LIVE_PID" \
+      --argjson acq "$((NOW - 4000))" --argjson exp "$((NOW - 100))" \
+      '{path:$path, holder:"ghost", pid:$pid, acquired_at:$acq, expires_at:$exp}' > "$EF"
+st="$("$LOCK" status "$EP" 2>&1)"
+if grep -q "STALE" <<<"$st"; then ok "expired lock reported STALE by status"; else no "expired lock not STALE: $st"; fi
+# status --json marks expired:true
+if [[ "$("$LOCK" status "$EP" --json | jq -r '.[0].expired')" == "true" ]]; then
+  ok "status --json flags expired:true"
+else
+  no "status --json did not flag expired"
+fi
+out="$("$LOCK" reap 2>&1)"
+if grep -qE "reaped [1-9][0-9]* stale" <<<"$out" && [[ ! -f "$EF" ]]; then
+  ok "reap removed the expired lock ($out)"
+else
+  no "reap did not remove the expired lock ($out)"
+fi
+
+echo "── 6. a DEAD-PID lock is stale → reap removes it ───────────────────────"
+DP="$TMP/dead-target"; DABS="$(realpath -m -- "$DP")"
+DKEY="$(printf '%s' "$DABS" | sha1sum | cut -d' ' -f1)"; DF="$NHQ_STATE_DIR/locks/$DKEY.json"
+# Spawn + reap a child so its pid is guaranteed dead (not just "probably unused").
+sleep 0.01 & DEAD_PID=$!; wait "$DEAD_PID" 2>/dev/null || true
+NOW="$(date +%s)"
+jq -n --arg path "$DABS" --argjson pid "$DEAD_PID" \
+      --argjson acq "$NOW" --argjson exp "$((NOW + 9000))" \
+      '{path:$path, holder:"crashed", pid:$pid, acquired_at:$acq, expires_at:$exp}' > "$DF"
+st="$("$LOCK" status "$DP" 2>&1)"
+if grep -q "STALE" <<<"$st"; then ok "dead-pid lock (unexpired) reported STALE"; else no "dead-pid lock not STALE: $st"; fi
+# A dead-pid lock is reclaimable: a fresh acquire must succeed over it.
+if NHQ_AGENT=dave NHQ_LOCK_PID="$LIVE_PID" "$LOCK" acquire "$DP" >/dev/null 2>&1 \
+   && [[ "$(jq -r .holder "$DF")" == "dave" ]]; then
+  ok "acquire reclaimed a dead-pid lock"
+else
+  no "acquire did not reclaim the dead-pid lock"
+fi
+
+echo "── 7. status of an unlocked path / empty board ─────────────────────────"
+NHQ_AGENT=dave "$LOCK" release "$DP" >/dev/null 2>&1 || true
+if grep -q "no locks held" <<<"$("$LOCK" status 2>&1)"; then ok "empty board reports 'no locks held'"; else no "empty board message wrong"; fi
+if [[ "$("$LOCK" status --json)" == "[]" ]]; then ok "empty board --json is []"; else no "empty board --json not []"; fi
+
+echo
+echo "── summary ──────────────────────────────────────────────────────────────"
+echo "  $pass passed, $fail failed"
+if (( fail == 0 )); then echo "nhq-lock-selftest: PASS"; exit 0; else echo "nhq-lock-selftest: FAIL"; exit 1; fi
