@@ -49,6 +49,52 @@ else
   MSG="<span size='200%' foreground='#ffffff'><b>$TITLE</b></span>"
 fi
 
-notify-send "Claude Code" "$MSG" \
-  --urgency=normal --expire-time="$T" \
-  --hint string:frcolor:"$FR" -i "$IC"
+# ── Session-bus / display recovery ────────────────────────────────────────────
+# Fleet notifications fire from detached pollers (nhq-await's setsid poller),
+# long-lived daemons (nhq-warden, claude-oom-guard), cron, and hook subprocesses
+# whose environment was stripped of the user session vars. With no session bus
+# (and no display for D-Bus autolaunch) notify-send dies "Cannot autolaunch D-Bus
+# without X11 $DISPLAY" and the toast silently never reaches Yash — every caller
+# swallows the failure with `2>/dev/null || true`. Re-establish the session vars
+# deterministically so the notifier works no matter who invoked it.
+uid="$(id -u)"
+: "${XDG_RUNTIME_DIR:=/run/user/$uid}"; export XDG_RUNTIME_DIR
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
+# Still missing a bus or any display? Harvest the real values from the running
+# dunst process (same user) — by definition it is already wired to the live
+# graphical session we want the toast to land on.
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] || { [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; }; then
+  for pid in $(pgrep -u "$uid" -x dunst 2>/dev/null); do
+    [ -r "/proc/$pid/environ" ] || continue
+    while IFS= read -r -d '' kv; do
+      case "$kv" in
+        DBUS_SESSION_BUS_ADDRESS=*) [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && export "$kv" ;;
+        DISPLAY=*)                  [ -z "${DISPLAY:-}" ]                  && export "$kv" ;;
+        WAYLAND_DISPLAY=*)          [ -z "${WAYLAND_DISPLAY:-}" ]          && export "$kv" ;;
+      esac
+    done < "/proc/$pid/environ"
+    break
+  done
+fi
+
+# Fire the toast. notify-send (libnotify, honored by dunst) is primary; if it
+# fails, fall back to dunstify directly. Log a failed delivery so a silent miss is
+# diagnosable instead of vanishing into the callers' `2>/dev/null`.
+NOTIFY_LOG="${NHQ_NOTIFY_LOG:-$XDG_RUNTIME_DIR/nhq-notify.log}"
+if notify-send "Claude Code" "$MSG" \
+     --urgency=normal --expire-time="$T" \
+     --hint string:frcolor:"$FR" -i "$IC" 2>>"$NOTIFY_LOG"; then
+  exit 0
+fi
+if command -v dunstify >/dev/null 2>&1 && \
+   dunstify -a "Claude Code" -u normal -t "$T" \
+     -h string:frcolor:"$FR" -i "$IC" "Claude Code" "$MSG" 2>>"$NOTIFY_LOG"; then
+  exit 0
+fi
+printf '%s nhq-notify FAILED type=%s title=%q (bus=%s display=%s/%s)\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TYPE" "$TITLE" \
+  "${DBUS_SESSION_BUS_ADDRESS:-unset}" "${DISPLAY:-unset}" "${WAYLAND_DISPLAY:-unset}" \
+  >>"$NOTIFY_LOG"
+exit 1
