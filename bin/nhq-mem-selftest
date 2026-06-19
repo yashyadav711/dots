@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# nhq-mem-selftest — hermetic acceptance test for nhq-mem (the v1 fact store).
+#
+# Uses a throwaway NHQ_FLEET_HOME (mktemp -d) so the real ~/.nhq-fleet is NEVER
+# touched. Exercises the full contract: add→get(value + hits++)→upsert(in place,
+# no dupes, created_at preserved)→scope isolation(global vs session)→list filter→
+# rm→distill(prunes stale hits=0, keeps fresh + read, collapses dupes). PASS/FAIL
+# summary; exits 0 on pass / 1 on fail.
+set -uo pipefail
+
+BIN="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+MEM="$BIN/nhq-mem"
+
+TMP="$(mktemp -d)"
+export NHQ_FLEET_HOME="$TMP"
+export NHQ_AGENT="selftest-agent"          # session identity for session-scoped facts
+unset NHQ_SESSION TMUX 2>/dev/null || true
+FACTS="$TMP/facts.jsonl"
+
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT
+
+pass=0; fail=0
+ok() { echo "  PASS: $1"; pass=$((pass + 1)); }
+no() { echo "  FAIL: $1"; fail=$((fail + 1)); }
+
+command -v jq >/dev/null 2>&1 || { echo "nhq-mem-selftest: jq not found"; exit 1; }
+
+# Convenience: pull a single scalar field of the first matching record from the store.
+field() { jq -s -r --arg k "$2" --arg s "$3" \
+  "[.[] | select(.key==\$k and .scope==\$s)][0].$1 // empty" "$FACTS"; }
+count() { jq -s --arg k "$1" '[.[] | select(.key==$k)] | length' "$FACTS"; }
+
+echo "── nhq-mem selftest (NHQ_FLEET_HOME=$TMP) ───────────────────────────────"
+
+# 1. add → get returns the value
+"$MEM" add greeting "hello world" >/dev/null
+v="$("$MEM" get greeting)"
+[ "$v" = "hello world" ] && ok "add→get returns the stored value" || no "get returned '$v' (expected 'hello world')"
+
+# 2. get increments hits (one get in T1 + this one = 2)
+"$MEM" get greeting >/dev/null
+h="$(field hits greeting global)"
+[ "$h" = "2" ] && ok "get increments hits (=2 after 2 reads)" || no "hits=$h (expected 2)"
+
+# 3. upsert: same (scope,key) updates in place — no dupe, created_at kept, updated_at bumped
+ca1="$(field created_at greeting global)"
+ua1="$(field updated_at greeting global)"
+sleep 1
+"$MEM" add greeting "hola mundo" >/dev/null
+c="$(count greeting)"; v2="$("$MEM" get greeting)"
+ca2="$(field created_at greeting global)"; ua2="$(field updated_at greeting global)"
+{ [ "$c" = "1" ] && [ "$v2" = "hola mundo" ]; } && ok "upsert updates in place (1 record, new value)" || no "upsert: count=$c value='$v2'"
+[ "$ca1" = "$ca2" ] && ok "upsert preserves created_at" || no "created_at changed ($ca1 → $ca2)"
+[ "$ua1" != "$ua2" ] && ok "upsert bumps updated_at" || no "updated_at unchanged ($ua1)"
+
+# 4. scope isolation: global vs session hold distinct values for the same key
+"$MEM" add token "GLOBAL-VAL"  --scope global  >/dev/null
+"$MEM" add token "SESSION-VAL" --scope session >/dev/null
+g="$("$MEM" get token --scope global)"
+s="$("$MEM" get token --scope session)"
+{ [ "$g" = "GLOBAL-VAL" ] && [ "$s" = "SESSION-VAL" ]; } && ok "scope isolation (global vs session distinct)" || no "scope leak: g='$g' s='$s'"
+[ "$(count token)" = "2" ] && ok "same key in 2 scopes → 2 records" || no "expected 2 'token' records, got $(count token)"
+sf="$(field session token session)"
+[ "$sf" = "selftest-agent" ] && ok "session fact keyed off \$NHQ_AGENT" || no "session field='$sf' (expected selftest-agent)"
+
+# 5. list filters by --tag and by --scope
+"$MEM" add red  apple --tag fruit >/dev/null
+"$MEM" add blue sky   --tag color >/dev/null
+ft="$("$MEM" list --tag fruit --json)"
+{ [ "$(jq 'length' <<<"$ft")" = "1" ] && [ "$(jq -r '.[0].key' <<<"$ft")" = "red" ]; } \
+  && ok "list --tag filters to the tagged fact" || no "list --tag: $(jq -c . <<<"$ft")"
+sn="$("$MEM" list --scope session --json | jq 'length')"
+[ "$sn" = "1" ] && ok "list --scope session shows only session facts" || no "list --scope session count=$sn (expected 1)"
+
+# 6. rm deletes the fact; rm of a missing key fails loudly
+"$MEM" rm red >/dev/null
+[ "$(count red)" = "0" ] && ok "rm deletes the fact" || no "rm left $(count red) record(s)"
+if "$MEM" rm nope >/dev/null 2>&1; then no "rm of nonexistent key should exit nonzero"; else ok "rm of nonexistent key exits nonzero"; fi
+
+# 7. distill: collapse dupes (keep latest), prune stale hits=0, keep fresh + stale-but-read
+old="$(date -u -d '40 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+fresh="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+emit() { printf '{"id":"%s","key":"%s","value":"%s","scope":"global","session":"","tag":"","created_at":"%s","updated_at":"%s","hits":%s}\n' "$@" >> "$FACTS"; }
+emit stale01     stale     x "$old"   "$old"   0    # stale + unread  → PRUNE
+emit staleread01 staleread y "$old"   "$old"   3    # stale + read    → KEEP
+emit fresh01     freshk    z "$fresh" "$fresh" 0    # fresh + unread  → KEEP
+emit dupid       dup       old "$fresh" "2026-06-19T00:00:00Z" 1   # duplicate id, older
+emit dupid       dup       new "$fresh" "2026-06-19T12:00:00Z" 2   # duplicate id, newer → wins
+
+out="$("$MEM" distill --days 30)"
+[ "$(count stale)" = "0" ]     && ok "distill prunes stale hits=0 entry" || no "stale not pruned (count=$(count stale))"
+[ "$(count staleread)" = "1" ] && ok "distill keeps stale-but-read (hits>0) entry" || no "stale-but-read was pruned"
+[ "$(count freshk)" = "1" ]    && ok "distill keeps fresh entry" || no "fresh entry was pruned"
+{ [ "$(count dup)" = "1" ] && [ "$(field value dup global)" = "new" ]; } \
+  && ok "distill collapses dupes keeping the latest" || no "dedup: count=$(count dup) value='$(field value dup global)'"
+grep -q "pruned 1 stale" <<<"$out" && ok "distill reports the prune count" || no "distill report missing prune count: $out"
+
+echo "────────────────────────────────────────────────────────────────────────"
+echo "nhq-mem selftest: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

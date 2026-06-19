@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# nhq-mem — durable fact store for the NHQ Fleet (the v1 "facts.jsonl + distill +
+# decay" memory layer; the vector index stays parked).
+#
+# A laptop-safe, daemon-free episodic→semantic memory: one JSON object per line in
+# ${NHQ_FLEET_HOME:-${NHQ_STATE_DIR:-~/.nhq-fleet}}/facts.jsonl. Facts are scoped
+# global (durable, cross-session) or session (keyed off $NHQ_AGENT / the current
+# .meta session). `distill` is the decay step: collapse duplicate keys keeping the
+# latest, and prune never-read (hits=0) entries older than N days.
+#
+# Record schema (one JSON object per line):
+#   {id,key,value,scope,session,tag,created_at,updated_at,hits}
+#   id = sha1("scope|session|key")[:16] — the stable (scope,session,key) UPSERT key.
+#
+# Usage:
+#   nhq-mem add  <key> <value> [--scope global|session] [--tag T]   # UPSERT on (scope,key)
+#   nhq-mem get  <key> [--scope global|session]                     # print value, hits++
+#   nhq-mem list [--scope S] [--tag T] [--json]
+#   nhq-mem rm   <key> [--scope global|session]
+#   nhq-mem distill [--days N]                                       # default N=30
+#
+# Mirrors nhq-lib.sh / nhq-meta conventions: jq-backed JSONL, atomic tmpfile+mv
+# writes, ISO-8601 UTC timestamps. Sources nhq-lib.sh only for NHQ_STATE_DIR parity.
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+# shellcheck source=/dev/null
+source "$(dirname "$SELF")/nhq-lib.sh" 2>/dev/null || true
+
+die() { echo "nhq-mem: $*" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || die "jq not found (install: sudo pacman -S jq)"
+
+# State home: honor NHQ_FLEET_HOME (the v1 spec + selftest) first, then the real
+# kit's NHQ_STATE_DIR, then the shared default — so facts.jsonl lands beside the
+# rest of the fleet state regardless of which var a caller exports.
+MEM_HOME="${NHQ_FLEET_HOME:-${NHQ_STATE_DIR:-$HOME/.nhq-fleet}}"
+FACTS="$MEM_HOME/facts.jsonl"
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Session identity for session-scoped facts: $NHQ_AGENT → $NHQ_SESSION → tmux #S.
+mem_session() {
+  if [[ -n "${NHQ_AGENT:-}" ]];   then printf '%s' "$NHQ_AGENT";   return 0; fi
+  if [[ -n "${NHQ_SESSION:-}" ]]; then printf '%s' "$NHQ_SESSION"; return 0; fi
+  if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    local s; s="$(tmux display-message -p '#S' 2>/dev/null || true)"
+    [[ -n "$s" ]] && { printf '%s' "$s"; return 0; }
+  fi
+  printf ''
+}
+
+# Resolve a --scope value into "scope<TAB>session". global → session=""; session →
+# the current session id (die if there is none). Anything else is rejected.
+resolve_scope() {
+  local scope="${1:-global}" sess=""
+  case "$scope" in
+    global) sess="" ;;
+    session)
+      sess="$(mem_session)"
+      [[ -z "$sess" ]] && die "session scope needs a session (set NHQ_AGENT or NHQ_SESSION)"
+      ;;
+    *) die "invalid --scope '$scope' (want: global|session)" ;;
+  esac
+  printf '%s\t%s' "$scope" "$sess"
+}
+
+# Stable UPSERT key: same (scope,session,key) → same id across re-adds.
+fact_id() { printf '%s' "$1|$2|$3" | sha1sum | cut -c1-16; }
+
+ensure_store() { mkdir -p "$MEM_HOME" 2>/dev/null || true; [[ -f "$FACTS" ]] || : > "$FACTS"; }
+
+# Slurp the whole store as one JSON array (empty/missing store → []).
+load_all() { ensure_store; jq -s '.' "$FACTS"; }
+
+# Atomically replace the store from a JSON array on stdin (→ one JSON object/line).
+save_all() {
+  ensure_store
+  local tmp; tmp="$(mktemp "${FACTS}.XXXXXX")"
+  if jq -c '.[]' > "$tmp"; then
+    mv -f "$tmp" "$FACTS"
+  else
+    rm -f "$tmp"; die "store write failed"
+  fi
+}
+
+cmd_add() {
+  local scope="global" tag="" hastag=0; local -a pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scope) scope="${2:-}"; shift 2 ;;
+      --tag)   tag="${2:-}"; hastag=1; shift 2 ;;
+      --*)     die "add: unknown flag '$1'" ;;
+      *)       pos+=("$1"); shift ;;
+    esac
+  done
+  [[ ${#pos[@]} -ge 2 ]] || die "usage: nhq-mem add <key> <value> [--scope global|session] [--tag T]"
+  local key="${pos[0]}" val="${pos[1]}"
+  local sc; sc="$(resolve_scope "$scope")"; scope="${sc%%$'\t'*}"; local sess="${sc#*$'\t'}"
+  local id; id="$(fact_id "$scope" "$sess" "$key")"
+  local now; now="$(now_iso)"
+  load_all | jq \
+    --arg id "$id" --arg key "$key" --arg val "$val" --arg scope "$scope" \
+    --arg sess "$sess" --arg tag "$tag" --argjson hastag "$hastag" --arg now "$now" '
+    (map(.id) | index($id)) as $i
+    | if $i == null then
+        . + [{id:$id, key:$key, value:$val, scope:$scope, session:$sess,
+              tag:$tag, created_at:$now, updated_at:$now, hits:0}]
+      else
+        .[$i] |= (.value = $val | .updated_at = $now
+                  | (if $hastag == 1 then .tag = $tag else . end))
+      end
+  ' | save_all
+  echo "nhq-mem: $key = $val  [$scope${sess:+/$sess}${tag:+ #$tag}]"
+}
+
+cmd_get() {
+  local scope="global"; local -a pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scope) scope="${2:-}"; shift 2 ;;
+      --*)     die "get: unknown flag '$1'" ;;
+      *)       pos+=("$1"); shift ;;
+    esac
+  done
+  local key="${pos[0]:-}"; [[ -n "$key" ]] || die "usage: nhq-mem get <key> [--scope global|session]"
+  local sc; sc="$(resolve_scope "$scope")"; scope="${sc%%$'\t'*}"; local sess="${sc#*$'\t'}"
+  local id; id="$(fact_id "$scope" "$sess" "$key")"
+  local all; all="$(load_all)"
+  local found; found="$(jq --arg id "$id" 'any(.[]; .id == $id)' <<<"$all")"
+  [[ "$found" == "true" ]] || die "no fact '$key' in scope $scope${sess:+/$sess}"
+  local val; val="$(jq -r --arg id "$id" 'map(select(.id == $id))[0].value' <<<"$all")"
+  jq --arg id "$id" 'map(if .id == $id then .hits += 1 else . end)' <<<"$all" | save_all
+  printf '%s\n' "$val"
+}
+
+cmd_list() {
+  local scope="" tag="" asjson=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scope) scope="${2:-}"; shift 2 ;;
+      --tag)   tag="${2:-}"; shift 2 ;;
+      --json)  asjson=1; shift ;;
+      *)       die "list: unknown arg '$1'" ;;
+    esac
+  done
+  local sess=""
+  case "$scope" in
+    "") ;;
+    global) ;;
+    session) sess="$(mem_session)"; [[ -z "$sess" ]] && die "session scope needs a session (set NHQ_AGENT)" ;;
+    *) die "invalid --scope '$scope' (want: global|session)" ;;
+  esac
+  local filtered
+  filtered="$(load_all | jq --arg scope "$scope" --arg sess "$sess" --arg tag "$tag" '
+    map(select(($scope == "") or (.scope == $scope and ($scope != "session" or .session == $sess))))
+    | map(select(($tag == "") or (.tag == $tag)))
+    | sort_by(.scope, .session, .key)
+  ')"
+  if [[ "$asjson" == "1" ]]; then jq '.' <<<"$filtered"; return 0; fi
+  local n; n="$(jq 'length' <<<"$filtered")"
+  [[ "$n" -eq 0 ]] && { echo "nhq-mem: (no facts)"; return 0; }
+  jq -r '.[] | "[\(.scope)\(if .session != "" then "/" + .session else "" end)] \(.key) = \(.value)  (\(if .tag != "" then "#" + .tag + ", " else "" end)hits=\(.hits))"' <<<"$filtered"
+}
+
+cmd_rm() {
+  local scope="global"; local -a pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scope) scope="${2:-}"; shift 2 ;;
+      --*)     die "rm: unknown flag '$1'" ;;
+      *)       pos+=("$1"); shift ;;
+    esac
+  done
+  local key="${pos[0]:-}"; [[ -n "$key" ]] || die "usage: nhq-mem rm <key> [--scope global|session]"
+  local sc; sc="$(resolve_scope "$scope")"; scope="${sc%%$'\t'*}"; local sess="${sc#*$'\t'}"
+  local id; id="$(fact_id "$scope" "$sess" "$key")"
+  local all; all="$(load_all)"
+  local found; found="$(jq --arg id "$id" 'any(.[]; .id == $id)' <<<"$all")"
+  [[ "$found" == "true" ]] || die "no fact '$key' in scope $scope${sess:+/$sess}"
+  jq --arg id "$id" 'map(select(.id != $id))' <<<"$all" | save_all
+  echo "nhq-mem: removed $key [$scope${sess:+/$sess}]"
+}
+
+cmd_distill() {
+  local days=30
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --days) days="${2:-}"; shift 2 ;;
+      *)      die "distill: unknown arg '$1'" ;;
+    esac
+  done
+  [[ "$days" =~ ^[0-9]+$ ]] || die "--days must be a non-negative integer"
+  local cutoff; cutoff="$(date -u -d "$days days ago" +%s)"
+  local result
+  result="$(load_all | jq --argjson cutoff "$cutoff" '
+    . as $all
+    # episodic→semantic: collapse duplicate keys keeping the latest updated_at.
+    | ($all | group_by(.id) | map(max_by(.updated_at))) as $dedup
+    | {
+        collapsed: (($all | length) - ($dedup | length)),
+        kept:      ($dedup | map(select((.hits != 0) or ((.updated_at | fromdateiso8601) >= $cutoff)))),
+        pruned:    ($dedup | map(select((.hits == 0) and ((.updated_at | fromdateiso8601) <  $cutoff))))
+      }
+  ')"
+  jq '.kept' <<<"$result" | save_all
+  local collapsed pruned_n
+  collapsed="$(jq '.collapsed' <<<"$result")"
+  pruned_n="$(jq '.pruned | length' <<<"$result")"
+  echo "nhq-mem distill: collapsed $collapsed duplicate(s), pruned $pruned_n stale (hits=0, >${days}d):"
+  jq -r '.pruned[] | "  - pruned \(.key) [\(.scope)\(if .session != "" then "/" + .session else "" end)] updated \(.updated_at) hits=\(.hits)"' <<<"$result"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  add)     cmd_add     "$@" ;;
+  get)     cmd_get     "$@" ;;
+  list)    cmd_list    "$@" ;;
+  rm)      cmd_rm      "$@" ;;
+  distill) cmd_distill "$@" ;;
+  ""|-h|--help|help) sed -n '2,23p' "$SELF" ;;
+  *) die "unknown command '$cmd' (want: add|get|list|rm|distill)" ;;
+esac
