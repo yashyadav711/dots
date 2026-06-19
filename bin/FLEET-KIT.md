@@ -134,3 +134,17 @@ systemctl --user daemon-reload && systemctl --user enable --now nhq-reap.timer
 
 - `NHQ_STATE_DIR` — state dir (default `~/.nhq-fleet`).
 - `NHQ_IDLE_KILL_MIN` — idle minutes before reap (default 20).
+
+## v1 additions (deferred-from-v0 layer — built 2026-06-19)
+
+Five new self-contained tools (all bash + jq, laptop-safe, hermetic selftests). State under `${NHQ_STATE_DIR:-~/.nhq-fleet}`. Each ships a `nhq-<x>-selftest`.
+
+| Command | What it does |
+|---|---|
+| `nhq-mem add\|get\|list\|rm\|distill` | Durable fact store (`facts.jsonl`). UPSERT on (scope,key); `--scope global\|session`, `--tag`; `distill` collapses dupes + prunes stale (hits=0, >N days). The deferred memory substrate (vector index still parked). |
+| `nhq-lock acquire\|release\|status\|reap <path>` | Per-path advisory write-lock so concurrent agents don't collide on a file/dir (the stacked-worktree race). Holder+pid+ttl; reclaimable on expiry or dead pid. |
+| `nhq-goal set\|check\|list\|clear <session>` | Per-session token/$ budget guard. OBSERVE+WARN only (never kills): `check` reads real spend (nhq-cost/.meta) → ok / warn(≥80%) / exceeded(≥100%, exit 1). |
+| `nhq-cap suggest\|list\|add <task>` | Capability registry (`capability-registry.jsonl`) + router. `suggest` maps a task → recommended agent/model-tier/tools (recommend-only, per D6). |
+| `nhq-fleet-golden [--list]` | Hermetic golden-scenario runner asserting the six v0 acceptance criteria end-to-end with no real agent spawn. `GOLDEN: N/N passed`, exit 0/1. |
+
+Selftest sweep (integrated `feat/aos-v1`): nhq-mem 17/17 · nhq-lock 16/16 · nhq-goal 16/16 · nhq-cap 15/15 · nhq-fleet-golden 5/5. Purely additive — no existing kit file modified.
