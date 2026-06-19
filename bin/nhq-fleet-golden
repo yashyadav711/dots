@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# nhq-fleet-golden — the v0-acceptance GOLDEN-SCENARIO auto-runner (deferred-to-v1).
+#
+# Drives the EXISTING, proven v0 Fleet Kit through ROADMAP.md's six acceptance
+# criteria end-to-end, as named scenarios, WITHOUT spawning a single real agent.
+# It fabricates the side a live agent would produce — session `.meta` records,
+# fleet-registry rows, git commits, JSONL transcripts, done-markers — directly,
+# then drives the read-side tools (nhq-status / nhq-meta / nhq-cost / nhq-warden)
+# against those fixtures and asserts the truth they report.
+#
+# This is the "golden-scenario auto-runner" the v0 plan deferred to v1 (ROADMAP.md
+# §"deferred to v1") plus the v0-acceptance live harness (ROADMAP.md §"Closing
+# verification"), made hermetic + laptop-safe: pure bash + jq (+ python3 for the
+# warden one-shot, + git for commit-advance fixtures), a throwaway state dir, NO
+# real claude/LLM, NO network, NO tmux requirement, NO background daemon. It never
+# touches the real ~/.nhq-fleet and fires no desktop toast.
+#
+# Scenario → ROADMAP v0 acceptance criterion:
+#   truth            → "Fleet tells the truth."           (status from artifacts, no memory)
+#   silent-complete  → "Silent-complete caught mechanically." (warden flags committed-but-no-done)
+#   spawn-recorded   → "Every spawn is identified and recorded." (.meta + task-ledger row)
+#   no-regression    → "No regression to the proven Fleet Kit." (read tools run clean on fixtures)
+#   laptop-safe      → "Laptop-safe."                     (no daemon required; runner spawns none)
+#
+# (The sixth criterion, "The irreversible is gated", is the P4 safety surface — it
+# is exhaustively covered by nhq-fleet-selftest's P4/SEC blocks, not re-driven here:
+# this runner is the OBSERVABILITY/SUPERVISION acceptance harness. Noted, not faked.)
+#
+# Mirrors nhq-fleet-selftest's helper style (ok/no/eq, mktemp temp dirs, NHQ_NOTIFY
+# stub) so the two read as one family.
+#
+# Usage:
+#   nhq-fleet-golden            run every scenario; print "GOLDEN: N/N passed";
+#                               exit 0 iff all pass, 1 if any fail
+#   nhq-fleet-golden --list     name the scenarios (no run, no temp dirs)
+set -uo pipefail
+
+BIN="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+
+# Scenario registry: "key|description|function". Pipe-delimited; descriptions hold
+# no pipes. The single source of truth for both --list and the run loop.
+SCENARIOS=(
+  "truth|fleet tells the truth — status reflects fabricated artifacts, forgets them when removed (no memory)|scen_truth"
+  "silent-complete|silent-complete caught — warden flags a session that committed work but never called nhq-done|scen_silent_complete"
+  "spawn-recorded|every spawn identified+recorded — a completed task yields a .meta + one task-ledger row|scen_spawn_recorded"
+  "no-regression|no regression — nhq-status / nhq-meta / nhq-cost run clean on the fabricated fixtures|scen_no_regression"
+  "laptop-safe|laptop-safe — no background daemon required; the read tools and the runner itself spawn none|scen_laptop_safe"
+)
+
+# ── --list short-circuits before any hermetic setup (no mktemp on a listing) ──
+case "${1:-}" in
+  --list|-l|list)
+    echo "nhq-fleet-golden scenarios (v0 acceptance):"
+    for s in "${SCENARIOS[@]}"; do
+      IFS='|' read -r k d _ <<<"$s"
+      printf '  %-16s %s\n' "$k" "$d"
+    done
+    exit 0
+    ;;
+  -h|--help|help)
+    sed -n '2,33p' "$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+    exit 0
+    ;;
+  ""|--all|all) ;;  # fall through to run all
+  *)
+    echo "nhq-fleet-golden: unknown arg '$1' (use --list, --help, or no args)" >&2
+    exit 2
+    ;;
+esac
+
+# ── hermetic environment (built only on the run path) ─────────────────────────
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+# The kit reads NHQ_STATE_DIR; the v1 plan calls the per-run home NHQ_FLEET_HOME.
+# Point the real var at a throwaway dir so nothing ever lands in ~/.nhq-fleet.
+export NHQ_FLEET_HOME="$TMP/fleet-home"
+export NHQ_STATE_DIR="$NHQ_FLEET_HOME"
+mkdir -p "$NHQ_STATE_DIR"
+
+# A fabricated registry — the "registry entry" the truth scenario asserts against.
+export NHQ_REGISTRY="$TMP/fleet-registry.json"
+cat > "$NHQ_REGISTRY" <<'JSON'
+{
+  "version": 1,
+  "agents": {
+    "golden": { "name": "GoldenBot", "repo": "Github/golden-fixture", "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": ["gb"] }
+  }
+}
+JSON
+
+# Toast-silent, like nhq-fleet-selftest: a no-op notifier + the suppress flag, so a
+# fixture can never fire a real desktop popup at Yash even on an unmerged branch.
+export NHQ_NOTIFY="$TMP/notify-noop"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$NHQ_NOTIFY"; chmod +x "$NHQ_NOTIFY"
+export NHQ_NOTIFY_SUPPRESS=1 NHQ_TEST=1
+
+# ── assertion helpers (nhq-fleet-selftest family) ─────────────────────────────
+# _F counts failures within the CURRENT scenario; each scenario runs in its own
+# subshell that exits with _F, so the count never leaks between scenarios.
+_F=0
+ok() { printf '    ✓ %s\n' "$1"; }
+no() { printf '    ✗ %s\n' "$1"; _F=$((_F + 1)); }
+eq() { if [[ "$2" == "$3" ]]; then ok "$1 ($2)"; else no "$1 — got '$2' want '$3'"; fi; }
+
+git_quiet() { git -C "$1" -c user.email=t@t -c user.name=t -c commit.gpgsign=false "${@:2}" >/dev/null 2>&1; }
+
+# ── (1) fleet tells the truth ─────────────────────────────────────────────────
+# Fabricate a session .meta + a registry entry; assert nhq-status's read path
+# reflects them (name/repo resolved from the registry, task from the .meta). Then
+# remove the artifacts and assert status updates with zero memory of the session.
+scen_truth() {
+  local S="fleet-golden-demo"
+  # shellcheck source=/dev/null
+  source "$BIN/nhq-status"   # source-guarded → render_* helpers + nhq-lib accessors
+
+  # The fabricated REGISTRY entry resolves through the lib accessors.
+  eq "registry: canon gb → golden"      "$(nhq_agent_canon gb)"     "golden"
+  eq "registry: name golden → GoldenBot" "$(nhq_agent_name golden)" "GoldenBot"
+  eq "registry: repo golden → abs dir"   "$(nhq_agent_repo golden)" "$HOME/Github/golden-fixture"
+
+  # Fabricate the session .meta with NO agent_name / repo, so the read path MUST
+  # resolve identity from the registry (proving status reads artifacts, not memory).
+  "$BIN/nhq-meta" init "$S" agent golden task "Wire the golden harness" \
+    spawn_epoch "$(date +%s)" >/dev/null 2>&1
+
+  # Drive the read side: one live RUNNING session backed by the fabricated .meta.
+  live_sessions() { printf '%s\n' "fleet-golden-demo"; }  # literal: render_block has its own local S
+  nhq_session_state_full() { echo RUNNING; }
+
+  local BLK; BLK="$(render_block)"
+  grep -q 'Wire the golden harness' <<<"$BLK" && ok "status --block reflects the fabricated task" \
+    || no "status --block missing the task ($BLK)"
+  grep -q 'GoldenBot' <<<"$BLK" && ok "status --block resolves the name from the registry" \
+    || no "status --block missing the registry name ($BLK)"
+
+  local J; J="$(render_json)"
+  eq "status --json agent from registry" "$(jq -r '.[0].agent' <<<"$J")" "golden"
+  eq "status --json repo from registry"  "$(jq -r '.[0].repo'  <<<"$J")" "$HOME/Github/golden-fixture"
+  eq "status --json state == RUNNING"    "$(jq -r '.[0].state' <<<"$J")" "RUNNING"
+
+  # NO MEMORY: remove the artifacts → status forgets the session entirely.
+  rm -f "$(nhq_meta "$S")"
+  live_sessions() { printf ''; }
+  local EMPTY; EMPTY="$(render_block)"
+  eq "removed session → empty --block (no memory)" "${#EMPTY}" "0"
+  eq "removed session → --json is []"              "$(render_json)" "[]"
+}
+
+# ── (2) silent-complete caught ────────────────────────────────────────────────
+# Fabricate a session that committed work but never called nhq-done (no .done
+# marker), past its spawn window. nhq-warden's one-shot fleet pass
+# (--check-fleet-once — a real no-daemon entrypoint) must flag it ORPHAN.
+scen_silent_complete() {
+  command -v git     >/dev/null 2>&1 || { no "git required for the commit-advance fixture";  return; }
+  command -v python3 >/dev/null 2>&1 || { no "python3 required for the warden one-shot pass"; return; }
+
+  # Isolated state dir so the warden globs ONLY this scenario's .meta.
+  export NHQ_STATE_DIR="$TMP/sc-state"; mkdir -p "$NHQ_STATE_DIR"
+  local WR="$TMP/sc-repo" SS="fleet-golden-silent" WLOG="$TMP/sc-warden.log" STUB="$TMP/sc-statecmd"
+
+  git init -q "$WR"; git_quiet "$WR" commit --allow-empty -m base
+  local BASE; BASE="$(git -C "$WR" rev-parse HEAD)"
+  "$BIN/nhq-meta" init "$SS" agent golden repo "$WR" base_commit "$BASE" \
+    spawn_epoch "$(( $(date +%s) - 600 ))" >/dev/null 2>&1
+  git_quiet "$WR" commit --allow-empty -m "agent committed work"   # HEAD now past base_commit
+
+  # Base-state stub → IDLE (agent dropped to its prompt). No .done marker = silent.
+  printf '#!/usr/bin/env bash\necho IDLE\n' > "$STUB"; chmod +x "$STUB"
+
+  warden_once() {
+    env NHQ_STATE_DIR="$NHQ_STATE_DIR" NHQ_WARDEN_STATE_CMD="$STUB" \
+        NHQ_NOTIFY=/bin/true NHQ_WARDEN_LOG="$WLOG" \
+        python3 "$BIN/nhq-warden" --check-fleet-once >/dev/null 2>&1
+  }
+
+  : > "$WLOG"; warden_once
+  eq "warden flags ORPHAN (committed, never nhq-done)" \
+    "$(grep -c 'ALERT \[orphan:'"$SS" "$WLOG" 2>/dev/null || true)" "1"
+  [[ ! -f "$NHQ_STATE_DIR/$SS.stalled" ]] && ok "ORPHAN writes no .stalled (it is silent-complete, not stalled)" \
+    || no "ORPHAN wrongly wrote .stalled"
+
+  # Control (truth, not memory): once the agent's .done exists, warden stops flagging.
+  : > "$NHQ_STATE_DIR/$SS.done"; : > "$WLOG"; warden_once
+  eq "with .done present → no ORPHAN alert" \
+    "$(grep -c 'ALERT \[orphan:'"$SS" "$WLOG" 2>/dev/null || true)" "0"
+}
+
+# ── (3) every spawn identified + recorded ─────────────────────────────────────
+# Fabricate a spawn (.meta + transcript) then run the real nhq-done callback;
+# assert the .meta exists and is well-formed, and exactly one task-ledger row is
+# written with real tokens + computed $cost + a DONE flip.
+scen_spawn_recorded() {
+  command -v jq >/dev/null 2>&1 || { no "jq required"; return; }
+  export NHQ_STATE_DIR="$TMP/spawn-state"; mkdir -p "$NHQ_STATE_DIR"
+
+  local AGENT="golden" S="fleet-golden" LED="$TMP/task-ledger.md" DJ="$NHQ_STATE_DIR/done.jsonl"
+  printf '# NHQ Task Ledger\n\n## Ledger (newest first)\n' > "$LED"
+  # Known transcript: in=1200, out=300 → Sonnet list price 1200/1e6*3 + 300/1e6*15 = 0.0081.
+  echo '{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1200,"output_tokens":300}}}' > "$DJ"
+
+  "$BIN/nhq-meta" init "$S" agent "$AGENT" agent_name GoldenBot repo "$HOME/Github/golden-fixture" \
+    task "Ship the acceptance harness" model "Claude Sonnet 4.6 (Thinking)" \
+    spawn_epoch "$(( $(date +%s) - 300 ))" last_state RUNNING >/dev/null 2>&1
+  "$BIN/nhq-meta" set "$S" jsonl "$DJ" >/dev/null 2>&1   # cache the transcript for nhq-cost
+
+  # Every spawn is identified + recorded: the .meta record exists and parses.
+  [[ -f "$NHQ_STATE_DIR/$S.meta" ]] && ok "spawn produced a .meta record" || no "no .meta for the spawn"
+  jq -e . "$NHQ_STATE_DIR/$S.meta" >/dev/null 2>&1 && ok ".meta is valid JSON" || no ".meta corrupt"
+  eq "spawn .meta carries the agent" "$("$BIN/nhq-meta" get "$S" agent)" "golden"
+
+  # Completed task → exactly one task-ledger row. TMUX unset so nhq-done resolves
+  # the fallback session fleet-<agent> == "$S"; everything overridden to stay hermetic.
+  env -u TMUX NHQ_LEDGER="$LED" NHQ_INBOX="$TMP/spawn-inbox.md" NHQ_NOTIFY=/bin/true \
+      NHQ_STATE_DIR="$NHQ_STATE_DIR" \
+      "$BIN/nhq-done" "$AGENT" "Done: harness shipped on feat/aos-v1-golden. No push." >/dev/null 2>&1
+
+  eq "ledger has exactly one row" "$(grep -cE '^\| ' "$LED")" "1"
+  local ROW; ROW="$(grep -E '^\| ' "$LED")"
+  grep -qE '1200\+300 tok' <<<"$ROW" && ok "ledger row carries real tokens" || no "ledger row missing tokens ($ROW)"
+  grep -qE '\$0\.0081'     <<<"$ROW" && ok "ledger row carries computed \$cost" || no "ledger row missing cost ($ROW)"
+  grep -qE '✅ done'        <<<"$ROW" && ok "ledger row marked done" || no "ledger row not marked done"
+  eq "nhq-done flipped .meta → DONE" "$("$BIN/nhq-meta" get "$S" last_state)" "DONE"
+  [[ -n "$("$BIN/nhq-meta" get "$S" done_ts)" ]] && ok "nhq-done set done_ts" || no "nhq-done did not set done_ts"
+}
+
+# ── (4) no regression to the proven Fleet Kit ─────────────────────────────────
+# The read-side tools run clean (exit 0 + sane output) over the fabricated fixtures.
+scen_no_regression() {
+  export NHQ_STATE_DIR="$TMP/nore-state"; mkdir -p "$NHQ_STATE_DIR"
+  local S="fleet-golden-nr" DJ="$NHQ_STATE_DIR/nr.jsonl"
+  echo '{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":500,"output_tokens":60}}}' > "$DJ"
+
+  "$BIN/nhq-meta" init "$S" agent golden agent_name GoldenBot repo "$HOME/Github/golden-fixture" \
+    task "regression probe" model "Claude Sonnet 4.6 (Thinking)" spawn_epoch 1 >/dev/null 2>&1
+  "$BIN/nhq-meta" set "$S" jsonl "$DJ" >/dev/null 2>&1
+
+  # nhq-meta: clean exit + readable fields.
+  "$BIN/nhq-meta" all "$S" >/dev/null 2>&1 && ok "nhq-meta all exits clean" || no "nhq-meta all failed"
+  eq "nhq-meta get returns the task" "$("$BIN/nhq-meta" get "$S" task)" "regression probe"
+
+  # nhq-cost: clean exit + correct token sum into .meta.
+  "$BIN/nhq-cost" "$S" >/dev/null 2>&1 && ok "nhq-cost exits clean" || no "nhq-cost failed"
+  eq "nhq-cost summed tokens_in"  "$("$BIN/nhq-meta" get "$S" tokens_in)"  "500"
+  eq "nhq-cost summed tokens_out" "$("$BIN/nhq-meta" get "$S" tokens_out)" "60"
+
+  # nhq-status: clean read path over the fixture (valid JSON array, one element).
+  if ( source "$BIN/nhq-status"
+       live_sessions() { printf '%s\n' "fleet-golden-nr"; }
+       nhq_session_state_full() { echo RUNNING; }
+       render_json | jq -e 'type=="array" and length==1 and .[0].state=="RUNNING"' >/dev/null 2>&1 ); then
+    ok "nhq-status --json valid over the fixture"
+  else
+    no "nhq-status --json invalid over the fixture"
+  fi
+}
+
+# ── (5) laptop-safe ───────────────────────────────────────────────────────────
+# Supervision is one-shot (no daemon required); the read tools return rather than
+# block; and the runner itself launches no background job or detached watcher.
+scen_laptop_safe() {
+  export NHQ_STATE_DIR="$TMP/ls-state"; mkdir -p "$NHQ_STATE_DIR"
+
+  # (a) Warden offers a real no-daemon supervision entrypoint AND it RETURNS:
+  #     under `timeout`, a daemon loop would be killed → exit 124; a one-shot exits 0.
+  if command -v python3 >/dev/null 2>&1; then
+    grep -q -- '--check-fleet-once' "$BIN/nhq-warden" \
+      && ok "warden exposes a one-shot (no-daemon) supervision entrypoint" \
+      || no "warden has no one-shot supervision mode"
+    env NHQ_STATE_DIR="$NHQ_STATE_DIR" NHQ_NOTIFY=/bin/true NHQ_WARDEN_LOG="$TMP/ls-warden.log" \
+      timeout 15 python3 "$BIN/nhq-warden" --check-fleet-once >/dev/null 2>&1
+    eq "warden one-shot returns cleanly (not a daemon: rc != 124)" "$?" "0"
+  else
+    no "python3 required to prove the warden one-shot"
+  fi
+
+  # (b) The read tools are one-shot — they return well within a timeout, never hang.
+  "$BIN/nhq-meta" init fleet-golden-ls agent golden task probe spawn_epoch 1 >/dev/null 2>&1
+  timeout 15 "$BIN/nhq-meta" all fleet-golden-ls >/dev/null 2>&1
+  eq "nhq-meta returns (no blocking poll)" "$?" "0"
+
+  # (c) The runner itself spawns nothing: no background jobs, no detached
+  #     await-watcher artifacts (--watch's setsid poller would drop a .await-result).
+  eq "runner spawned no background jobs" "$(jobs -rp | wc -l | tr -d ' ')" "0"
+  shopt -s nullglob; local watchers=( "$NHQ_STATE_DIR"/*.await-result ); shopt -u nullglob
+  eq "no detached await-watcher artifacts created" "${#watchers[@]}" "0"
+}
+
+# ── run loop ──────────────────────────────────────────────────────────────────
+# Each scenario runs in its own subshell so sourced read-tools, function overrides
+# (live_sessions / nhq_session_state_full), per-scenario state dirs, and the _F
+# failure counter never leak across scenarios. The subshell exits with _F; a
+# zero exit = the scenario passed.
+run_one() {
+  local key="$1" desc="$2" fn="$3"
+  printf '── %-16s %s\n' "$key" "$desc"
+  if ( _F=0; "$fn"; exit "$_F" ); then
+    printf '  PASS: %s\n' "$key"; return 0
+  else
+    printf '  FAIL: %s\n' "$key"; return 1
+  fi
+}
+
+echo "nhq-fleet-golden — v0 acceptance golden scenarios (hermetic; no real agents)"
+echo "  state dir: $NHQ_STATE_DIR"
+echo "  registry:  $NHQ_REGISTRY"
+echo
+
+PASS=0; TOTAL=0
+for s in "${SCENARIOS[@]}"; do
+  IFS='|' read -r k d fn <<<"$s"
+  TOTAL=$((TOTAL + 1))
+  run_one "$k" "$d" "$fn" && PASS=$((PASS + 1))
+  echo
+done
+
+echo "────────────────────────────────────────────────────────────────────────"
+printf 'GOLDEN: %d/%d passed\n' "$PASS" "$TOTAL"
+[[ "$PASS" -eq "$TOTAL" ]]
