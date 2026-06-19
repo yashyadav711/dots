@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# nhq-goal-selftest — hermetic acceptance for the v1 per-session budget guard.
+#
+# Runs entirely against a throwaway NHQ_FLEET_HOME (mktemp -d), so the real
+# ~/.nhq-fleet is never touched. We fabricate the spend source the tool reads —
+# a session .meta record (via nhq-meta) carrying tokens_in/tokens_out + cost_usd,
+# exactly what nhq-cost would persist — then drive the full budget lifecycle:
+#
+#   set budget -> check under budget = ok -> check at ~85% = warn
+#              -> check over budget = exceeded (exit 1) -> clear -> unset
+#
+# Usage: nhq-goal-selftest        (prints PASS/FAIL summary; exit 0 pass / 1 fail)
+set -uo pipefail
+
+BIN="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+GOAL="$BIN/nhq-goal"
+META="$BIN/nhq-meta"
+
+# Throwaway data home: export BOTH the assignment's NHQ_FLEET_HOME alias and the
+# real kit var NHQ_STATE_DIR (which nhq-meta reads) at the same temp dir, so the
+# whole run is hermetic — the real ~/.nhq-fleet is never written.
+NHQ_TMP_HOME="$(mktemp -d)"
+export NHQ_FLEET_HOME="$NHQ_TMP_HOME"   # the assignment's alias var
+export NHQ_STATE_DIR="$NHQ_TMP_HOME"    # the real kit var nhq-meta reads (hermetic)
+unset NHQ_GOALS 2>/dev/null || true
+trap 'rm -rf "$NHQ_TMP_HOME"' EXIT
+
+pass=0; fail=0
+ok() { echo "  PASS: $1"; pass=$((pass + 1)); }
+no() { echo "  FAIL: $1"; fail=$((fail + 1)); }
+
+# Run `nhq-goal check` capturing stdout + exit code.
+run_check() { CHK_OUT="$("$GOAL" check "$@" 2>&1)"; CHK_RC=$?; }
+expect_rc()    { if [[ "$2" == "$1" ]]; then ok "$3 (exit $2)"; else no "$3 (want exit $1, got $2)"; fi; }
+expect_state() { if grep -q "$1" <<<"$CHK_OUT"; then ok "$2"; else no "$2 (output: $(tr '\n' ' ' <<<"$CHK_OUT"))"; fi; }
+
+# Fabricate / re-point the spend source: write tokens_in/out + cost_usd into the
+# session .meta via nhq-meta (these are the fields nhq-cost persists; nhq-goal reads
+# them read-only). $1 session, $2 tokens_in, $3 tokens_out, $4 cost_usd.
+set_spend() {
+  "$META" set "$1" tokens_in  "$2" >/dev/null
+  "$META" set "$1" tokens_out "$3" >/dev/null
+  "$META" set "$1" cost_usd   "$4" >/dev/null
+}
+
+S="fleet-goal-selftest"
+
+echo "── 0: fabricate spend source (.meta) + set a budget ─────────────────────"
+"$META" init "$S" >/dev/null
+set_spend "$S" 0 0 0
+"$GOAL" set "$S" --tokens 100000 --usd 10 >/dev/null
+if [[ -s "$NHQ_FLEET_HOME/goals.json" ]] \
+   && [[ "$(jq -r --arg s "$S" '.[$s].tokens' "$NHQ_FLEET_HOME/goals.json")" == "100000" ]] \
+   && [[ "$(jq -r --arg s "$S" '.[$s].usd'    "$NHQ_FLEET_HOME/goals.json")" == "10"     ]] \
+   && [[ "$(jq -r --arg s "$S" '.[$s].set_at != null' "$NHQ_FLEET_HOME/goals.json")" == "true" ]]; then
+  ok "set wrote goals.json entry {tokens:100000, usd:10, set_at:...}"
+else
+  no "goals.json entry malformed: $(cat "$NHQ_FLEET_HOME/goals.json" 2>/dev/null)"
+fi
+# list sees it
+if "$GOAL" list | grep -q "$S"; then ok "list shows the budget"; else no "list missing the budget"; fi
+if [[ "$("$GOAL" list --json | jq -r --arg s "$S" '.[$s].tokens')" == "100000" ]]; then
+  ok "list --json carries the budget"
+else
+  no "list --json wrong"
+fi
+
+echo "── 1: check UNDER budget -> ok, exit 0 ──────────────────────────────────"
+set_spend "$S" 30000 20000 4.00          # 50000/100000 = 50% tokens ; \$4/\$10 = 40% usd
+run_check "$S"
+echo "$CHK_OUT" | sed 's/^/    /'
+expect_state '\-> ok' "under budget reports ok"
+expect_rc 0 "$CHK_RC" "ok check exits 0"
+
+echo "── 2: check at ~85% -> warn, exit 0 (no kill) ───────────────────────────"
+set_spend "$S" 50000 35000 4.00          # 85000/100000 = 85% tokens -> warn (worst dim)
+run_check "$S"
+echo "$CHK_OUT" | sed 's/^/    /'
+expect_state '\-> warn' "85% reports warn"
+expect_rc 0 "$CHK_RC" "warn check still exits 0 (observe-only)"
+
+echo "── 3: check OVER budget -> exceeded, exit 1 ─────────────────────────────"
+set_spend "$S" 70000 50000 4.00          # 120000/100000 = 120% tokens -> exceeded
+run_check "$S"
+echo "$CHK_OUT" | sed 's/^/    /'
+expect_state '\-> exceeded' "over budget reports exceeded"
+expect_rc 1 "$CHK_RC" "exceeded check exits 1 (caller MAY react; we never kill)"
+
+echo "── 3b: usd dimension drives exceeded independently ──────────────────────"
+set_spend "$S" 0 0 12.50                  # tokens 0% ok, usd 125% -> combined exceeded
+run_check "$S"
+expect_state '\-> exceeded' "usd over budget reports exceeded"
+expect_rc 1 "$CHK_RC" "usd-driven exceeded exits 1"
+
+echo "── 3c: --json check is well-formed + carries worst state ────────────────"
+set_spend "$S" 50000 35000 4.00          # back to 85% tokens -> warn
+CHK_JSON="$("$GOAL" check --json "$S" 2>&1)"
+if jq -e '.state == "warn" and .tokens.state == "warn" and .usd.state == "ok"' <<<"$CHK_JSON" >/dev/null 2>&1; then
+  ok "check --json: state=warn, tokens=warn, usd=ok"
+else
+  no "check --json malformed: $(tr '\n' ' ' <<<"$CHK_JSON")"
+fi
+
+echo "── 4: clear -> budget forgotten, check reports unset, exit 0 ─────────────"
+"$GOAL" clear "$S" >/dev/null
+if [[ "$(jq -r --arg s "$S" 'has($s)' "$NHQ_FLEET_HOME/goals.json")" == "false" ]]; then
+  ok "clear removed the goals.json entry"
+else
+  no "clear left the entry behind"
+fi
+run_check "$S"
+expect_state 'no budget set' "cleared session reports no budget"
+expect_rc 0 "$CHK_RC" "unset check exits 0"
+
+echo "── 5: real ~/.nhq-fleet untouched (hermetic) ────────────────────────────"
+# goals.json must live ONLY under the temp home, never the user's real dir.
+if [[ -f "$NHQ_FLEET_HOME/goals.json" ]]; then ok "goals.json lives under the throwaway NHQ_FLEET_HOME"; else no "goals.json not under temp home"; fi
+
+echo "─────────────────────────────────────────────────────────────────────────"
+echo "nhq-goal-selftest: $pass passed, $fail failed"
+[[ "$fail" -eq 0 ]] && exit 0 || exit 1
