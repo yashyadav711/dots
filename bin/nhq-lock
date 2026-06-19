@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# nhq-lock — per-path advisory write-lock so concurrent fleet agents don't collide
+# on a shared file/dir (the stacked-worktree race that bit us today).
+#
+# COOPERATIVE / ADVISORY: this does NOT take a kernel lock or block writes — it is a
+# shared claim board. A well-behaved agent runs `nhq-lock acquire <path>` before it
+# touches <path>, sees who else holds it, and backs off on a conflict. It enforces
+# nothing on a process that ignores it.
+#
+# A lock is keyed by sha1(absolute path) and stored one-file-per-path under
+#   $NHQ_STATE_DIR/locks/<sha1>.json   →  {path, holder, pid, acquired_at, expires_at}
+# holder = $NHQ_AGENT (fallback $USER). acquired_at/expires_at are epoch seconds.
+#
+# A lock is RECLAIMABLE (free for the taking) when it is expired (now ≥ expires_at)
+# OR its holder pid is dead (kill -0 fails). That double signal — a TTL backstop plus
+# live-pid liveness — means a crashed or finished agent never wedges a path forever.
+#
+# Usage:
+#   nhq-lock acquire <path> [--ttl SECS]   # claim <path>; default ttl 1800s.
+#                                          #   exit 0: free / held-by-dead-pid / expired
+#                                          #           / already ours → (re)written.
+#                                          #   exit 1: held by another LIVE holder
+#                                          #           (prints who) — caller must back off.
+#   nhq-lock release <path> [--force]      # drop the lock (only the holder; --force overrides).
+#   nhq-lock status [<path>] [--json]      # list locks; mark stale = expired or dead pid.
+#   nhq-lock reap                          # delete expired/dead-holder locks; print count.
+#
+# Env: NHQ_STATE_DIR (state dir, default ~/.nhq-fleet), NHQ_AGENT (holder id),
+#      NHQ_LOCK_PID (override the recorded liveness pid; default $PPID — the agent
+#      shell that invoked nhq-lock, NOT the short-lived nhq-lock process itself).
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+# shellcheck source=/dev/null
+source "$(dirname "$SELF")/nhq-lib.sh"   # NHQ_STATE_DIR + nhq_ensure_state_dir (read-only use)
+
+die() { echo "nhq-lock: $*" >&2; exit 1; }
+
+command -v jq      >/dev/null 2>&1 || die "jq not found (install: sudo pacman -S jq)"
+command -v sha1sum >/dev/null 2>&1 || die "sha1sum not found (coreutils)"
+
+DEFAULT_TTL=1800
+LOCKS_DIR="$NHQ_STATE_DIR/locks"
+HOLDER="${NHQ_AGENT:-${USER:-unknown}}"
+now="$(date +%s)"
+
+# Liveness pid: the agent process that invoked us (persists after nhq-lock exits),
+# overridable for explicit control / testing. Recording our own $$ would be useless —
+# it dies the instant the command returns, so every lock would read as dead.
+self_pid="${NHQ_LOCK_PID:-$PPID}"
+[[ "$self_pid" =~ ^[0-9]+$ ]] || self_pid=0
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+_abspath() { realpath -m -- "$1"; }                       # canonical, no existence req
+_key()     { printf '%s' "$1" | sha1sum | cut -d' ' -f1; }
+_lockfile(){ printf '%s/%s.json' "$LOCKS_DIR" "$(_key "$1")"; }
+
+# Is pid $1 a live process? Bogus / 0 / empty → not alive.
+_alive() { local p="${1:-}"; [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )) && kill -0 "$p" 2>/dev/null; }
+
+# Read one scalar field of a lock file ("" if absent/unreadable).
+_field() { jq -r --arg f "$1" '.[$f] // ""' "$2" 2>/dev/null; }
+
+# Atomic write: jq builds the record, land it via tmpfile + mv (no half-written reader).
+_write_lock() {
+  local file="$1" abs="$2" holder="$3" pid="$4" acq="$5" exp="$6"
+  nhq_ensure_state_dir; mkdir -p "$LOCKS_DIR" 2>/dev/null || true
+  local tmp; tmp="$(mktemp "${file}.XXXXXX")"
+  if jq -n --arg path "$abs" --arg holder "$holder" \
+          --argjson pid "$pid" --argjson acquired_at "$acq" --argjson expires_at "$exp" \
+          '{path:$path, holder:$holder, pid:$pid, acquired_at:$acquired_at, expires_at:$expires_at}' \
+          > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$file"
+  else
+    rm -f "$tmp"; die "failed to write lock $file"
+  fi
+}
+
+# Is a lock file stale (reclaimable)? expired OR dead-pid. Sets globals: _expired _dead.
+_is_stale() {
+  local file="$1" exp pid
+  exp="$(_field expires_at "$file")"; pid="$(_field pid "$file")"
+  [[ "$exp" =~ ^[0-9]+$ ]] || exp=0
+  _expired=0; (( now >= exp )) && _expired=1
+  _dead=0; _alive "$pid" || _dead=1
+  (( _expired || _dead ))
+}
+
+# ── subcommands ─────────────────────────────────────────────────────────────
+cmd_acquire() {
+  local path="" ttl="$DEFAULT_TTL"
+  while (( $# )); do
+    case "$1" in
+      --ttl)   ttl="${2:-}"; shift 2 || die "acquire: --ttl needs a value" ;;
+      --ttl=*) ttl="${1#*=}"; shift ;;
+      --)      shift; [[ $# -gt 0 ]] && { path="$1"; shift; } ;;
+      -*)      die "acquire: unknown flag '$1'" ;;
+      *)       [[ -z "$path" ]] && path="$1" || die "acquire: unexpected arg '$1'"; shift ;;
+    esac
+  done
+  [[ -z "$path" ]] && die "usage: nhq-lock acquire <path> [--ttl SECS]"
+  [[ "$ttl" =~ ^[0-9]+$ && "$ttl" -gt 0 ]] || die "acquire: --ttl must be a positive integer"
+
+  local abs file; abs="$(_abspath "$path")"; file="$(_lockfile "$abs")"
+
+  if [[ -f "$file" ]]; then
+    local cur_holder cur_pid cur_exp
+    cur_holder="$(_field holder "$file")"; cur_pid="$(_field pid "$file")"; cur_exp="$(_field expires_at "$file")"
+    if ! _is_stale "$file"; then
+      # Live, unexpired lock. Same holder → refresh (reentrant). Other → conflict.
+      if [[ "$cur_holder" != "$HOLDER" ]]; then
+        echo "nhq-lock: '$abs' is held by $cur_holder (pid $cur_pid, expires_at $cur_exp)" >&2
+        exit 1
+      fi
+    fi
+    # else: expired or dead-pid → reclaim (fall through and overwrite).
+  fi
+
+  _write_lock "$file" "$abs" "$HOLDER" "$self_pid" "$now" "$(( now + ttl ))"
+  echo "nhq-lock: acquired '$abs' (holder=$HOLDER pid=$self_pid ttl=${ttl}s)"
+}
+
+cmd_release() {
+  local path="" force=0
+  while (( $# )); do
+    case "$1" in
+      --force) force=1; shift ;;
+      --)      shift; [[ $# -gt 0 ]] && { path="$1"; shift; } ;;
+      -*)      die "release: unknown flag '$1'" ;;
+      *)       [[ -z "$path" ]] && path="$1" || die "release: unexpected arg '$1'"; shift ;;
+    esac
+  done
+  [[ -z "$path" ]] && die "usage: nhq-lock release <path> [--force]"
+
+  local abs file; abs="$(_abspath "$path")"; file="$(_lockfile "$abs")"
+  [[ -f "$file" ]] || { echo "nhq-lock: '$abs' is not locked"; exit 0; }
+
+  local cur_holder; cur_holder="$(_field holder "$file")"
+  if (( force )) || [[ "$cur_holder" == "$HOLDER" ]]; then
+    rm -f "$file"
+    echo "nhq-lock: released '$abs'"
+  else
+    echo "nhq-lock: '$abs' is held by $cur_holder — refusing (use --force)" >&2
+    exit 1
+  fi
+}
+
+cmd_status() {
+  local want_json=0 target=""
+  while (( $# )); do
+    case "$1" in
+      --json) want_json=1; shift ;;
+      --)     shift; [[ $# -gt 0 ]] && { target="$1"; shift; } ;;
+      -*)     die "status: unknown flag '$1'" ;;
+      *)      [[ -z "$target" ]] && target="$1" || die "status: unexpected arg '$1'"; shift ;;
+    esac
+  done
+
+  local files=()
+  if [[ -n "$target" ]]; then
+    local f; f="$(_lockfile "$(_abspath "$target")")"
+    [[ -f "$f" ]] && files+=("$f")
+  elif [[ -d "$LOCKS_DIR" ]]; then
+    shopt -s nullglob; files=("$LOCKS_DIR"/*.json); shopt -u nullglob
+  fi
+
+  if (( want_json )); then
+    local first=1; printf '['
+    local f
+    for f in "${files[@]}"; do
+      local stale=0; _is_stale "$f" && stale=1
+      (( first )) || printf ','; first=0
+      jq -c --argjson now "$now" \
+            --argjson stale   "$([[ $stale     == 1 ]] && echo true || echo false)" \
+            --argjson expired "$([[ ${_expired:-0} == 1 ]] && echo true || echo false)" \
+            --argjson dead    "$([[ ${_dead:-0}    == 1 ]] && echo true || echo false)" \
+            '. + {stale:$stale, expired:$expired, dead:$dead}' "$f"
+    done
+    printf ']\n'
+    return 0
+  fi
+
+  if (( ${#files[@]} == 0 )); then echo "nhq-lock: no locks held"; return 0; fi
+  printf '%-6s %-18s %-8s %s\n' STATE HOLDER PID PATH
+  local f
+  for f in "${files[@]}"; do
+    local stale=0; _is_stale "$f" && stale=1
+    local state="HELD"; (( stale )) && state="STALE"
+    printf '%-6s %-18s %-8s %s\n' \
+      "$state" "$(_field holder "$f")" "$(_field pid "$f")" "$(_field path "$f")"
+  done
+}
+
+cmd_reap() {
+  [[ $# -eq 0 ]] || die "usage: nhq-lock reap"
+  local n=0
+  if [[ -d "$LOCKS_DIR" ]]; then
+    shopt -s nullglob
+    local f
+    for f in "$LOCKS_DIR"/*.json; do
+      if _is_stale "$f"; then rm -f "$f"; n=$((n + 1)); fi
+    done
+    shopt -u nullglob
+  fi
+  echo "nhq-lock: reaped $n stale lock(s)"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  acquire) cmd_acquire "$@" ;;
+  release) cmd_release "$@" ;;
+  status)  cmd_status  "$@" ;;
+  reap)    cmd_reap    "$@" ;;
+  ""|-h|--help|help) sed -n '2,33p' "$SELF" ;;
+  *) die "unknown command '$cmd' (want: acquire|release|status|reap)" ;;
+esac
