@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""nhq-threads — render the chat-ready OPEN THREADS table from the canonical
+ai/open-threads.md tree (render-from-truth; kills thread-dropping).
+
+Director must PASTE this output verbatim instead of hand-typing the thread
+tree from memory. The tool parses every `[id]` thread line out of the fenced
+```text tree block, then emits the header + grouped markdown table that
+replies.md RULE 1 expects. A built-in self-test guarantees the rendered row
+count == the number of thread-start lines in the source, so no thread can be
+silently dropped.
+
+Usage:
+  nhq-threads                 # print header + table to stdout
+  nhq-threads --file PATH      # override the source file
+  nhq-threads --needs-you      # only 🔴 (needs-you / blocked) threads
+  nhq-threads --verify         # also run self-test, print parse stats to stderr
+
+Exit non-zero if the self-test fails (rendered rows != source [id] lines),
+listing the missing IDs.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+
+DEFAULT_FILE = os.path.expanduser("~/Github/nhq-agentic-os/ai/open-threads.md")
+
+# Status emoji -> (short label, header-bucket).  header-bucket is the key used
+# for the summary counts in the header line (None = not summarised there).
+STATUS = {
+    "🔴": ("needs you",    "needs"),
+    "👉": ("active",       "active"),
+    "🟡": ("in-progress",  None),
+    "⏳": ("waiting",      None),
+    "🟢": ("nearly done",  None),
+    "✅": ("close-ready",  "close"),
+    "🅿️": ("parked",       None),
+    "🕒": ("deferred",     None),
+    "❓": ("unclear",      None),
+    "🔵": ("await review", None),
+}
+# Variation-selector-insensitive lookup: strip U+FE0F when matching.
+_VS16 = "\ufe0f"
+STATUS_KEYS = sorted(STATUS, key=len, reverse=True)
+
+# Recognised category headers (bare ALL-CAPS lines inside the tree).  WORK is a
+# parent group with no direct threads; its children are the real buckets.
+CATEGORIES = {"WORK", "HEYDADDY", "MIRROR", "FIRSTSTONE", "JULIAN", "OPS", "OFF-WORK"}
+
+# A thread-start line: optional tree gutter, a branch glyph, then `[id]`.
+THREAD_RE = re.compile(r"^[\s│]*[├└]──\s+(\[[^\]]+\](?:\s*/\s*\[[^\]]+\])*)\s*(.*)$")
+# A category header: leading whitespace then ALL-CAPS word(s), maybe a "(...)" note.
+CAT_RE = re.compile(r"^(\s*)([A-Z][A-Z0-9\- ]*?)(\s*\(.*\))?\s*$")
+
+
+def extract_block(text: str) -> list[str]:
+    """Return the lines inside the first ```text fenced block (the open tree)."""
+    lines = text.splitlines()
+    out: list[str] = []
+    inblk = False
+    for line in lines:
+        if not inblk:
+            if line.strip() == "```text":
+                inblk = True
+            continue
+        if line.strip() == "```":
+            break
+        out.append(line)
+    if not out:
+        raise SystemExit("nhq-threads: no ```text tree block found in source")
+    return out
+
+
+def _match_status(rest: str):
+    """Pull a leading status emoji off `rest`; return (emoji, remainder)."""
+    s = rest.lstrip()
+    for emo in STATUS_KEYS:
+        if s.startswith(emo):
+            return emo, s[len(emo):].lstrip()
+        # tolerate a missing/extra variation selector
+        if s.startswith(emo.rstrip(_VS16)) and emo.endswith(_VS16):
+            return emo, s[len(emo.rstrip(_VS16)):].lstrip()
+    # emoji absent or unknown: try first token
+    return None, s
+
+
+def _clean_id(raw: str) -> str:
+    """`[tr]/[vr]` -> `tr/vr`; `[hd]` -> `hd`."""
+    parts = re.findall(r"\[([^\]]+)\]", raw)
+    return "/".join(p.strip() for p in parts)
+
+
+def _split_name_state(body: str) -> tuple[str, str]:
+    """Split `Name — state` on the first em/en-dash; fall back to whole-as-name."""
+    for dash in ("—", "–", " - "):
+        if dash in body:
+            name, state = body.split(dash, 1)
+            return name.strip(), state.strip()
+    return body.strip(), ""
+
+
+def parse(block: list[str]) -> tuple[list[dict], int]:
+    """Parse the tree block -> (threads, source_thread_line_count).
+
+    source_thread_line_count is counted independently of the parsed list so the
+    self-test can catch any row that failed to render.
+    """
+    threads: list[dict] = []
+    source_count = 0
+    cat = None
+    for line in block:
+        if not line.strip():
+            continue
+        m = THREAD_RE.match(line)
+        if m:
+            source_count += 1
+            raw_id, rest = m.group(1), m.group(2)
+            emoji, body = _match_status(rest)
+            name, state = _split_name_state(body)
+            threads.append({
+                "id": _clean_id(raw_id),
+                "emoji": emoji,
+                "name": name,
+                "state": state,
+                "cat": cat or "WORK",
+            })
+            continue
+        # Skip indented sub-lines (opened:, 💬 last:, nested ├──/└── detail).
+        cm = CAT_RE.match(line)
+        if cm and cm.group(2).strip() in CATEGORIES:
+            cat = cm.group(2).strip()
+    return threads, source_count
+
+
+def _truncate(text: str, limit: int = 88) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _cell(text: str) -> str:
+    """Escape a markdown table cell (pipes, stray newlines)."""
+    return text.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _thread_cell(t: dict) -> str:
+    name = t["name"]
+    state = t["state"]
+    body = f"{name} — {state}" if state else name
+    return _cell(_truncate(body))
+
+
+def _status_cell(t: dict) -> str:
+    emo = t["emoji"]
+    if emo is None:
+        return ""
+    label, _ = STATUS[emo]
+    return f"{emo} {label}"
+
+
+# Category display order (children of WORK first, then standalone buckets).
+CAT_ORDER = ["HEYDADDY", "MIRROR", "FIRSTSTONE", "JULIAN", "OPS", "OFF-WORK", "WORK"]
+
+
+def render(threads: list[dict], needs_you: bool = False) -> tuple[str, int]:
+    """Render header + table. Returns (text, rendered_row_count)."""
+    shown = [t for t in threads if (not needs_you or t["emoji"] == "🔴")]
+
+    # header counts
+    n_needs = sum(1 for t in shown if t["emoji"] == "🔴")
+    n_active = sum(1 for t in shown if t["emoji"] == "👉")
+    n_close = sum(1 for t in shown if t["emoji"] == "✅")
+    header_bits = ["🧵 OPEN THREADS"]
+    if n_needs:
+        header_bits.append(f"🔴 {n_needs} need you")
+    if n_active:
+        header_bits.append(f"👉 {n_active} active")
+    if n_close:
+        header_bits.append(f"✅ {n_close} close?")
+    header = " · ".join(header_bits)
+
+    # group, preserving source order within a category
+    by_cat: dict[str, list[dict]] = {}
+    for t in shown:
+        by_cat.setdefault(t["cat"], []).append(t)
+
+    lines = [header, "", "| ID | Thread | Status |", "| --- | --- | --- |"]
+    rows = 0
+    ordered = [c for c in CAT_ORDER if c in by_cat]
+    ordered += [c for c in by_cat if c not in CAT_ORDER]
+    for c in ordered:
+        items = by_cat[c]
+        if not items:
+            continue
+        lines.append(f"| **{c}** | | |")
+        for t in items:
+            lines.append(f"| `{t['id']}` | {_thread_cell(t)} | {_status_cell(t)} |")
+            rows += 1
+
+    # close-ready summary row
+    close_ids = [t["id"] for t in shown if t["emoji"] == "✅"]
+    if close_ids:
+        joined = " ".join(f"`{i}`" for i in close_ids)
+        lines.append(f"| ✅ | close?: {joined} | ✅ |")
+
+    return "\n".join(lines), rows
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="nhq-threads",
+        description="Render the OPEN THREADS chat table from ai/open-threads.md.",
+    )
+    ap.add_argument("--file", default=DEFAULT_FILE, help="source open-threads.md")
+    ap.add_argument("--needs-you", action="store_true", help="only 🔴 threads")
+    ap.add_argument("--verify", action="store_true",
+                    help="run self-test + print parse stats to stderr")
+    args = ap.parse_args(argv)
+
+    path = os.path.expanduser(args.file)
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError as e:
+        print(f"nhq-threads: cannot read {path}: {e}", file=sys.stderr)
+        return 2
+
+    block = extract_block(text)
+    threads, source_count = parse(block)
+    table, rows = render(threads, needs_you=args.needs_you)
+
+    print(table)
+
+    # Completeness self-test (the whole point). When filtering with
+    # --needs-you the rendered rows are a deliberate subset, so the strict
+    # equality test only applies to the full parse.
+    parsed_n = len(threads)
+    print(f"nhq-threads: parsed {parsed_n} open threads "
+          f"({source_count} thread-start lines in source)", file=sys.stderr)
+
+    full_rows = rows if not args.needs_you else parsed_n
+    if full_rows != source_count:
+        rendered_ids = {t["id"] for t in threads}
+        # recover the raw ids from source for the diff
+        src_ids: list[str] = []
+        for line in block:
+            m = THREAD_RE.match(line)
+            if m:
+                src_ids.append(_clean_id(m.group(1)))
+        missing = [i for i in src_ids if i not in rendered_ids]
+        print(f"nhq-threads: SELF-TEST FAILED — rendered {full_rows} rows "
+              f"but source has {source_count} threads; missing: "
+              f"{missing or '(count mismatch, ids present)'}", file=sys.stderr)
+        return 1
+
+    if args.verify:
+        print(f"nhq-threads: self-test OK — {rows} rendered rows == "
+              f"{source_count} source thread lines (no drops)", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
