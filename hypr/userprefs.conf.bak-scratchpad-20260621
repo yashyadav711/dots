@@ -1,0 +1,175 @@
+
+# █░█ █▀ █▀▀ █▀█   █▀█ █▀█ █▀▀ █▀▀ █▀
+# █▄█ ▄█ ██▄ █▀▄   █▀▀ █▀▄ ██▄ █▀░ ▄█
+
+# Set your personal hyprland configuration here
+# See https://wiki.hyprland.org/Configuring for more information
+
+
+# // █ █▄░█ █▀█ █░█ ▀█▀
+# // █ █░▀█ █▀▀ █▄█ ░█░
+
+
+#  Uncomment to enable // change to a preferred value
+# 🔗 See https://wiki.hyprland.org/Configuring/Variables/#input
+
+# Walker disabled (elephant binary broken) — using rofi via HyDE
+# exec-once = walker --gapplication-service
+
+input {
+    # kb_layout = us
+    # follow_mouse = 1
+    # sensitivity = 0
+    # force_no_accel = 0
+    # accel_profile = flat 
+    # numlock_by_default = true
+
+    # 🔗 See https://wiki.hyprland.org/Configuring/Variables/#touchpad
+    touchpad {
+        natural_scroll = yes
+    }
+
+}
+
+
+
+# 🔗 See https://wiki .hyprland.org/Configuring/Variables/#gestures
+gestures {
+#     workspace_swipe = true
+#     workspace_swipe_fingers = 3
+}
+
+# for window shallow similar to devour
+misc {
+    # enable_swallow = true
+    # swallow_regex = (foot|kitty|allacritty|Alacritty|ghostty|Ghostty|org.wezfurlong.wezterm)
+}
+
+# Don't show update on first launch
+ecosystem {
+  # no_update_news = true
+}
+
+
+# Custom Keybindings
+
+# Logout menu
+bind = $mainMod, X, exec, $scrPath/logoutlaunch.sh
+
+# Resize window (using bindm for mouse resize)
+bindm = $mainMod Alt, R, resizewindow
+
+# Maximize (fullscreen)
+bind = $mainMod, M, fullscreen
+
+# Toggle floating
+bind = $mainMod, F, togglefloating
+
+# Lock screen
+bind = $mainMod SHIFT, L, exec, lockscreen.sh
+
+# Terminal emulator
+bind = $mainMod, Return, exec, /home/yash/.config/hypr/kitty-tmux.sh   # tmux terminal (+ chooser if tmux already running)
+
+# Web Browser
+unbind = $mainMod, W # Original Toggle floating
+bindd = $mainMod, W, [Launcher|Apps] web browser, exec, /home/yash/.config/hypr/firefox-raise.sh
+
+# File explorer
+bind = Control Alt, F, exec, $EXPLORER
+
+# Text editor
+unbind = $mainMod, E # Original File explorer
+# bindd = $mainMod, E, [Launcher|Apps] text editor, exec, /usr/bin/subl # This is not working
+
+# Application finder — combi mode: search apps + run raw commands (walker disabled)
+bind = $mainMod, D, exec, pkill -x rofi || rofi -show combi -combi-modi "drun,run" -modi combi -show-icons -theme ~/.config/rofi/spotlight.rasi
+
+# Rename current workspace
+bind = $mainMod, R, exec, ~/.config/hypr/scripts/rename-workspace.sh
+
+# Move window
+bindm = $mainMod Alt, M, movewindow
+
+# Unbind original keybindings to avoid conflicts
+unbind = Shift, F11 # Original Toggle fullscreen
+unbind = Control Alt, Delete # Original Logout menu
+unbind = $mainMod, L # Original Lock screen
+unbind = $mainMod, X # Original hold to resize window (mouse binding)
+unbind = $mainMod, T # Original Terminal emulator
+unbind = $mainMod, B # Original Web Browser
+unbind = $mainMod, C # Original Text editor
+unbind = $mainMod, A # Original Application finder
+unbind = $mainMod, E # Original File explorer
+
+# Test binding (now for Sublime)
+bindd = $mainMod, I, [Launcher|Apps] text editor, exec, /usr/bin/subl
+# Final Overrides
+unbind = $mainMod, X
+bind = $mainMod, X, exec, $scrPath/logoutlaunch.sh
+bind = $mainMod, E, exec, /home/yash/.config/hypr/sublime-raise.sh
+bindm = $mainMod, mouse:272, movewindow
+bindm = $mainMod Alt, mouse:272, resizewindow
+
+# Super+T = plain kitty (no tmux). Placed after the `unbind = $mainMod, T` above so it sticks.
+bind = $mainMod, T, exec, kitty
+
+# WhatsApp (ZapZap) launcher
+bindd = Control Alt, W, [Launcher|Apps] WhatsApp (ZapZap), exec, flatpak run com.rtosta.zapzap
+
+# AyuGram (Telegram) launcher
+bindd = Control Alt, T, [Launcher|Apps] AyuGram (Telegram), exec, AyuGram
+
+# Obsidian — nHQ vault (Win+J trial; Win+D untouched)
+bindd = $mainMod, J, [Launcher|Apps] Obsidian nHQ vault, exec, xdg-open obsidian://open?vault=nHQ
+
+# Claude Code live overview — kitty running claude-overview -w (replaced dead opcode AppImage)
+bindd = Control Alt, C, [Launcher|Apps] Claude overview, exec, kitty --title claude-overview -e /home/yash/.local/bin/claude-overview -w 2
+
+# Emoji picker = smile (iOS-style scrollable grid, categories, skin tones, recents).
+# unbind HyDE's own Super+, (hyde-shell emoji-picker) first so it doesn't collide.
+unbind = $mainMod, comma
+bindd = $mainMod, comma, [Launcher|Apps] emoji picker, exec, flatpak run it.mijorus.smile
+
+# Free up bare F11 so it reaches apps (Firefox F11 = native fullscreen / "zen" page-only view).
+# HyDE had bound bare F11 to volume-down, swallowing the key before any app saw it.
+# Volume-down still works via the dedicated media key (XF86AudioLowerVolume) / Fn+F11.
+unbind = , F11
+# Bare F12 too: this HP Envy's F12 is the airplane key (Fn layer), NOT volume-up.
+# HyDE had bound bare F12 to volume-up, which both swallowed F12 (browser DevTools) and
+# was wrong for the keyboard. Free it: bare F12 -> apps (DevTools); airplane via Fn+F12.
+unbind = , F12
+# Bare F10 too: on this HP Envy 13 F10 is play/pause (Fn layer), NOT mute. HyDE's bare-F10
+# mute bind hijacked it. Free it: bare F10 -> apps; play/pause via Fn+F10 (XF86AudioPlay).
+# Net result: the whole F-row is function-keys-first (F1-F12 reach apps); the printed media
+# icons (brightness F2/F3, mute F6, vol F7/F8, prev/play/next F9/F10/F11, airplane F12) all
+# fire via Fn, which emits XF86* codes already bound in keybindings.conf.
+unbind = , F10
+
+# Print Screen keybindings:
+#   Print               = region select → clipboard (no editor)
+#   Win+Print           = region select → satty markup editor
+#   Shift+Print         = all monitors → clipboard + file
+#   Win+Shift+Print     = full screen → clipboard + file (grimblast copysave screen)
+unbind = , Print
+bindd = , Print, [$ut|Screen Capture] snip to clipboard, exec, /home/yash/.local/lib/hyde/grimblast copy area
+bind = $mainMod, Print, exec, hyde-shell screenshot s
+binddl = Shift, Print, [$ut|Screen Capture] print all monitors, exec, hyde-shell screenshot p
+binddl = $mainMod SHIFT, Print, [$ut|Screen Capture] full screen capture, exec, hyde-shell screenshot p
+
+# Pin Firefox to workspace 2 (silent = land there without yanking focus on background windows;
+# the Super+W run-or-raise script handles "take me there" on launch)
+windowrule = workspace 2 silent, match:class ^(firefox)$
+
+
+# tmux chooser popup (Super+Enter when tmux already running) — small, floating, centered
+windowrule = float true, match:class ^(kitty-chooser)$
+windowrule = size 720 260, match:class ^(kitty-chooser)$
+windowrule = center true, match:class ^(kitty-chooser)$
+
+# satty (screenshot annotation) — always float and center
+windowrule = float true, match:class ^(com.gabm.satty)$
+windowrule = center true, match:class ^(com.gabm.satty)$
+
+# NHQ Secret Clipboard — local-only secure scratch file, never committed to any repo
+bind = $mainMod CTRL SHIFT, S, exec, xed /home/yash/.nhq-clipboard
