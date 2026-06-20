@@ -19,8 +19,41 @@ AGY_TOKEN_PATH = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth
 ROTATOR_ACCOUNTS_PATH = os.path.expanduser("~/.pi-antigravity-rotator/accounts.json")
 ROTATOR_STATUS_URL = "http://localhost:51200/api/status"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
-CLIENT_ID = "REDACTED-OAUTH-CLIENT-ID"
-CLIENT_SECRET = "REDACTED-OAUTH-CLIENT-SECRET"
+CREDS_PATH = os.path.expanduser(os.environ.get("AGY_CREDS_PATH", "~/.config/agy/creds.env"))
+
+
+def load_oauth_creds():
+    """Load OAuth client creds from env or the gitignored creds file.
+
+    Precedence: AGY_OAUTH_CLIENT_ID/SECRET env vars, then CREDS_PATH
+    (key=value lines). Never hardcoded — keeps secrets out of the repo.
+    """
+    cid = os.environ.get("AGY_OAUTH_CLIENT_ID")
+    csec = os.environ.get("AGY_OAUTH_CLIENT_SECRET")
+    if not (cid and csec):
+        try:
+            with open(CREDS_PATH) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    if key == "AGY_OAUTH_CLIENT_ID" and not cid:
+                        cid = val
+                    elif key == "AGY_OAUTH_CLIENT_SECRET" and not csec:
+                        csec = val
+        except FileNotFoundError:
+            pass
+    if not (cid and csec):
+        print(
+            f"Error: missing OAuth creds. Set AGY_OAUTH_CLIENT_ID and "
+            f"AGY_OAUTH_CLIENT_SECRET, or create {CREDS_PATH}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return cid, csec
 
 
 def read_accounts():
@@ -41,9 +74,10 @@ def get_rotator_quota():
 
 
 def refresh_access_token(refresh_tok):
+    client_id, client_secret = load_oauth_creds()
     payload = json.dumps({
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
+        "client_id": client_id,
+        "client_secret": client_secret,
         "refresh_token": refresh_tok,
         "grant_type": "refresh_token",
     }).encode()

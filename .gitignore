@@ -4,3 +4,7 @@ fish/private.fish
 *.secret
 .env
 .env.*
+# agy OAuth creds — consumed by bin/agy-reauth from ~/.config/agy/creds.env
+creds.env
+**/creds.env
+.config/agy/creds.env
