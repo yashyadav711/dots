@@ -455,6 +455,14 @@ bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel "bash -c 'd=
 bind -T copy-mode    y send -X copy-pipe-and-cancel "bash -c 'd=$(cat); printf %s \"$d\" | wl-copy; printf %s \"$d\" | wl-copy --primary'"
 bind -T copy-mode-vi y send -X copy-pipe-and-cancel "bash -c 'd=$(cat); printf %s \"$d\" | wl-copy; printf %s \"$d\" | wl-copy --primary'"
 set -g set-clipboard on
+
+# Click to leave copy-mode. Scrolling up (mouse wheel) drops you into vi copy-mode;
+# this lets a single left-click jump straight back to the prompt so you can type again
+# without hunting for q/Esc. Drag-select is untouched — a drag ends on MouseDragEnd1Pane
+# (which copies above), not on a plain MouseUp1Pane, and the wheel uses WheelUp/Down — so
+# only a plain click triggers the exit. (Scrolling back to the bottom also auto-exits via -e.)
+bind -T copy-mode    MouseUp1Pane send-keys -X cancel
+bind -T copy-mode-vi MouseUp1Pane send-keys -X cancel
 # ------------------------------------------------------------------------------
 
 # # /!\ do not remove the following line
