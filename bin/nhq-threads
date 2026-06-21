@@ -49,6 +49,43 @@ STATUS_KEYS = sorted(STATUS, key=len, reverse=True)
 # parent group with no direct threads; its children are the real buckets.
 CATEGORIES = {"WORK", "HEYDADDY", "MIRROR", "FIRSTSTONE", "JULIAN", "OPS", "OFF-WORK"}
 
+# Who is on the hook, derived from the status emoji (everything else -> Director).
+WHO_BY_STATUS = {"🔴": "Yash", "⏳": "Julian/ext", "✅": "Yash"}
+# Fallback action phrase when a thread has no explicit `▶ next:` field.
+ACTION_BY_STATUS = {
+    "🔴": "your call",
+    "⏳": "awaiting Julian",
+    "✅": "confirm close",
+    "🟡": "Director working",
+    "👉": "in progress",
+    "🟢": "near done",
+    "🅿️": "parked",
+    "🕒": "deferred",
+    "🔵": "await review",
+    "❓": "unclear",
+}
+# Terminal-mode colour for the Who chip (NHQ palette).
+WHO_COLOR = {"Yash": "#F2B705", "Julian/ext": "#7C873E", "Director": "#BDB8AC"}
+
+# Category theme: (colour hex, single-line ASCII motif) for the header row.
+CAT_THEME = {
+    "HEYDADDY":   ("#C8102E", "❤ ─────────── companion chat ───────────"),
+    "MIRROR":     ("#F2B705", "◧ ─────────── reflection ───────────"),
+    "FIRSTSTONE": ("#ECE7DA", "▣ ─────────── foundation ───────────"),
+    "JULIAN":     ("#7C873E", "✦ ─────────── partner ───────────"),
+    "OPS":        ("#BDB8AC", "⚙ ─────────── the machine ───────────"),
+    "OFF-WORK":   ("#BDB8AC", "☾ ─────────── after hours ───────────"),
+}
+
+# State-sort order within a category (🔴 first ... ✅/close-ready last).
+STATE_ORDER = {
+    "🔴": 0, "👉": 1, "🟡": 2, "⏳": 3, "🟢": 4,
+    "🅿️": 5, "🕒": 6, "🔵": 7, "❓": 8, "✅": 9,
+}
+
+# An optional `▶ next: <phrase>` action field inside a thread block.
+NEXT_RE = re.compile(r"▶\s*next:\s*(.+?)\s*$")
+
 # A thread-start line: optional tree gutter, a branch glyph, then `[id]`.
 THREAD_RE = re.compile(r"^[\s│]*[├└]──\s+(\[[^\]]+\](?:\s*/\s*\[[^\]]+\])*)\s*(.*)$")
 # A category header: leading whitespace then ALL-CAPS word(s), maybe a "(...)" note.
@@ -110,6 +147,7 @@ def parse(block: list[str]) -> tuple[list[dict], int]:
     threads: list[dict] = []
     source_count = 0
     cat = None
+    current: dict | None = None
     for line in block:
         if not line.strip():
             continue
@@ -119,18 +157,27 @@ def parse(block: list[str]) -> tuple[list[dict], int]:
             raw_id, rest = m.group(1), m.group(2)
             emoji, body = _match_status(rest)
             name, state = _split_name_state(body)
-            threads.append({
+            current = {
                 "id": _clean_id(raw_id),
                 "emoji": emoji,
                 "name": name,
                 "state": state,
                 "cat": cat or "WORK",
-            })
+                "next": "",
+                "idx": source_count,
+            }
+            threads.append(current)
             continue
-        # Skip indented sub-lines (opened:, 💬 last:, nested ├──/└── detail).
+        # An optional `▶ next:` action field attaches to the current thread.
+        nm = NEXT_RE.search(line)
+        if nm and current is not None:
+            current["next"] = nm.group(1).strip()
+            continue
+        # Otherwise skip indented sub-lines (opened:, 💬 last:, nested detail).
         cm = CAT_RE.match(line)
         if cm and cm.group(2).strip() in CATEGORIES:
             cat = cm.group(2).strip()
+            current = None
     return threads, source_count
 
 
@@ -146,11 +193,36 @@ def _cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ").strip()
 
 
+def _color(text: str, hexcolor: str, web: bool, bold: bool = False) -> str:
+    """Wrap text in the active render mode's colour/emphasis."""
+    if web:
+        return f"**{text}**" if bold else text
+    inner = (r"\textbf{%s}" if bold else r"\text{%s}") % text
+    return r"$\textcolor{%s}{%s}$" % (hexcolor, inner)
+
+
 def _thread_cell(t: dict) -> str:
     name = t["name"]
     state = t["state"]
     body = f"{name} — {state}" if state else name
     return _cell(_truncate(body))
+
+
+def _who(t: dict) -> str:
+    return WHO_BY_STATUS.get(t["emoji"], "Director")
+
+
+def _action(t: dict) -> str:
+    if t.get("next"):
+        return _truncate(t["next"], 40)
+    return ACTION_BY_STATUS.get(t["emoji"], "—")
+
+
+def _action_cell(t: dict, web: bool) -> str:
+    who = _who(t)
+    who_str = _color(who, WHO_COLOR.get(who, "#BDB8AC"), web, bold=True)
+    action = _cell(_action(t))
+    return f"{action} · {who_str}"
 
 
 def _status_cell(t: dict) -> str:
@@ -165,8 +237,20 @@ def _status_cell(t: dict) -> str:
 CAT_ORDER = ["HEYDADDY", "MIRROR", "FIRSTSTONE", "JULIAN", "OPS", "OFF-WORK", "WORK"]
 
 
-def render(threads: list[dict], needs_you: bool = False) -> tuple[str, int]:
-    """Render header + table. Returns (text, rendered_row_count)."""
+def _cat_header_row(cat: str, web: bool) -> str:
+    """Render a category header row: coloured name + themed single-line motif."""
+    theme = CAT_THEME.get(cat)
+    if theme is None:
+        return f"| **{cat}** | | | |"
+    hexcolor, motif = theme
+    name = _color(cat, hexcolor, web, bold=True)
+    motif_cell = _color(motif, hexcolor, web, bold=False)
+    return f"| {name} | {motif_cell} | | |"
+
+
+def render(threads: list[dict], needs_you: bool = False,
+           web: bool = False) -> tuple[str, int]:
+    """Render header + 4-column table. Returns (text, rendered_row_count)."""
     shown = [t for t in threads if (not needs_you or t["emoji"] == "🔴")]
 
     # header counts
@@ -182,12 +266,18 @@ def render(threads: list[dict], needs_you: bool = False) -> tuple[str, int]:
         header_bits.append(f"✅ {n_close} close?")
     header = " · ".join(header_bits)
 
-    # group, preserving source order within a category
+    # group, then state-sort within each category (stable on source order)
     by_cat: dict[str, list[dict]] = {}
     for t in shown:
         by_cat.setdefault(t["cat"], []).append(t)
+    for items in by_cat.values():
+        items.sort(key=lambda t: (STATE_ORDER.get(t["emoji"], 99), t["idx"]))
 
-    lines = [header, "", "| ID | Thread | Status |", "| --- | --- | --- |"]
+    lines = [
+        header, "",
+        "| ID | Thread | Action · Who | Status |",
+        "| --- | --- | --- | --- |",
+    ]
     rows = 0
     ordered = [c for c in CAT_ORDER if c in by_cat]
     ordered += [c for c in by_cat if c not in CAT_ORDER]
@@ -195,16 +285,20 @@ def render(threads: list[dict], needs_you: bool = False) -> tuple[str, int]:
         items = by_cat[c]
         if not items:
             continue
-        lines.append(f"| **{c}** | | |")
+        lines.append(_cat_header_row(c, web))
         for t in items:
-            lines.append(f"| `{t['id']}` | {_thread_cell(t)} | {_status_cell(t)} |")
+            lines.append(
+                f"| `{t['id']}` | {_thread_cell(t)} | "
+                f"{_action_cell(t, web)} | {_status_cell(t)} |"
+            )
             rows += 1
 
-    # close-ready summary row
+    # close-ready summary row (named ids), 4 columns
     close_ids = [t["id"] for t in shown if t["emoji"] == "✅"]
     if close_ids:
         joined = " ".join(f"`{i}`" for i in close_ids)
-        lines.append(f"| ✅ | close?: {joined} | ✅ |")
+        who_str = _color("Yash", WHO_COLOR["Yash"], web, bold=True)
+        lines.append(f"| ✅ | close?: {joined} | confirm close · {who_str} | ✅ |")
 
     return "\n".join(lines), rows
 
@@ -218,6 +312,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--needs-you", action="store_true", help="only 🔴 threads")
     ap.add_argument("--verify", action="store_true",
                     help="run self-test + print parse stats to stderr")
+    ap.add_argument("--web", action="store_true",
+                    help="web-safe output (bold + emoji chips, no LaTeX colour)")
     args = ap.parse_args(argv)
 
     path = os.path.expanduser(args.file)
@@ -229,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
 
     block = extract_block(text)
     threads, source_count = parse(block)
-    table, rows = render(threads, needs_you=args.needs_you)
+    table, rows = render(threads, needs_you=args.needs_you, web=args.web)
 
     print(table)
 
