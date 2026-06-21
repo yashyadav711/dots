@@ -433,6 +433,12 @@ set -g visual-bell off
 setw -g monitor-activity on
 set -g visual-activity both
 
+# Desktop notifications through tmux. omp/agents send OSC 99 notifications wrapped
+# in the tmux passthrough sequence (\ePtmux;...\e\\); tmux only forwards them to the
+# outer terminal (kitty -> dunst) when passthrough is allowed. Without this, the bell
+# (sound) still propagates but the visual popup is swallowed by tmux.
+set -g allow-passthrough on
+
 # Mouse-select -> system clipboard (Wayland). Two problems this fixes:
 #  1) `mouse on` makes a drag select into tmux's OWN buffer, not the terminal's.
 #  2) Oh-My-Tmux's copy path shells out to xclip/xsel (X11) — this box only has
