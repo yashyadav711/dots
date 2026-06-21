@@ -456,13 +456,12 @@ bind -T copy-mode    y send -X copy-pipe-and-cancel "bash -c 'd=$(cat); printf %
 bind -T copy-mode-vi y send -X copy-pipe-and-cancel "bash -c 'd=$(cat); printf %s \"$d\" | wl-copy; printf %s \"$d\" | wl-copy --primary'"
 set -g set-clipboard on
 
-# Click to leave copy-mode. Scrolling up (mouse wheel) drops you into vi copy-mode;
-# this lets a single left-click jump straight back to the prompt so you can type again
-# without hunting for q/Esc. Drag-select is untouched — a drag ends on MouseDragEnd1Pane
-# (which copies above), not on a plain MouseUp1Pane, and the wheel uses WheelUp/Down — so
-# only a plain click triggers the exit. (Scrolling back to the bottom also auto-exits via -e.)
-bind -T copy-mode    MouseUp1Pane send-keys -X cancel
-bind -T copy-mode-vi MouseUp1Pane send-keys -X cancel
+# Type-to-return in copy-mode. Scrolling up drops you into vi copy-mode to browse/select
+# with the MOUSE (click = position, drag = select+copy, wheel = scroll) WITHOUT jumping you
+# anywhere. The moment you START TYPING any normal key, copy-mode exits to the live prompt
+# and that key is sent — so you're never stuck. Escape exits without typing; scroll-to-bottom
+# auto-exits (-e); right-click menu has Go To Bottom. Printable keys are bound by the helper:
+run-shell "bash $HOME/Github/dots/tmux/copy-mode-type-exit.sh"
 # ------------------------------------------------------------------------------
 
 # # /!\ do not remove the following line
