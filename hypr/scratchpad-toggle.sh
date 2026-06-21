@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Super+S floating GUI scratchpad toggle (xed notepad on ~/scratchpad.md).
+# Super+S floating GUI scratchpad toggle (gnome-text-editor on ~/scratchpad.md).
 #
-# A single persistent floating xed window editing ~/scratchpad.md. Unlike
+# A single persistent floating gnome-text-editor window editing ~/scratchpad.md. Unlike
 # `togglespecialworkspace`, this does NOT pop an input-capturing special-workspace
 # overlay, so the rest of the screen stays fully clickable while the scratchpad is
 # open. It just hides/shows ONE floating window:
@@ -10,13 +10,12 @@
 #   - stashed in scratchpadhidden  -> pull to the current workspace + focus (SHOW)
 #   - not running at all           -> spawn it, then pin it to the top-right corner
 #
-# xed is single-instance by default and its window class is always `xed`, so we
-# (a) launch with `--standalone` to get an independent process that never merges its
-# tab into the Super+Ctrl+Shift+S secret-clipboard xed, and (b) identify the
-# scratchpad window by TITLE (it always contains "scratchpad.md") rather than class,
-# so we never grab another xed window or spawn duplicates. The userprefs.conf
-# windowrules float + size the window (reliable); placement is done here because
-# GTK/xed re-centres floating windows at map time, which defeats a `move` rule.
+# gnome-text-editor is a single-instance GApplication; its window class is always
+# `org.gnome.TextEditor`. We (a) launch with `--new-window` so the scratchpad gets its
+# own dedicated window, and (b) identify that window by class + TITLE (always contains
+# "scratchpad.md") so we never grab another Text Editor window or spawn duplicates. The
+# userprefs.conf windowrules (matched by title) float + size the window; placement is
+# done here because GTK re-centres floating windows at map time, defeating a `move` rule.
 set -euo pipefail
 
 HIDDEN="special:scratchpadhidden"
@@ -30,7 +29,7 @@ TOP=12         # gap below the top reserved area (waybar)
 
 find_addr() {
   hyprctl clients -j | jq -r \
-    'first(.[] | select(.class=="xed" and (.title | test("scratchpad\\.md"))) | .address) // empty'
+    'first(.[] | select(.class=="org.gnome.TextEditor" and (.title | test("scratchpad\\.md"))) | .address) // empty'
 }
 
 place() { # $1 = window address -> pin to the top-right corner of the focused monitor
@@ -45,9 +44,9 @@ place() { # $1 = window address -> pin to the top-right corner of the focused mo
 
 addr=$(find_addr)
 
-# Not running -> spawn a standalone floating xed, wait for it, then pin to corner.
+# Not running -> spawn a new floating gnome-text-editor window, wait for it, pin to corner.
 if [ -z "$addr" ]; then
-  xed --standalone "$NOTE" >/dev/null 2>&1 &
+  gnome-text-editor --new-window "$NOTE" >/dev/null 2>&1 &
   for _ in $(seq 1 50); do
     addr=$(find_addr)
     [ -n "$addr" ] && break
