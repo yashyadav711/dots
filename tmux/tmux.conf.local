@@ -460,8 +460,9 @@ set -g set-clipboard on
 # with the MOUSE (click = position, drag = select+copy, wheel = scroll) WITHOUT jumping you
 # anywhere. The moment you START TYPING any normal key, copy-mode exits to the live prompt
 # and that key is sent — so you're never stuck. Escape exits without typing; scroll-to-bottom
-# auto-exits (-e); right-click menu has Go To Bottom. Printable keys are bound by the helper:
-run-shell "bash $HOME/Github/dots/tmux/copy-mode-type-exit.sh"
+# auto-exits (-e); right-click menu has Go To Bottom. Bound by the helper, deferred so it
+# runs AFTER tpm/copycat load (which would otherwise clobber the letter keys):
+run-shell -b "sleep 3 && bash $HOME/Github/dots/tmux/copy-mode-type-exit.sh"
 # ------------------------------------------------------------------------------
 
 # # /!\ do not remove the following line
