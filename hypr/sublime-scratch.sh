@@ -1,48 +1,32 @@
 #!/usr/bin/env bash
-# Launch the independent, minimal Sublime Text scratchpad on ~/scratchpad.md.
+# Launch the independent, minimal, dark Sublime Text scratchpad on ~/scratchpad.md.
 #
-# Runs as a SEPARATE Sublime instance via its own XDG dirs, so it never merges with —
-# or changes the settings of — your main Sublime, while still using the auto-updating
-# /opt binary. "Very minimal": no gutter/line-numbers/indent-guides (settings) and
-# tabs + menu + status bar + minimap hidden once (they persist in THIS instance's
-# session, guarded by a sentinel so the toggles run exactly once).
-#
-# scratchpad-toggle.sh (Super+S) calls this for the cold spawn; it then floats/sizes
-# and pins the window (matched by class sublime_text + title containing scratchpad.md).
+# Separate Sublime instance via its own XDG dirs (~/.local/sublime-scratch) using the
+# /opt binary — never merges with or changes the main Sublime. Config (minimal Preferences
+# + the custom dark markdown color scheme) is seeded from dots/sublime-scratch so it's
+# reproducible and authoritative. Chrome (tabs/menu/status/minimap) is hidden once and
+# persists in this instance's session (sentinel). scratchpad-toggle.sh (Super+S) calls
+# this for the cold spawn, then floats/sizes/pins the window (class sublime_text + title).
 set -u
 
 SCRATCH="$HOME/.local/sublime-scratch"
 NOTE="$HOME/scratchpad.md"
 BIN="/opt/sublime_text/sublime_text"
+DOTS="$HOME/Github/dots/sublime-scratch"
 export XDG_CONFIG_HOME="$SCRATCH/config"
 export XDG_CACHE_HOME="$SCRATCH/cache"
 
-# Seed minimal Preferences on first run.
-PREF_DIR="$XDG_CONFIG_HOME/sublime-text/Packages/User"
-PREF="$PREF_DIR/Preferences.sublime-settings"
-if [ ! -f "$PREF" ]; then
-  mkdir -p "$PREF_DIR"
-  cat > "$PREF" <<'JSON'
-{
-    "gutter": false,
-    "line_numbers": false,
-    "draw_white_space": "none",
-    "draw_indent_guides": false,
-    "rulers": [],
-    "highlight_line": false,
-    "scroll_past_end": false,
-    "fold_buttons": false,
-    "show_definitions": false,
-    "word_wrap": true,
-    "font_size": 12
-}
-JSON
-fi
+# Seed config from dots (authoritative: keeps the minimal + dark-markdown setup correct).
+USERPKG="$XDG_CONFIG_HOME/sublime-text/Packages/User"
+mkdir -p "$USERPKG"
+cp -f "$DOTS/Preferences.sublime-settings"      "$USERPKG/" 2>/dev/null
+cp -f "$DOTS/MarkdownDark.sublime-color-scheme" "$USERPKG/" 2>/dev/null
 
 [ -f "$NOTE" ] || printf '# Scratchpad\n\n' > "$NOTE"
 
-# Launch a new window in the dedicated instance.
-"$BIN" -n "$NOTE" >/dev/null 2>&1 &
+# Launch in the dedicated instance. NO -n: a plain open focuses the existing scratchpad
+# window if the instance is already running, instead of spawning a duplicate window.
+"$BIN" "$NOTE" >/dev/null 2>&1 &
 
 # First run only: hide tabs/menu/status/minimap (persists in this instance's session).
 SENTINEL="$SCRATCH/.minimal-applied"
