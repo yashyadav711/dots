@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Super+S floating GUI scratchpad toggle (gnome-text-editor on ~/scratchpad.md).
+# Super+S floating GUI scratchpad toggle (independent minimal Sublime on ~/scratchpad.md).
 #
-# A single persistent floating gnome-text-editor window editing ~/scratchpad.md. Unlike
+# A single persistent floating Sublime Text window editing ~/scratchpad.md. Unlike
 # `togglespecialworkspace`, this does NOT pop an input-capturing special-workspace
 # overlay, so the rest of the screen stays fully clickable while the scratchpad is
 # open. It just hides/shows ONE floating window:
@@ -10,12 +10,12 @@
 #   - stashed in scratchpadhidden  -> pull to the current workspace + focus (SHOW)
 #   - not running at all           -> spawn it, then pin it to the top-right corner
 #
-# gnome-text-editor is a single-instance GApplication; its window class is always
-# `org.gnome.TextEditor`. We (a) launch with `--new-window` so the scratchpad gets its
-# own dedicated window, and (b) identify that window by class + TITLE (always contains
-# "scratchpad.md") so we never grab another Text Editor window or spawn duplicates. The
-# userprefs.conf windowrules (matched by title) float + size the window; placement is
-# done here because GTK re-centres floating windows at map time, defeating a `move` rule.
+# The scratchpad runs as an INDEPENDENT minimal Sublime instance (its own XDG config under
+# ~/.local/sublime-scratch, launched by sublime-scratch.sh) so it never merges with — or
+# changes the settings of — your main Sublime. Its window class is `sublime_text` (shared
+# with the main Sublime), so we identify the scratchpad window by class + TITLE (always
+# contains "scratchpad.md"). The userprefs.conf windowrules (matched by title) float + size
+# it; placement is done here because the window re-centres at map time, defeating `move`.
 set -euo pipefail
 
 HIDDEN="special:scratchpadhidden"
@@ -29,7 +29,7 @@ TOP=12         # gap below the top reserved area (waybar)
 
 find_addr() {
   hyprctl clients -j | jq -r \
-    'first(.[] | select(.class=="org.gnome.TextEditor" and (.title | test("scratchpad\\.md"))) | .address) // empty'
+    'first(.[] | select(.class=="sublime_text" and (.title | test("scratchpad\\.md"))) | .address) // empty'
 }
 
 place() { # $1 = window address -> pin to the top-right corner of the focused monitor
@@ -44,10 +44,10 @@ place() { # $1 = window address -> pin to the top-right corner of the focused mo
 
 addr=$(find_addr)
 
-# Not running -> spawn a new floating gnome-text-editor window, wait for it, pin to corner.
+# Not running -> launch the independent minimal Sublime, wait for its window, pin to corner.
 if [ -z "$addr" ]; then
-  gnome-text-editor --new-window "$NOTE" >/dev/null 2>&1 &
-  for _ in $(seq 1 50); do
+  bash "$HOME/Github/dots/hypr/sublime-scratch.sh" >/dev/null 2>&1 &
+  for _ in $(seq 1 80); do
     addr=$(find_addr)
     [ -n "$addr" ] && break
     sleep 0.1
