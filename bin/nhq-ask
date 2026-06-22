@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# nhq-ask <agent> "<question>" [--quick] — ephemeral one-shot ask to a fleet agent.
+# nhq-ask <agent> "<question>" [--read] — ephemeral one-shot ask to a fleet agent.
 #
 # Runs the target agent in omp PRINT mode (`omp -p --no-session`): a one-shot process
 # that loads the agent's CLAUDE.md + .claude/rules, answers, and EXITS. It creates NO
@@ -8,15 +8,15 @@
 # all in a single throwaway process. If the agent already has a live session, that
 # session is untouched — this is a separate ephemeral instance, asked and gone.
 #
-# Default: tools ON + --auto-approve so the agent can read what it needs to answer
-# (the prompt is READ-ONLY: no edits/commits/push). `--quick` = --no-tools (pure
-# reasoning, fastest, zero side-effect).
+# Default: --no-tools — a fast, tool-free, zero-side-effect reply (the agent answers
+# from its loaded CLAUDE.md + .claude/rules context). Add `--read` to let the agent use
+# tools (read repo files / its inbox) for a deeper answer; the prompt stays READ-ONLY.
 #
 # Logs the Q&A to <target-repo>/ai/<asker>-inbox.md so there's a who-asked-what trail.
 #
 # Usage:
 #   nhq-ask director "Per-repo rules file, or one shared fleet rule?"
-#   nhq-ask director --quick "One line: is omp loading .claude/rules confirmed?"
+#   nhq-ask director "Summarize the 3 briefs in ai/envy-inbox.md" --read
 set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
@@ -25,7 +25,7 @@ source "$(dirname "$SELF")/nhq-lib.sh"
 
 AGENT="${1:-}"; Q="${2:-}"; FLAG="${3:-}"
 if [[ -z "$AGENT" || -z "$Q" ]]; then
-  echo "usage: nhq-ask <agent> \"<question>\" [--quick]" >&2
+  echo "usage: nhq-ask <agent> \"<question>\" [--read]" >&2
   exit 1
 fi
 
@@ -52,8 +52,10 @@ if [[ -n "$ASKER_KEY" && "$ASKER_KEY" == "$KEY" ]]; then
   exit 1
 fi
 
-TOOLS="--auto-approve"
-[[ "$FLAG" == "--quick" ]] && TOOLS="--no-tools"
+# Default: --no-tools (fast, safe, deterministic — the agent's CLAUDE.md + rules load
+# regardless). --read enables tools (omp's yolo approvalMode auto-runs them).
+TOOLS="--no-tools"
+[[ "$FLAG" == "--read" || "$FLAG" == "--deep" ]] && TOOLS=""
 
 PROMPT="$Q
 
@@ -63,7 +65,7 @@ echo "nhq-ask -> $NAME  (ephemeral omp -p, no session; live sessions untouched)�
 ANSWER="$(cd "$REPO" && timeout 150 omp -p --no-session $TOOLS "$PROMPT" 2>/dev/null || true)"
 
 if [[ -z "${ANSWER//[[:space:]]/}" ]]; then
-  echo "nhq-ask: no answer captured from $NAME (timed out or empty). Try again, or --quick for a tool-free reply." >&2
+  echo "nhq-ask: no answer captured from $NAME (timed out or empty). Try again." >&2
   exit 1
 fi
 
