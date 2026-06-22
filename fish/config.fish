@@ -226,14 +226,20 @@ function copy; cat $argv | nhq-clip; end
 # VFrame project setup alias
 alias setupproject='bash -c "$(curl -fsSL https://raw.githubusercontent.com/yashyadav711/vframe-installer/main/setup-vframe.sh)"'
 
-# jump into HeyDaddy and resume Claude (YOLO / skip permission prompts)
-alias heydaddy='cd /home/yash/Github/heydaddy && claude --dangerously-skip-permissions --resume'
+# jump into HeyDaddy on omp
+alias heydaddy='cd ~/Github/heydaddy && omp --continue'
 # launch Envy in its office (~/Github/envy) on omp — always, regardless of invocation dir
 alias envy='cd ~/Github/envy && omp --continue'
-# jump into the mirror project and resume Claude (YOLO / skip permission prompts)
-alias mirror='cd /home/yash/Github/mirror && claude --dangerously-skip-permissions --resume'
+# jump into Mirror on omp
+alias mirror='cd ~/Github/mirror && omp --continue'
 # jump into Director (nhq-agentic-os) on omp
 alias director='cd ~/Github/nhq-agentic-os && omp --continue'
+# jump into HeyDaddy-Design on omp
+alias heydaddy-design='cd ~/Github/heydaddy-design && omp --continue'
+# jump into Mirror-Design on omp
+alias mirror-design='cd ~/Github/mirror-design && omp --continue'
+# jump into NHQ-Features on omp
+alias nhq-features='cd ~/Github/nhq-features && omp --continue'
 # typing /exit (slash-command muscle memory) expands to exit
 abbr -a -- /exit exit
 

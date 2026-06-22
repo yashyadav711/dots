@@ -45,8 +45,6 @@ tmux_conf_new_pane_reconnect_ssh=false
 #   - false (default)
 tmux_conf_new_session_prompt=false
 
-# auto-name first window when a new session is created
-set-hook -g session-created 'rename-window "PM"'
 set -g allow-rename off
 setw -g automatic-rename off
 
