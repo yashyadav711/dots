@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# nhq-ask <agent> "<question>" [--quick] — ephemeral one-shot ask to a fleet agent.
+#
+# Runs the target agent in omp PRINT mode (`omp -p --no-session`): a one-shot process
+# that loads the agent's CLAUDE.md + .claude/rules, answers, and EXITS. It creates NO
+# persistent session and never attaches to / disturbs a live interactive session
+# (e.g. Yash's Director session in nhq-agentic-os). Spawn -> ask -> answer -> close,
+# all in a single throwaway process. If the agent already has a live session, that
+# session is untouched — this is a separate ephemeral instance, asked and gone.
+#
+# Default: tools ON + --auto-approve so the agent can read what it needs to answer
+# (the prompt is READ-ONLY: no edits/commits/push). `--quick` = --no-tools (pure
+# reasoning, fastest, zero side-effect).
+#
+# Logs the Q&A to <target-repo>/ai/<asker>-inbox.md so there's a who-asked-what trail.
+#
+# Usage:
+#   nhq-ask director "Per-repo rules file, or one shared fleet rule?"
+#   nhq-ask director --quick "One line: is omp loading .claude/rules confirmed?"
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+# shellcheck source=/dev/null
+source "$(dirname "$SELF")/nhq-lib.sh"
+
+AGENT="${1:-}"; Q="${2:-}"; FLAG="${3:-}"
+if [[ -z "$AGENT" || -z "$Q" ]]; then
+  echo "usage: nhq-ask <agent> \"<question>\" [--quick]" >&2
+  exit 1
+fi
+
+KEY="$(nhq_agent_canon "$AGENT")"
+if [[ -z "$KEY" ]]; then
+  echo "nhq-ask: unknown agent '$AGENT' (see dots/bin/fleet-registry.json)" >&2
+  exit 1
+fi
+REPO="$(nhq_agent_repo "$KEY")"
+NAME="$(nhq_agent_name "$KEY")"
+if [[ -z "$REPO" || ! -d "$REPO" ]]; then
+  echo "nhq-ask: repo not found for '$KEY': ${REPO:-<unresolved>}" >&2
+  exit 1
+fi
+
+# Who is asking (for the comms log). Resolve from the caller's context; fall back gracefully.
+ASKER="$(nhq-agent-name 2>/dev/null || true)"; ASKER="${ASKER:-someone}"
+ASKER_KEY="$(nhq_agent_canon "$ASKER" 2>/dev/null || true)"
+[[ -z "$ASKER_KEY" ]] && ASKER_KEY="$(printf '%s' "$ASKER" | tr '[:upper:] ' '[:lower:]-')"
+
+# Don't ask yourself.
+if [[ -n "$ASKER_KEY" && "$ASKER_KEY" == "$KEY" ]]; then
+  echo "nhq-ask: '$NAME' is you — nothing to ask." >&2
+  exit 1
+fi
+
+TOOLS="--auto-approve"
+[[ "$FLAG" == "--quick" ]] && TOOLS="--no-tools"
+
+PROMPT="$Q
+
+[One-shot ask from '$ASKER' via nhq-ask. Answer concisely + decisively from your role and rules. READ-ONLY: do NOT edit / write / commit / push / branch — just answer. No need to run nhq-done; this is a direct reply.]"
+
+echo "nhq-ask -> $NAME  (ephemeral omp -p, no session; live sessions untouched)…" >&2
+ANSWER="$(cd "$REPO" && timeout 150 omp -p --no-session $TOOLS "$PROMPT" 2>/dev/null || true)"
+
+if [[ -z "${ANSWER//[[:space:]]/}" ]]; then
+  echo "nhq-ask: no answer captured from $NAME (timed out or empty). Try again, or --quick for a tool-free reply." >&2
+  exit 1
+fi
+
+# Print the answer to stdout.
+printf '%s\n' "$ANSWER"
+
+# Log the Q&A to the target's comms inbox (who-asked-what trail). Coordination
+# scaffolding (sanctioned carve-out from no-author-project-source); best-effort —
+# never fail the ask on a logging error.
+INBOX_DIR="$REPO/ai"
+INBOX="$INBOX_DIR/${ASKER_KEY}-inbox.md"
+if mkdir -p "$INBOX_DIR" 2>/dev/null; then
+  {
+    printf '\n## %s · %s -> %s (nhq-ask)\n**Q:** %s\n\n**A:** %s\n' \
+      "$(date '+%Y-%m-%d %H:%M')" "$ASKER" "$NAME" "$Q" "$ANSWER" >> "$INBOX" \
+      && echo "nhq-ask: logged -> ${INBOX/#$HOME/~}" >&2
+  } || true
+fi
