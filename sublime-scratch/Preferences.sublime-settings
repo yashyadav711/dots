@@ -1,0 +1,16 @@
+{
+    "color_scheme": "Packages/User/MarkdownDark.sublime-color-scheme",
+    "gutter": false,
+    "line_numbers": false,
+    "draw_white_space": "none",
+    "draw_indent_guides": false,
+    "rulers": [],
+    "highlight_line": false,
+    "scroll_past_end": false,
+    "fold_buttons": false,
+    "show_definitions": false,
+    "word_wrap": true,
+    "font_face": "JetBrains Mono",
+    "font_size": 13,
+    "margin": 8
+}

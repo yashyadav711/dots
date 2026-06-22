@@ -1,0 +1,37 @@
+{
+    "name": "Scratchpad Dark",
+    "variables": {
+        "bg": "#131313",
+        "fg": "#e4e4e4",
+        "blue": "#7aa2f7",
+        "cyan": "#7dcfff",
+        "amber": "#e0af68",
+        "purple": "#bb9af7",
+        "green": "#9ece6a",
+        "muted": "#8089a8"
+    },
+    "globals": {
+        "background": "var(bg)",
+        "foreground": "var(fg)",
+        "caret": "var(fg)",
+        "selection": "#2a2e3a",
+        "line_highlight": "#1c1c1c",
+        "gutter": "var(bg)",
+        "gutter_foreground": "var(muted)"
+    },
+    "rules": [
+        { "name": "Headings", "scope": "markup.heading", "foreground": "var(blue)", "font_style": "bold" },
+        { "name": "Heading hashes", "scope": "punctuation.definition.heading", "foreground": "var(blue)", "font_style": "bold" },
+        { "name": "Bold", "scope": "markup.bold", "foreground": "var(amber)", "font_style": "bold" },
+        { "name": "Italic", "scope": "markup.italic", "foreground": "var(purple)", "font_style": "italic" },
+        { "name": "Code", "scope": "markup.raw, markup.raw.inline, markup.raw.block, markup.inline.raw", "foreground": "var(cyan)" },
+        { "name": "Code fence punctuation", "scope": "punctuation.definition.raw", "foreground": "var(muted)" },
+        { "name": "Links", "scope": "markup.underline.link, meta.link, constant.other.reference.link", "foreground": "var(cyan)", "font_style": "underline" },
+        { "name": "Link title", "scope": "string.other.link.title, string.other.link.description", "foreground": "var(blue)" },
+        { "name": "Lists", "scope": "markup.list, punctuation.definition.list_item", "foreground": "var(amber)" },
+        { "name": "Blockquote", "scope": "markup.quote", "foreground": "var(muted)", "font_style": "italic" },
+        { "name": "Emphasis punctuation", "scope": "punctuation.definition.bold, punctuation.definition.italic", "foreground": "var(muted)" },
+        { "name": "Separator/HR", "scope": "meta.separator, punctuation.definition.thematic-break", "foreground": "var(muted)" },
+        { "name": "Code language label", "scope": "constant.other.language-name", "foreground": "var(green)" }
+    ]
+}
