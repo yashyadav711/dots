@@ -220,7 +220,7 @@ if type -q thefuck
 end
 
 # Copy a file to clipboard function
-function copy; cat $argv | xsel --clipboard; echo "📋 Copied to clipboard!"; end
+function copy; cat $argv | nhq-clip; end
 
 
 # VFrame project setup alias
@@ -228,12 +228,12 @@ alias setupproject='bash -c "$(curl -fsSL https://raw.githubusercontent.com/yash
 
 # jump into HeyDaddy and resume Claude (YOLO / skip permission prompts)
 alias heydaddy='cd /home/yash/Github/heydaddy && claude --dangerously-skip-permissions --resume'
-# launch Envy in ~ and resume (YOLO / skip permission prompts)
-alias envy='cd ~ && claude --dangerously-skip-permissions --resume'
+# launch Envy in its office (~/Github/envy) on omp — always, regardless of invocation dir
+alias envy='cd ~/Github/envy && omp --continue'
 # jump into the mirror project and resume Claude (YOLO / skip permission prompts)
 alias mirror='cd /home/yash/Github/mirror && claude --dangerously-skip-permissions --resume'
-# jump into the product-manager project (PM) and resume Claude (YOLO / skip permission prompts)
-alias pm='cd ~/Github/product-manager && claude --model sonnet --name PM --dangerously-skip-permissions'
+# jump into Director (nhq-agentic-os) on omp
+alias director='cd ~/Github/nhq-agentic-os && omp --continue'
 # typing /exit (slash-command muscle memory) expands to exit
 abbr -a -- /exit exit
 
@@ -275,7 +275,7 @@ function fish_greeting
 
     echo "$cb  ╭─── NetrunnersHQ ─────────────────────────────────────╮$cn"
 
-    for entry in "HeyDaddy |/home/yash/Github/heydaddy" "Mirror   |/home/yash/Github/mirror" "PM       |/home/yash/Github/product-manager"
+    for entry in "HeyDaddy |/home/yash/Github/heydaddy" "Mirror   |/home/yash/Github/mirror" "Director |/home/yash/Github/nhq-agentic-os"
         set -l parts (string split "|" $entry)
         set -l label $parts[1]
         set -l path $parts[2]
