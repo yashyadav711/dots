@@ -4,3 +4,6 @@ fish/private.fish
 *.secret
 .env
 .env.*
+# firecrawl rotator key store (lives at ~/.config/firecrawl-keys — never commit a key)
+firecrawl-keys
+firecrawl-rotator-keys*

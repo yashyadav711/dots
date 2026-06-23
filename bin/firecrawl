@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# firecrawl — key-rotator wrapper (shadows ~/.npm-global/bin/firecrawl via PATH order).
+#   • Round-robin: each invocation starts on the next key (persisted index).
+#   • Rotate-on-quota: on 429 / out-of-credit, retry the same call with the next key.
+# Keys live in $STORE (chmod 600, OUTSIDE any git repo, NEVER committed). No key value
+# is ever printed; FCROT_DEBUG=1 shows only the masked last-4 + index, to stderr.
+set -uo pipefail
+
+REAL="$HOME/.npm-global/bin/firecrawl"
+STORE="$HOME/.config/firecrawl-keys"
+IDX="$HOME/.cache/firecrawl-rotator.idx"
+# Markers Firecrawl emits when a key is rate-limited / out of credit (case-insensitive).
+QUOTA_RE='429|too many requests|rate.?limit|quota|insufficient.*credit|out of credit|payment required|402|credit limit|exceeded'
+
+[ -x "$REAL" ] || { echo "firecrawl-rotator: real CLI not found at $REAL" >&2; exit 127; }
+
+mapfile -t KEYS < <(grep -vE '^[[:space:]]*(#|$)' "$STORE" 2>/dev/null)
+n=${#KEYS[@]}
+# No store → behave exactly like the real CLI (honour existing FIRECRAWL_API_KEY env).
+[ "$n" -eq 0 ] && exec "$REAL" "$@"
+
+start=$(cat "$IDX" 2>/dev/null); start=${start//[!0-9]/}; start=${start:-0}
+echo $(( (start + 1) % n )) > "$IDX" 2>/dev/null   # advance for the NEXT invocation
+
+# ponytail: output is teed (streamed live + buffered) so we can scan it for quota
+# markers before deciding to rotate. Fine for a CLI; lose true byte-streaming only.
+tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+rc=0
+for ((i = 0; i < n; i++)); do
+  slot=$(( (start + i) % n )); k="${KEYS[$slot]}"
+  [ -n "${FCROT_DEBUG:-}" ] && echo "firecrawl-rotator: key #$((slot + 1))/$n (…${k: -4})" >&2
+  FIRECRAWL_API_KEY="$k" "$REAL" "$@" 2>&1 | tee "$tmp"
+  rc=${PIPESTATUS[0]}
+  [ "$rc" -eq 0 ] && exit 0
+  if grep -qiE "$QUOTA_RE" "$tmp"; then
+    [ -n "${FCROT_DEBUG:-}" ] && echo "firecrawl-rotator: quota/limit on key #$((slot + 1)), rotating" >&2
+    continue
+  fi
+  exit "$rc"   # non-quota failure (bad URL, syntax, …): rotating won't help
+done
+echo "firecrawl-rotator: all $n keys exhausted (quota/limit)" >&2
+exit "$rc"
