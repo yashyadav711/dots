@@ -66,7 +66,7 @@ def pad_visible(s,width):
     return s+" "*max(0,width-len_visible(s))
 
 # public API list prices per 1M tokens: (input, output, cache_read, cache_write_5m)
-# source: platform.claude.com/docs/.../pricing — verified 2026-06-03 (PM-BT research).
+# source: platform.claude.com/docs/.../pricing — verified 2026-06-03 (pricing research).
 # NOTE: the Pilot is on a Claude MAX subscription (flat ~$200/mo), NOT API billing — so
 # the $ figure below is "API-equivalent" (what this token volume WOULD cost at API rates),
 # not an actual charge. Token volume is the real signal; dollars are a reference only.
@@ -106,7 +106,7 @@ def proc_comm(pid):
 # map a cwd to a human project NAME (the headline identity)
 def project_label(cwd):
     if not cwd: return "?"
-    if cwd==HOME: return "Home-BT"
+    if cwd==HOME: return "Home"
     return os.path.basename(cwd.rstrip("/")) or cwd
 # the folder PATH, home-relative, shown dim next to the name
 def folder_path_disp(cwd):
@@ -124,7 +124,7 @@ def creator_of(pid):
         comm=proc_comm(cur); cwd=proc_cwd(cur)
         base=os.path.basename(argv[0]) if argv else comm
         if base=="claude":
-            who="Home-BT" if cwd==HOME else f"{project_label(cwd)} BT"
+            who="Home Fleet" if cwd==HOME else f"{project_label(cwd)} Fleet"
             return (f"{who} (claude session pid {cur})", cwd)
         if base in ("python","python3") and "-m" in argv:
             mod=argv[argv.index("-m")+1] if argv.index("-m")+1<len(argv) else "?"
@@ -420,7 +420,7 @@ def render(include_idle=False, max_idle=300):
             L.append(label("agents" if i==0 else "",
                 f"{c(tee,GREY)} {dot(sage)} {c(aid,CYAN)} {trunc(txt,W-27)} {c(fmt_age(sage),DIM)}"))
         L.append("")    # blank line between sessions
-    L.append(c(" id=session uuid · pid · git branch    from=who spawned it (BT/project, or you)",DIM))
+    L.append(c(" id=session uuid · pid · git branch    from=who spawned it (Fleet/project, or you)",DIM))
     L.append(c(" ⧗=time until the rolling 5h rate-limit window resets (via ccusage) — not quota remaining",DIM))
     L.append(c(" up=process uptime · convo=conversation span (resumed) · io=fresh in+out tokens",DIM))
     return "\n".join(L)
