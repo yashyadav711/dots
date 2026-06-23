@@ -27,8 +27,7 @@ if [[ -z "$AGENT" || -z "$RESULT" ]]; then
 fi
 
 # Overridable so the selftest stays hermetic (no real inbox / toast / ledger writes).
-# P3: inbox migrated to nhq-agentic-os (Director's canonical home; product-manager
-# is now legacy/fallback).
+# Inbox lives in nhq-agentic-os (Director's canonical home).
 INBOX="${NHQ_INBOX:-$HOME/Github/nhq-agentic-os/ai/fleet-inbox.md}"
 NOTIFY="${NHQ_NOTIFY:-$HOME/.local/bin/nhq-notify}"
 LEDGER="${NHQ_LEDGER:-$HOME/Github/nhq-agentic-os/ai/task-ledger.md}"

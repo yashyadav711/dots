@@ -124,13 +124,9 @@ eq() { # eq <label> <got> <want>
   if [[ "$2" == "$3" ]]; then ok "$1 ($2)"; else no "$1 — got '$2' want '$3'"; fi
 }
 eq "canon hd → heydaddy"            "$(nhq_agent_canon hd)"                       "heydaddy"
-eq "canon pm → director"            "$(nhq_agent_canon pm)"                       "director"
-eq "canon product-manager → director" "$(nhq_agent_canon product-manager)"       "director"
 eq "canon bogus → ''"               "$(nhq_agent_canon bogus)"                    ""
 eq "repo director abs dir"          "$(nhq_agent_repo director)"                  "$HOME/Github/nhq-agentic-os"
-eq "alias product-manager → director repo" "$(nhq_agent_repo product-manager)"    "$HOME/Github/nhq-agentic-os"
 eq "session fleet-director-x-y"     "$(nhq_session_agent fleet-director-x-y)"     "director"
-eq "session fleet-product-manager-z" "$(nhq_session_agent fleet-product-manager-z)" "director"
 
 echo "── P1-b: nhq-meta CRUD round-trip ──────────────────────────────────────"
 SM="fleet-selftest-meta"

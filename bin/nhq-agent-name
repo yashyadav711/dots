@@ -45,8 +45,9 @@ canon() { nhq_agent_name "${1:-}"; }
 
 # A fleet session is fleet-<agent>-<slug>; <slug> may itself contain dashes, so
 # match the agent as the KNOWN token right after "fleet-" (prefix/longest match),
-# not by splitting on dashes (which breaks on "product-manager" and multi-word
-# slugs). nhq_session_agent does the longest-token match against the registry.
+# not by splitting on dashes (which breaks on dashed agent names like
+# "heydaddy-design" and multi-word slugs). nhq_session_agent does the
+# longest-token match against the registry.
 from_session() {
   local s="${1:-}"
   [[ "$s" == fleet-* ]] || return 0
