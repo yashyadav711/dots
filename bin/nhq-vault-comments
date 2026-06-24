@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""nhq-vault-comments — list every Document Comments comment in the nHQ vault.
+
+Document Comments stores comments inline in each note as HTML-comment markers:
+    <!--c:ID-->highlighted text<!--/c:ID-->        (the anchored span)
+    <!--co:ID by:AUTHOR at:TS status:open quote:"..."
+    author (ts): message
+    -->                                            (the thread)
+So "which file did I comment in?" is answered by scanning for `<!--co:` blocks.
+This tool finds them across the vault and prints file · status · quoted text ·
+thread — the saved version of the find-my-comment logic.
+
+Usage:
+  nhq-vault-comments            # all comments, grouped by file
+  nhq-vault-comments --open     # only unresolved (status:open)
+Exit 0 always.
+"""
+import sys, os, re
+from pathlib import Path
+
+VAULT = Path(os.environ.get("NHQ_VAULT",
+    "/home/yash/Github/product-manager/Yash's Folder/Obsidian/nHQ"))
+SKIP = {".obsidian", ".git", ".trash", ".stfolder"}
+CO = re.compile(r'<!--co:(?P<id>\S+)\s+(?P<meta>[^\n]*)\n(?P<body>.*?)-->', re.DOTALL)
+
+def field(meta, key):
+    m = re.search(rf'{key}:"([^"]*)"', meta) or re.search(rf'{key}:(\S+)', meta)
+    return m.group(1) if m else ""
+
+def main(argv):
+    only_open = "--open" in argv
+    total = 0
+    for root, dirs, files in os.walk(VAULT):
+        dirs[:] = [d for d in dirs if d not in SKIP]
+        for fn in sorted(files):
+            if not fn.endswith(".md"):
+                continue
+            p = Path(root) / fn
+            try:
+                txt = p.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if "<!--co:" not in txt:
+                continue
+            hits = []
+            for m in CO.finditer(txt):
+                status = field(m["meta"], "status") or "open"
+                if only_open and status != "open":
+                    continue
+                quote = field(m["meta"], "quote")
+                by = field(m["meta"], "by")
+                # thread: lines like  author (ts): text
+                thread = []
+                for ln in m["body"].strip().splitlines():
+                    mm = re.match(r'\s*(.+?)\s*\([^)]*\):\s*(.*)', ln)
+                    if mm:
+                        thread.append(f"{mm.group(1)}: {mm.group(2)}")
+                    elif ln.strip():
+                        thread.append(ln.strip())
+                hits.append((status, quote, by, thread))
+            if hits:
+                rel = p.relative_to(VAULT)
+                print(f"\n\U0001F4C4 {rel}")
+                for status, quote, by, thread in hits:
+                    tag = "\u2713 resolved" if status == "resolved" else "\u25cf open"
+                    print(f'  [{tag}] on "{quote}"  (by {by or "?"})')
+                    for t in thread:
+                        print(f"      \u2192 {t}")
+                    total += 1
+    print(f"\nnhq-vault-comments: {total} comment(s)" + (" (open only)" if only_open else "") + " across the vault")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
