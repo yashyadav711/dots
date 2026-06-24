@@ -13,7 +13,10 @@ def assemble(items, date, cfg):
     for it in items: by_sec.setdefault(it["section"], []).append(it)
     part_of = {s["section"]: s["part"] for s in cfg["sources"]}
     L = [f"---\ntitle: '📰 Daily — {date}'\ntags: [daily, news]\ndate: {date}\nread: false\n---\n",
-         "- [ ] Read\n"]
+         "- [ ] Read\n",
+         f"![hero](_covers/{date}-cover.png)",
+         f"*Your daily world + builder briefing — {date}*",
+         ""]
     # TL;DR
     flat = [i for s in by_sec.values() for i in s]
     L.append("> [!tip] TL;DR — the 5 things that matter today")

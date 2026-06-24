@@ -17,3 +17,5 @@ def test_assemble_structure_and_rules():
     assert "8.2" in md and "- [ ] Already know this" in md                 # rating + tick on lounge
     assert "(#around-the-world)" in md and "(#movie-of-the-day)" in md     # index anchors match slugs
     assert md.count("- [ ] Already know this") == 1                        # only lounge gets it
+    assert "![hero](_covers/2026-06-25-cover.png)" in md                   # hero cover emitted
+    assert md.index("![hero]") < md.index("TL;DR")                        # hero above the fold

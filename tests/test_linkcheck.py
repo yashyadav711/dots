@@ -8,7 +8,8 @@ nlc = importlib.util.module_from_spec(spec); spec.loader.exec_module(nlc)
 def test_homepage_rejected_article_ok():
     ok_home, _ = nlc.is_homepage("https://www.bbc.com/")
     ok_art, _ = nlc.is_homepage("https://www.bbc.com/news/world-12345")
-    assert ok_home is True and ok_art is False   # bare root flagged, deep article fine
+    proj, _ = nlc.is_homepage("https://selforg-npa.github.io/")
+    assert ok_home is True and ok_art is False and proj is False  # project-page root is real content
 
 def test_anchor_resolution():
     md = "## In this edition\n- [Around the World](#around-the-world)\n- [Dead](#nope)\n## Around the World\nx\n"

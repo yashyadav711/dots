@@ -3,10 +3,16 @@
 import sys, re, urllib.request, urllib.parse, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
+# Hosts where the bare root IS the content (project/landing pages), not a nav homepage.
+PROJECT_HOSTS = (".github.io", ".gitlab.io", ".pages.dev", ".netlify.app", ".vercel.app", ".readthedocs.io")
+
 def is_homepage(url):
     p = urllib.parse.urlparse(url)
+    host = p.netloc.lower()
     depth = len([x for x in p.path.split("/") if x])
-    if depth == 0 and not p.query: return True, "bare homepage"
+    if depth == 0 and not p.query:
+        if any(host.endswith(s) for s in PROJECT_HOSTS): return False, ""  # project page = real content
+        return True, "bare homepage"
     return False, ""
 
 # Definitively-dead codes: drop. Everything else (incl. 403/405/429/5xx bot-blocks

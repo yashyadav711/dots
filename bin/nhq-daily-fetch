@@ -59,8 +59,10 @@ def fetch_source(entry, rating_min=7):
     for r in rows:
         if t == "rss":
             getf = lambda key: (r.get(f[key]) if key in f else None)
+            summ = getf("summary") or r.get("description") or r.get("subtitle")
+            if not summ and r.get("content"): summ = r["content"][0].get("value")
             item = {"headline": getf("title"), "url": getf("url"),
-                    "image": _field(r, f.get("image")), "summary": getf("summary"), "rating": None}
+                    "image": _field(r, f.get("image")), "summary": summ, "rating": None}
         else:
             item = {"headline": _field(r, f["title"]), "url": _field(r, f["url"]),
                     "image": _field(r, f.get("image")), "summary": _field(r, f.get("summary")),
