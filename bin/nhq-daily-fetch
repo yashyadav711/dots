@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 """nhq-daily-fetch — typed source adapters -> normalized magazine items."""
-import sys, os, json, yaml, urllib.request, datetime, feedparser
+import sys, os, json, re, html, yaml, urllib.request, datetime, feedparser
 
 CFG = os.path.expanduser("~/.claude/skills/daily-news/config.yaml")
+
+def _clean(text):
+    """Sanitize feed body text: decode HTML entities, strip tags, drop arXiv
+    boilerplate, collapse whitespace — so no raw markup leaks into the magazine."""
+    if not text: return text
+    text = html.unescape(str(text))                 # &#x2F; &amp; &lt;p&gt; -> / & <p>
+    text = re.sub(r"<[^>]+>", " ", text)            # strip HTML tags
+    text = re.sub(r"arXiv:\S+\s*", "", text)        # arXiv id prefix
+    text = re.sub(r"Announce Type:\s*\w+\s*", "", text)
+    text = re.sub(r"^\s*Abstract:\s*", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
 
 def _dig(obj, path):
     cur = obj
@@ -53,6 +65,7 @@ def fetch_source(entry, rating_min=7):
             item = {"headline": _field(r, f["title"]), "url": _field(r, f["url"]),
                     "image": _field(r, f.get("image")), "summary": _field(r, f.get("summary")),
                     "rating": _field(r, f.get("rating"))}
+        item["headline"] = _clean(item["headline"]); item["summary"] = _clean(item.get("summary"))
         if not item["headline"] or not item["url"]: continue
         if item["rating"] is not None and float(item["rating"]) < rating_min: continue
         item.update(section=entry["section"], part=entry["part"], source=entry["url"])

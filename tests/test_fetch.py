@@ -31,3 +31,9 @@ def test_fetch_all_skips_failing_source():
            "url":"https://127.0.0.1:1/nope.json","fields":{"root":"x","title":"t","url":"u"}}
     items = ndf.fetch_all([good, bad], 7)   # must not raise
     assert len(items) >= 1 and all(i["section"] == "Around the World" for i in items)
+
+def test_clean_strips_html_entities_boilerplate():
+    assert ndf._clean("<p>Hello <a href='x'>world</a></p>") == "Hello world"
+    assert ndf._clean("go to https:&#x2F;&#x2F;x.com&#x2F;a now") == "go to https://x.com/a now"
+    assert ndf._clean("arXiv:2606.123 Announce Type: new Abstract: Real text") == "Real text"
+    assert ndf._clean("&lt;p&gt;escaped&lt;/p&gt;") == "escaped"
