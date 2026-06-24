@@ -1,4 +1,4 @@
-import importlib.util, os, json
+import importlib.util, os, json, time
 import importlib.machinery
 loader = importlib.machinery.SourceFileLoader("ndf", os.path.expanduser("~/Github/dots/bin/nhq-daily-fetch"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -37,3 +37,11 @@ def test_clean_strips_html_entities_boilerplate():
     assert ndf._clean("go to https:&#x2F;&#x2F;x.com&#x2F;a now") == "go to https://x.com/a now"
     assert ndf._clean("arXiv:2606.123 Announce Type: new Abstract: Real text") == "Real text"
     assert ndf._clean("&lt;p&gt;escaped&lt;/p&gt;") == "escaped"
+
+def test_fresh_filters_old_rss():
+    now = time.gmtime()
+    old = time.gmtime(time.time() - 10*86400)   # 10 days old
+    assert ndf._fresh({"published_parsed": now}, 3) is True
+    assert ndf._fresh({"published_parsed": old}, 3) is False   # stale → dropped
+    assert ndf._fresh({}, 3) is True                            # no date → kept
+    assert ndf._fresh({"published_parsed": old}, 0) is True     # filter off
