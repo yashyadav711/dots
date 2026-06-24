@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""nhq-daily-image — build the on-brand prompt + call nhq-image."""
+import sys, os, subprocess, yaml
+CFG = os.path.expanduser("~/.claude/skills/daily-news/config.yaml")
+
+def build_prompt(section_key, cfg):
+    motif = cfg["image"]["motifs"].get(section_key, cfg["image"]["motifs"].get("cover",""))
+    return cfg["image"]["template"].replace("{section_motif}", motif)
+
+def main():
+    section_key, out = sys.argv[1], sys.argv[2]
+    cfg = yaml.safe_load(open(CFG)); prompt = build_prompt(section_key, cfg)
+    subprocess.run(["nhq-image", prompt, out, "--brand"], check=False)
+    print(out if os.path.exists(out) and os.path.getsize(out) > 0 else "FAILED")
+
+if __name__ == "__main__":
+    main()
