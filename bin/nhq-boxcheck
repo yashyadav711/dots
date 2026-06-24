@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""nhq-boxcheck — verify box-drawing TUI mockups inside ```text fences render as
+perfect rectangles in a monospace/Nerd-Font context (Obsidian, terminals).
+
+THE VERIFIED WAY (why mockups break + the rule):
+  A box only aligns if every row is the SAME display width and every char is
+  exactly ONE monospace cell. Two things break that:
+    1. Color emoji (🟢 📄 ⚡ ⚠ 🤖 …) fall back to the OS emoji font → ~2 cells,
+       off the grid. Use 1-cell glyphs instead: ● status, ▲ warning, ❯ prompt,
+       ▸ · ○ ◉ ◯, or plain text labels.
+    2. Rows not padded to the border width (right edge ragged), or stray
+       U+FFFD/control chars buried in borders.
+  Under "1-cell chars only", display width == len(line), so the check is simply:
+  all box rows equal length, and no emoji/garbage chars.
+
+Usage:
+  nhq-boxcheck <file.md> [more files / globs...]
+  nhq-boxcheck "vault/omp/*.md"
+Exit 0 = all boxes aligned & clean; exit 1 = at least one broken box.
+"""
+import sys, glob, unicodedata
+
+BOX = set("╭╮╰╯│├┤┬┴┼─━┃┏┓┗┛┣┫┳┻╋")
+
+def is_box_line(l):
+    return any(c in BOX for c in l)
+
+def bad_char(c):
+    o = ord(c)
+    # color emoji + emoji-presentation dingbats + replacement/garbage + VS16
+    return (0x1F000 <= o <= 0x1FAFF) or o in (
+        0x26A0, 0x26A1, 0x2705, 0x274C, 0x2728, 0x2B50, 0x2764, 0xFFFD, 0xFE0F)
+
+def text_boxes(text):
+    out, cur, infence = [], [], False
+    for ln in text.split("\n"):
+        if ln.strip() == "```text":
+            infence, cur = True, []
+            continue
+        if infence and ln.strip() == "```":
+            infence = False
+            out.append(cur)
+            continue
+        if infence:
+            cur.append(ln)
+    return out
+
+def check_file(path):
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError as e:
+        print(f"  ! cannot read {path}: {e}")
+        return 0, 1
+    ok = broken = 0
+    for bi, blk in enumerate(text_boxes(text)):
+        bl = [l for l in blk if is_box_line(l)]
+        if not bl:
+            continue
+        lens = {len(l) for l in bl}
+        bads = sorted({f"{c!r} U+{ord(c):04X}" for l in bl for c in l if bad_char(c)})
+        if len(lens) == 1 and not bads:
+            ok += 1
+        else:
+            broken += 1
+            why = []
+            if len(lens) != 1:
+                why.append(f"ragged rows (widths {sorted(lens)})")
+            if bads:
+                why.append(f"non-1-cell chars {bads}")
+            print(f"  ✗ {path}  [text-block {bi}]: " + "; ".join(why))
+    return ok, broken
+
+def main(argv):
+    paths = []
+    for a in argv:
+        g = glob.glob(a)
+        paths += g if g else [a]
+    if not paths:
+        print(__doc__)
+        return 2
+    tot_ok = tot_broken = 0
+    for p in paths:
+        o, b = check_file(p)
+        tot_ok += o
+        tot_broken += b
+    status = "✅ all boxes aligned & clean" if tot_broken == 0 else f"✗ {tot_broken} broken"
+    print(f"nhq-boxcheck: {tot_ok} ok, {tot_broken} broken across {len(paths)} file(s) — {status}")
+    return 1 if tot_broken else 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
