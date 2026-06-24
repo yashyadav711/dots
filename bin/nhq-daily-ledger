@@ -5,26 +5,36 @@ import sys, os, json, re
 def canonical_id(item):
     return (item.get("url") or item.get("headline") or "").strip().lower().rstrip("/")
 
-def _title_key(item):
-    """Normalized first-6-words of the headline — catches the same story
-    surfacing in two sections/outlets (different URLs, ~same title)."""
-    h = re.sub(r"[^a-z0-9 ]", "", (item.get("headline") or "").lower())
-    return " ".join(h.split()[:6])
+_STOP = set("the a an of to in on for and or with as is are be by at from over into after amid say says said new latest this that it its his her their what how why when who will would over under more most than then but not are was were".split())
 
-def _load(p): 
+def _sig_words(item):
+    """Significant (≥4-char, non-stopword) words of a headline — for fuzzy dedup
+    of the SAME story worded differently across outlets/sections."""
+    h = re.sub(r"[^a-z0-9 ]", " ", (item.get("headline") or "").lower())
+    return {w for w in h.split() if len(w) >= 4 and w not in _STOP}
+
+def _dup(a, b):
+    """Two headlines are the same story if they share ≥3 significant words AND
+    that overlap is ≥40% of the smaller headline's significant words."""
+    if not a or not b: return False
+    shared = len(a & b)
+    return shared >= 3 and shared / min(len(a), len(b)) >= 0.4
+
+def _load(p):
     try: return set(json.load(open(p)))
     except (OSError, ValueError): return set()
 
 def filter_unseen(items, ledger_path):
     """Drop items already in the persistent ledger (by URL) AND near-duplicate
-    headlines within this edition (same story from a different outlet/section)."""
-    seen = _load(ledger_path); titles = set(); out = []
+    stories within this edition — even when worded differently per outlet."""
+    seen = _load(ledger_path); kept_sets = []; out = []
     for it in items:
-        cid = canonical_id(it); tk = _title_key(it)
+        cid = canonical_id(it)
         if cid and cid in seen: continue
-        if tk and tk in titles: continue   # cross-section / cross-outlet dupe
+        sig = _sig_words(it)
+        if any(_dup(sig, k) for k in kept_sets): continue   # same story, different wording/section
         if cid: seen.add(cid)
-        if tk: titles.add(tk)
+        kept_sets.append(sig)
         out.append(it)
     return out
 
