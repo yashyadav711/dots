@@ -13,9 +13,14 @@ def update_home(home_path, block):
     text = open(home_path).read()
     if "<!-- DAILY:START -->" in text:
         text = re.sub(r"<!-- DAILY:START -->.*?<!-- DAILY:END -->", block, text, flags=re.S)
+    elif text.startswith("---\n") and "\n---" in text[4:]:
+        # no markers yet: insert AFTER the YAML frontmatter, never above it
+        end = text.index("\n---", 4)
+        cut = text.index("\n", end + 1) + 1
+        text = text[:cut] + "\n" + block + "\n" + text[cut:]
     else:
         text = block + "\n" + text
-    open(home_path,"w").write(text)
+    open(home_path, "w").write(text)
 
 def main():
     home, date, cover, items_json = sys.argv[1:5]
