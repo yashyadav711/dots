@@ -35,7 +35,7 @@ def _field(item, spec):
 
 def _subst_url(url):
     d7 = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
-    url = url.replace("{date_7d}", d7)
+    url = url.replace("{date_7d}", d7).replace("{today}", datetime.date.today().isoformat())
     if "{TMDB_KEY}" in url: url = url.replace("{TMDB_KEY}", os.environ.get("TMDB_KEY",""))
     return url
 
