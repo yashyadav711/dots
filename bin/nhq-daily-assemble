@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""nhq-daily-assemble — normalized items -> premium 3-part magazine markdown."""
+import sys, os, json, yaml, re
+from collections import OrderedDict
+CFG = os.path.expanduser("~/.claude/skills/daily-news/config.yaml")
+PARTS = [("world","🌍 THE WORLD"),("workshop","🛠️ THE WORKSHOP"),("lounge","🎧 THE LOUNGE")]
+
+def _slug(h): return re.sub(r"[^a-z0-9]+","-", h.strip().lower()).strip("-")
+
+def assemble(items, date, cfg):
+    order = [s["section"] for s in cfg["sources"]]
+    by_sec = OrderedDict((s, []) for s in order)
+    for it in items: by_sec.setdefault(it["section"], []).append(it)
+    part_of = {s["section"]: s["part"] for s in cfg["sources"]}
+    L = [f"---\ntitle: '📰 Daily — {date}'\ntags: [daily, news]\ndate: {date}\nread: false\n---\n",
+         "- [ ] Read\n"]
+    # TL;DR
+    flat = [i for s in by_sec.values() for i in s]
+    L.append("> [!tip] TL;DR — the 5 things that matter today")
+    for i in flat[:5]: L.append(f"> - **{i['headline']}** — [source]({i['url']})")
+    L.append("")
+    # Index
+    L.append("## 📑 In this edition")
+    for part_key, part_label in PARTS:
+        secs = [s for s in by_sec if part_of.get(s)==part_key and by_sec[s]]
+        if not secs: continue
+        L.append(f"**{part_label}**")
+        for s in secs: L.append(f"- [{s}](#{_slug(s)}) · {len(by_sec[s])}")
+    L.append("\n---")
+    # Parts
+    for part_key, part_label in PARTS:
+        secs = [s for s in by_sec if part_of.get(s)==part_key and by_sec[s]]
+        if not secs: continue
+        L.append(f"## {part_label}")
+        for s in secs:
+            L.append(f"### {s}")
+            for it in by_sec[s]:
+                L.append(f"**{it['headline']}**" + (f" · ⭐ {it['rating']}" if it.get("rating") else ""))
+                if it.get("summary"): L.append(it["summary"])
+                if it.get("image"): L.append(f"![]({it['image']})")
+                L.append(f"↗ [source]({it['url']})")
+                if part_key == "lounge": L.append("- [ ] Already know this")
+                L.append("")
+    L.append("## 📅 On This Day\n## 💡 Idea of the Day\n")
+    L.append(f"*Sources: {len(flat)} · generated {date}*")
+    return "\n".join(L)
+
+def main():
+    items = json.load(open(sys.argv[1])); date = sys.argv[2]; out = sys.argv[3]
+    cfg = yaml.safe_load(open(CFG))
+    open(out,"w").write(assemble(items, date, cfg)); print(out)
+
+if __name__ == "__main__":
+    main()
