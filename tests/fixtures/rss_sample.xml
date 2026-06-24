@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0">
+<channel>
+    <title>Sample RSS</title>
+    <item>
+        <title>Item 1</title>
+        <link>http://example.com/1</link>
+        <summary>Summary 1</summary>
+    </item>
+    <item>
+        <title>Item 2</title>
+        <link>http://example.com/2</link>
+        <summary>Summary 2</summary>
+    </item>
+    <item>
+        <title>Item 3</title>
+        <link>http://example.com/3</link>
+        <summary>Summary 3</summary>
+    </item>
+    <item>
+        <title>Item 4</title>
+        <link>http://example.com/4</link>
+        <summary>Summary 4</summary>
+    </item>
+</channel>
+</rss>
