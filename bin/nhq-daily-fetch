@@ -35,7 +35,8 @@ def _field(item, spec):
 
 def _subst_url(url):
     d7 = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
-    url = url.replace("{date_7d}", d7).replace("{today}", datetime.date.today().isoformat())
+    t = datetime.date.today()
+    url = url.replace("{date_7d}", d7).replace("{today}", t.isoformat()).replace("{month}", f"{t.month:02d}").replace("{day}", f"{t.day:02d}")
     if "{TMDB_KEY}" in url: url = url.replace("{TMDB_KEY}", os.environ.get("TMDB_KEY",""))
     return url
 
@@ -104,7 +105,8 @@ def fetch_source(entry, rating_min=7):
                     "image": _field(r, f.get("image")), "summary": _field(r, f.get("summary")),
                     "rating": _field(r, f.get("rating"))}
         item["headline"] = _clean(item["headline"]); item["summary"] = _clean(item.get("summary"))
-        if not item["headline"] or not item["url"]: continue
+        if not item["headline"]: continue
+        if not item["url"] and entry.get("part") != "closing": continue   # quotes (Idea) have no URL
         if item["rating"] is not None and float(item["rating"]) < rating_min: continue
         item.update(section=entry["section"], part=entry["part"], source=entry["url"])
         out.append(item)
