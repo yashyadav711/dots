@@ -47,13 +47,16 @@ def assemble(items, date, cfg):
                 if img.startswith("http"): B.append(f"![]({img})")   # real photo only; skip the repeated tile
                 B.append(f"↗ [source]({it['url']})")
                 if part_key == "lounge": B.append("- [ ] Already know this")
-    # closing sections render from data (part: closing) when present
-    for sec, label in [("On This Day", "## 📅 On This Day"), ("Idea of the Day", "## 💡 Idea of the Day")]:
-        B.append(label)
-        for it in by_sec.get(sec, []):
-            if it.get("headline"): B.append(f"**{it['headline']}**")
-            if it.get("summary"): B.append(it["summary"])
-            if it.get("url"): B.append(f"↗ [source]({it['url']})")
+    # On This Day — bulleted list (short events, not article blocks → no empty-summary gate trip)
+    B.append("## 📅 On This Day")
+    for it in by_sec.get("On This Day", []):
+        if it.get("headline"):
+            B.append(f"- {it['headline']}" + (f" — [source]({it['url']})" if it.get("url") else ""))
+    # Idea of the Day — blockquote (quote + author)
+    B.append("## 💡 Idea of the Day")
+    for it in by_sec.get("Idea of the Day", []):
+        q = it.get("headline", ""); a = it.get("summary", "")
+        if q: B.append(f"> *{q}*" + (f"\n> — {a}" if a else ""))
     B.append(f"*Sources: {len(flat)} · generated {date}*")
     return "\n\n".join(B) + "\n"
 
@@ -61,6 +64,11 @@ def main():
     items = json.load(open(sys.argv[1])); date = sys.argv[2]; out = sys.argv[3]
     cfg = yaml.safe_load(open(CFG))
     open(out,"w").write(assemble(items, date, cfg)); print(out)
+    # warn (stderr) about any declared section that rendered with zero items —
+    # a dead feed / bad mapping must not silently re-blank a section.
+    present = {it["section"] for it in items}
+    empty = [s["section"] for s in cfg["sources"] if s["section"] not in present]
+    if empty: print("EMPTY SECTIONS: " + ", ".join(empty), file=sys.stderr)
 
 if __name__ == "__main__":
     main()
