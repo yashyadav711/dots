@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 CREDS = os.path.expanduser("~/.claude/.credentials.json")
 CACHE = os.path.expanduser("~/.cache/nhq-usage.json")
 ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
-CACHE_TTL = 60  # seconds
+CACHE_TTL = 900  # seconds (15 min — usage % barely moves; keeps endpoint calls rare)
 
 
 def _token() -> str:
@@ -35,14 +35,18 @@ def _token() -> str:
 
 
 def fetch() -> dict:
-    """Return usage JSON, using a <60s disk cache to avoid hammering the API."""
+    """Return usage JSON. Uses a 15-min disk cache; on any network/HTTP error
+    (e.g. a 429 from the stats endpoint) falls back to the last cached value
+    rather than failing — the segment never shows an error for a transient blip."""
+    fresh = None
     try:
         st = os.stat(CACHE)
+        with open(CACHE) as f:
+            fresh = json.load(f)
         if time.time() - st.st_mtime < CACHE_TTL:
-            with open(CACHE) as f:
-                return json.load(f)
+            return fresh
     except (OSError, ValueError):
-        pass
+        fresh = None
 
     req = urllib.request.Request(
         ENDPOINT,
@@ -51,8 +55,13 @@ def fetch() -> dict:
             "anthropic-beta": "oauth-2025-04-20",
         },
     )
-    with urllib.request.urlopen(req, timeout=8) as r:
-        data = json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode())
+    except Exception:
+        if fresh is not None:
+            return fresh  # stale-but-good beats an error (handles 429/offline)
+        raise
 
     try:
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)
@@ -135,13 +144,15 @@ def main() -> int:
     try:
         data = fetch()
     except urllib.error.HTTPError as e:
-        msg = "claude usage: auth expired" if e.code == 401 else f"claude usage: http {e.code}"
-        print(msg if mode == "--segment" else f"nhq-usage: {msg}", file=sys.stderr if mode != "--segment" else sys.stdout)
-        return 0 if mode == "--segment" else 1
+        # Segment hides silently on any error (incl. 429); CLI modes report it.
+        if mode == "--segment":
+            print(""); return 0
+        msg = "auth expired (re-login)" if e.code == 401 else f"http {e.code}"
+        print(f"nhq-usage: {msg}", file=sys.stderr); return 1
     except Exception as e:  # noqa: BLE001 - network/parse, degrade gracefully
-        print("claude usage n/a" if mode == "--segment" else f"nhq-usage: {e}",
-              file=sys.stdout if mode == "--segment" else sys.stderr)
-        return 0 if mode == "--segment" else 1
+        if mode == "--segment":
+            print(""); return 0
+        print(f"nhq-usage: {e}", file=sys.stderr); return 1
 
     if mode == "--json":
         print(json.dumps(data, indent=2))
