@@ -36,3 +36,12 @@ def test_image_classification(monkeypatch):
     assert nlc.check_image("https://i/notimg") is False       # reachable but not an image
     assert nlc.check_image("https://i/img") is True
     assert nlc.check_image("https://i/blocked") is True       # blocked → keep
+
+def test_format_issues_catches_render_defects():
+    bad = "## 🌍 THE WORLD\n\n**H**\nsummary\n![](https://x/a.jpg)\n↗ [source](https://x/1)\n"
+    assert any("blank-separated" in x for x in nlc.format_issues(bad))   # run-on collapse
+    bad2 = "<p>raw</p>\n\ngo https:&#x2F;&#x2F;x\n"
+    iss = nlc.format_issues(bad2)
+    assert any("raw HTML" in x for x in iss) and any("entity" in x for x in iss)
+    good = "## 🌍 THE WORLD\n\n**H**\n\nsummary\n\n![](https://x/a.jpg)\n\n↗ [source](https://x/1)\n"
+    assert nlc.format_issues(good) == []

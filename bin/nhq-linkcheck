@@ -56,13 +56,29 @@ def check_anchors(md):
     refs = re.findall(r"\]\((#[^)]+)\)", md)
     return [r for r in refs if r not in headings]
 
+def format_issues(md):
+    """Catch RENDERING defects link-checking can't see: raw HTML/entities leaking
+    into body text, and block elements (image / source line) not blank-separated —
+    which Obsidian collapses into a run-on paragraph. 'Links resolve' != 'looks good'."""
+    issues = []
+    lines = md.split("\n")
+    for i, l in enumerate(lines):
+        s = l.strip()
+        if re.search(r"</?(p|img|a|br|em|strong|div|span|h[1-6])\b", l):
+            issues.append(f"raw HTML @{i+1}: {s[:50]}")
+        if re.search(r"&#x?[0-9a-fA-F]+;|&(amp|lt|gt|quot);", l):
+            issues.append(f"entity @{i+1}: {s[:50]}")
+        if (s.startswith("![") or s.startswith("↗ ")) and i > 0 and lines[i-1].strip() != "":
+            issues.append(f"block not blank-separated @{i+1}: {s[:40]}")
+    return issues
+
 def audit(md):
     links = re.findall(r"(?<!!)\[[^\]]+\]\((https?://[^)]+)\)", md)
     imgs  = re.findall(r"!\[[^\]]*\]\((https?://[^)]+)\)", md) + re.findall(r'<img[^>]+src="(https?://[^"]+)"', md)
     with ThreadPoolExecutor(max_workers=16) as ex:
         bl = [u for u,(ok,_) in zip(links, ex.map(check_url, links)) if not ok]
         bi = [u for u,ok in zip(imgs, ex.map(check_image, imgs)) if not ok]
-    return {"broken_links": bl, "broken_images": bi, "broken_anchors": check_anchors(md)}
+    return {"broken_links": bl, "broken_images": bi, "broken_anchors": check_anchors(md), "format_issues": format_issues(md)}
 
 def main():
     md = open(sys.argv[1]).read(); res = audit(md)
