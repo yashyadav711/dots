@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""nhq-vault-changes — show which vault notes changed since the last check.
+
+The nHQ vault is Syncthing-synced (no git), so there's no blame/history. This
+gives the next-best thing: a content-hash snapshot, so any time you run it you
+see exactly which notes were ADDED / MODIFIED / DELETED since the previous run —
+i.e. what Yash edited between agent sweeps. Director runs it at session start to
+review only the changed files instead of re-reading the whole vault.
+
+Attribution is by-recency: changes between sessions are Yash's; an agent sweep
+updates the baseline. (For true "who edited what", version-control the vault.)
+
+Usage:
+  nhq-vault-changes            # list changes since last run, then update baseline
+  nhq-vault-changes --peek     # list changes but DON'T update the baseline
+  nhq-vault-changes --all      # include non-markdown files too (default: *.md only)
+Exit 0 always; first run just saves the baseline.
+"""
+import sys, os, json, hashlib, time
+from pathlib import Path
+
+VAULT = Path(os.environ.get("NHQ_VAULT",
+    "/home/yash/Github/product-manager/Yash's Folder/Obsidian/nHQ"))
+SNAP = Path(os.environ.get("NHQ_VAULT_SNAPSHOT",
+    str(Path.home() / ".config/nhq/vault-snapshot.json")))
+SKIP_DIRS = {".obsidian", ".git", ".trash", ".stfolder", "_covers"}
+
+def scan(include_all):
+    out = {}
+    for root, dirs, files in os.walk(VAULT):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fn in files:
+            if not include_all and not fn.endswith(".md"):
+                continue
+            p = Path(root) / fn
+            try:
+                b = p.read_bytes()
+            except OSError:
+                continue
+            rel = str(p.relative_to(VAULT))
+            out[rel] = {"sha": hashlib.sha256(b).hexdigest()[:16],
+                        "mtime": p.stat().st_mtime}
+    return out
+
+def main(argv):
+    peek = "--peek" in argv
+    include_all = "--all" in argv
+    cur = scan(include_all)
+
+    if not SNAP.exists():
+        SNAP.parent.mkdir(parents=True, exist_ok=True)
+        SNAP.write_text(json.dumps(cur))
+        print(f"nhq-vault-changes: baseline saved ({len(cur)} notes). Re-run after edits to see changes.")
+        return 0
+
+    old = json.loads(SNAP.read_text())
+    added    = [f for f in cur if f not in old]
+    deleted  = [f for f in old if f not in cur]
+    modified = [f for f in cur if f in old and cur[f]["sha"] != old[f]["sha"]]
+
+    def show(label, files):
+        if not files:
+            return
+        print(f"\n{label} ({len(files)}):")
+        for f in sorted(files, key=lambda x: cur.get(x, old.get(x, {})).get("mtime", 0), reverse=True):
+            mt = cur.get(f, old.get(f, {})).get("mtime")
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(mt)) if mt else "?"
+            print(f"  {ts}  {f}")
+
+    n = len(added) + len(modified) + len(deleted)
+    if n == 0:
+        print("nhq-vault-changes: no changes since last check.")
+    else:
+        show("🟢 ADDED", added)
+        show("🟡 MODIFIED", modified)
+        show("🔴 DELETED", deleted)
+        print(f"\n{n} change(s) since last check" + (" (baseline NOT updated — --peek)" if peek else " (baseline updated)"))
+
+    if not peek:
+        SNAP.write_text(json.dumps(cur))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
