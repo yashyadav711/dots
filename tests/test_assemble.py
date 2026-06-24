@@ -19,3 +19,10 @@ def test_assemble_structure_and_rules():
     assert md.count("- [ ] Already know this") == 1                        # only lounge gets it
     assert "![hero](_covers/2026-06-25-cover.png)" in md                   # hero cover emitted
     assert md.index("![hero]") < md.index("TL;DR")                        # hero above the fold
+
+def test_blocks_blank_line_separated():
+    items = [{"section":"Around the World","part":"world","headline":"Big news","summary":"s","url":"https://bbc.com/news/1","image":"https://x/a.jpg","rating":None}]
+    md = nda.assemble(items, "2026-06-25", CFG)
+    assert "\n\n![](https://x/a.jpg)\n\n" in md        # image is its own block (blank lines around)
+    assert "**Big news**\n\ns\n\n" in md               # headline / summary separated by blank line
+    assert "\n\n↗ [source](https://bbc.com/news/1)" in md
