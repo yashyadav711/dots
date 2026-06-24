@@ -57,6 +57,15 @@ def _fresh(r, max_age_days):
 
 def fetch_source(entry, rating_min=7):
     t = entry["type"]; f = entry["fields"]; out = []
+    if isinstance(entry["url"], list):  # multi-feed section: fetch each, merge, dedup within
+        seen, merged = set(), []
+        for u in entry["url"]:
+            for it in fetch_source({**entry, "url": u}, rating_min):
+                k = (it.get("url") or "").lower()
+                if k and k not in seen:
+                    seen.add(k); merged.append(it)
+                    if len(merged) >= entry.get("count", 10): return merged
+        return merged
     if t == "rss":
         url = entry["url"]; feed = feedparser.parse(url[7:] if url.startswith("file://") else url)
         rows = feed.entries

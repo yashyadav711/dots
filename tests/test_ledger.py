@@ -21,3 +21,10 @@ def test_absorb_ticks(tmp_path):
     assert n == 1
     seen = json.load(open(led))
     assert any("aaa" in s for s in seen) and not any("bbb" in s for s in seen)
+
+def test_title_dedup_across_sections(tmp_path):
+    led = str(tmp_path/"seen.json")
+    bbc = {"section":"Around the World","url":"https://bbc.com/iran-vote","headline":"US Senate approves Iran war powers resolution"}
+    ajz = {"section":"Developing Today","url":"https://aljazeera.com/iran-vote","headline":"US Senate approves Iran war powers resolution: what it means"}
+    out = ndl.filter_unseen([bbc, ajz], led)
+    assert len(out) == 1   # same story, different outlet/section → deduped by title

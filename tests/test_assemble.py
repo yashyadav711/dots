@@ -26,3 +26,13 @@ def test_blocks_blank_line_separated():
     assert "\n\n![](https://x/a.jpg)\n\n" in md        # image is its own block (blank lines around)
     assert "**Big news**\n\ns\n\n" in md               # headline / summary separated by blank line
     assert "\n\n↗ [source](https://bbc.com/news/1)" in md
+
+def test_section_image_once_no_repeat():
+    cfg = {"sources":[{"section":"AI Today","part":"workshop"}]}
+    tile = "_covers/2026-06-24-ai_today.png"
+    items = [
+        {"section":"AI Today","part":"workshop","headline":"A","summary":"a real summary sentence","url":"https://x/1","image":tile,"rating":None},
+        {"section":"AI Today","part":"workshop","headline":"B","summary":"another real summary","url":"https://x/2","image":tile,"rating":None},
+    ]
+    md = nda.assemble(items, "2026-06-24", cfg)
+    assert md.count(f"![]({tile})") == 1   # section banner once, NOT under every item

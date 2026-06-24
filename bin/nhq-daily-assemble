@@ -38,14 +38,22 @@ def assemble(items, date, cfg):
         B.append(f"## {part_label}")
         for s in secs:
             B.append(f"### {s}")
+            tile = next((it["image"] for it in by_sec[s] if (it.get("image") or "").startswith("_covers/")), None)
+            if tile: B.append(f"![]({tile})")   # section banner shown ONCE — not the same tile under every item
             for it in by_sec[s]:
                 B.append(f"**{it['headline']}**" + (f" · ⭐ {it['rating']}" if it.get("rating") else ""))
                 if it.get("summary"): B.append(it["summary"])
-                if it.get("image"): B.append(f"![]({it['image']})")
+                img = it.get("image") or ""
+                if img.startswith("http"): B.append(f"![]({img})")   # real photo only; skip the repeated tile
                 B.append(f"↗ [source]({it['url']})")
                 if part_key == "lounge": B.append("- [ ] Already know this")
-    B.append("## 📅 On This Day")
-    B.append("## 💡 Idea of the Day")
+    # closing sections render from data (part: closing) when present
+    for sec, label in [("On This Day", "## 📅 On This Day"), ("Idea of the Day", "## 💡 Idea of the Day")]:
+        B.append(label)
+        for it in by_sec.get(sec, []):
+            if it.get("headline"): B.append(f"**{it['headline']}**")
+            if it.get("summary"): B.append(it["summary"])
+            if it.get("url"): B.append(f"↗ [source]({it['url']})")
     B.append(f"*Sources: {len(flat)} · generated {date}*")
     return "\n\n".join(B) + "\n"
 

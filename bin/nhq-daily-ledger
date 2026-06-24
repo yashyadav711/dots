@@ -5,15 +5,27 @@ import sys, os, json, re
 def canonical_id(item):
     return (item.get("url") or item.get("headline") or "").strip().lower().rstrip("/")
 
+def _title_key(item):
+    """Normalized first-6-words of the headline — catches the same story
+    surfacing in two sections/outlets (different URLs, ~same title)."""
+    h = re.sub(r"[^a-z0-9 ]", "", (item.get("headline") or "").lower())
+    return " ".join(h.split()[:6])
+
 def _load(p): 
     try: return set(json.load(open(p)))
     except (OSError, ValueError): return set()
 
 def filter_unseen(items, ledger_path):
-    seen = _load(ledger_path); out=[]
+    """Drop items already in the persistent ledger (by URL) AND near-duplicate
+    headlines within this edition (same story from a different outlet/section)."""
+    seen = _load(ledger_path); titles = set(); out = []
     for it in items:
-        cid = canonical_id(it)
-        if cid and cid not in seen: out.append(it); seen.add(cid)  # also dedup within batch
+        cid = canonical_id(it); tk = _title_key(it)
+        if cid and cid in seen: continue
+        if tk and tk in titles: continue   # cross-section / cross-outlet dupe
+        if cid: seen.add(cid)
+        if tk: titles.add(tk)
+        out.append(it)
     return out
 
 def append(items, ledger_path):
