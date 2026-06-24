@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""nhq-daily-home — rewrite the 📰 Today block atop Home.md."""
+import sys, os, re, json
+
+def render_block(date, cover, top5):
+    lines = ["<!-- DAILY:START -->", f"![cover]({cover})", f"## 📰 Today — {date}"]
+    for i in top5[:5]: lines.append(f"- [{i['headline']}]({i['url']})")
+    lines.append(f"→ [[Daily News/{date} — Daily|Read today's edition]]")
+    lines.append("<!-- DAILY:END -->")
+    return "\n".join(lines)
+
+def update_home(home_path, block):
+    text = open(home_path).read()
+    if "<!-- DAILY:START -->" in text:
+        text = re.sub(r"<!-- DAILY:START -->.*?<!-- DAILY:END -->", block, text, flags=re.S)
+    else:
+        text = block + "\n" + text
+    open(home_path,"w").write(text)
+
+def main():
+    home, date, cover, items_json = sys.argv[1:5]
+    items = json.load(open(items_json))
+    update_home(home, render_block(date, cover, items)); print("home updated")
+
+if __name__ == "__main__":
+    main()
