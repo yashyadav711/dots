@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# nhq-omp-hooks-install — symlink the P2 safety hooks + TTSR rules into the LIVE omp agent
+# home (~/.omp/agent/{hooks,rules}), the same source-of-truth-in-dots + symlink pattern the
+# rest of this repo uses (see install.sh / the agents/ symlinks).
+#
+# ⚠ SECURITY-CONTROL CODE. This script is intentionally:
+#   • NOT invoked by install.sh (the hooks must not ship through ambient trust), and
+#   • a DRY-RUN by default — it only PREVIEWS what it would link.
+# A human (Yash) reviews the hook diff, then runs `nhq-omp-hooks-install --activate` to go
+# live. This is the "omp-P0 guard global install" step the spike (SPIKE-RESULT.md §5) deferred.
+#
+# After --activate, EVERY omp session (incl. task subagents) inherits the hooks. Verify with
+#   omp -p '/extensions'      (the three hooks should list)
+# and confirm a `task`-spawned subagent's bash is also gated (spike §4.3).
+set -uo pipefail
+
+DOTS="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/.." && pwd)"
+OMP_AGENT="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}"
+ACTIVATE=0
+[[ "${1:-}" == "--activate" ]] && ACTIVATE=1
+
+link_one() {  # link_one <repo-relative-src> <absolute-dest>
+  local src="$DOTS/$1" dest="$2"
+  [ -e "$src" ] || { echo "  MISSING src: $1"; return 1; }
+  if [ "$ACTIVATE" -eq 1 ]; then
+    mkdir -p "$(dirname "$dest")"
+    if [ -e "$dest" ] && [ ! -L "$dest" ]; then mv "$dest" "$dest.pre-omp.bak"; fi
+    ln -sfn "$src" "$dest"
+    echo "  linked: $dest -> $src"
+  else
+    echo "  WOULD link: $dest -> $src"
+  fi
+}
+
+echo "== NHQ omp P2 safety hooks installer  (agent home: $OMP_AGENT) =="
+if [ "$ACTIVATE" -eq 1 ]; then
+  echo "!! ACTIVATING security-control hooks into the LIVE omp home."
+else
+  echo "(dry-run — pass --activate to actually symlink. Review the hook diff FIRST.)"
+fi
+
+link_one omp/agent/hooks/pre/p3-guard.ts                "$OMP_AGENT/hooks/pre/p3-guard.ts"
+link_one omp/agent/hooks/pre/dangerous-command-guard.ts "$OMP_AGENT/hooks/pre/dangerous-command-guard.ts"
+link_one omp/agent/hooks/post/audit.ts                  "$OMP_AGENT/hooks/post/audit.ts"
+for r in "$DOTS"/omp/agent/rules/*.md; do
+  [ -e "$r" ] && link_one "omp/agent/rules/$(basename "$r")" "$OMP_AGENT/rules/$(basename "$r")"
+done
+
+# The hooks DELEGATE to these v0 binaries (no policy is reimplemented in TS) — they MUST be
+# on PATH at runtime, else p3-guard fails closed on commits and audit silently no-ops.
+echo "== delegate-binary check (hooks shell out to these) =="
+for b in nhq-p3-guard nhq-audit; do
+  if command -v "$b" >/dev/null 2>&1; then
+    echo "  ok: $b -> $(command -v "$b")"
+  else
+    echo "  WARN: $b not on PATH — run dots/install.sh first (it links the nhq-* binaries)."
+  fi
+done
+
+if [ "$ACTIVATE" -eq 1 ]; then
+  echo "ACTIVATED. Verify: omp -p '/extensions' lists the hooks; confirm a subagent's bash is gated."
+else
+  echo "Nothing changed. Review, then: nhq-omp-hooks-install --activate"
+fi

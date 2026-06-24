@@ -91,7 +91,17 @@ p3_caller_privileged() {
 # Git invocation context for the repo under evaluation (set by each caller). Using the
 # real GIT_DIR/-C the commit targets defeats H3 misdirection.
 P3_GIT_ARGS=()
-p3_staged_files() { git "${P3_GIT_ARGS[@]}" diff --cached --name-only 2>/dev/null; }
+# The set of paths the commit will write. The cached index is the precise set a normal
+# `git commit` writes. P2-02: `git commit -a` / `git commit <pathspec>` stage at commit time,
+# so at PreToolUse the cached set is blind to them — when NHQ_P3_EFFECTIVE=1 (set by the omp
+# hook for fleet lanes) we ALSO consider tracked working-tree changes vs HEAD, the superset of
+# what `-a`/pathspec would stage. (The installed pre-commit hook remains the precise post-
+# staging backstop; this widens the PreToolUse evaluation as defense-in-depth.) De-duplicated.
+p3_staged_files() {
+  { git "${P3_GIT_ARGS[@]}" diff --cached --name-only 2>/dev/null
+    [[ "${NHQ_P3_EFFECTIVE:-}" == "1" ]] && git "${P3_GIT_ARGS[@]}" diff HEAD --name-only 2>/dev/null
+  } | awk 'NF && !seen[$0]++'
+}
 
 # p3_evaluate <mode>  (mode = pretooluse | precommit)
 # sets P3_MATCHED + P3_VERDICT; returns 0 allow / 1 deny. Reads P3_GIT_ARGS.
@@ -140,6 +150,10 @@ p3_evaluate() {
 # Best-effort audit line (never fatal).
 p3_audit() {
   local decision="$1" ab="${NHQ_AUDIT_BIN:-$BIN/nhq-audit}"
+  # P2-05: when a fleet daemon owns a HMAC-KEYED audit chain (NHQ_OMP_SOCK set) but this process
+  # has NO key (it was stripped from the worker/host env), a direct unkeyed append would corrupt
+  # the keyed chain — the driver's keyed sink owns it. Skip; the BLOCK still stands & is surfaced.
+  if [[ -n "${NHQ_OMP_SOCK:-}" && -z "${NHQ_AUDIT_HMAC_KEY:-}" && -z "${NHQ_AUDIT_HMAC_KEYFILE:-}" ]]; then return 0; fi
   [[ -x "$ab" ]] || ab="$(command -v nhq-audit 2>/dev/null || true)"
   [[ -n "$ab" && -x "$ab" ]] || return 0
   "$ab" append --tool p3-guard --bucket "p3:${decision}" \
@@ -200,6 +214,20 @@ case "${1:-}" in
       exit 1
     fi
     ;;
+  match-path)
+    # nhq-p3-guard match-path <path> [<path> ...]
+    # Single-path policy probe for the omp edit/write pre-hook: reuses the EXACT
+    # p3_match_file matcher (no policy duplication). Prints + exit 0 on the FIRST
+    # protected match; exit 1 if none match; exit 2 if the policy file is missing
+    # (fail-closed — the caller treats an unparseable policy as "protected").
+    shift
+    if ! p3_load_globs; then echo "DENY(no-policy-file)" >&2; exit 2; fi
+    for f in "$@"; do
+      [[ -z "$f" ]] && continue
+      if p3_match_file "$f"; then echo "$f"; exit 0; fi
+    done
+    exit 1
+    ;;
   pre-commit)
     # The git pre-commit hook — fires after `git add`, before the commit is written.
     # ALWAYS precommit mode → never trusts inline env (H2). Uses the ambient repo.
@@ -234,7 +262,7 @@ case "${1:-}" in
     exit 0   # decision carried in the JSON, not the exit code
     ;;
   *)
-    echo "usage: nhq-p3-guard {check <repo> [pretooluse|precommit]|pre-commit}  (or pipe PreToolUse hook JSON)" >&2
+    echo "usage: nhq-p3-guard {check <repo> [pretooluse|precommit]|match-path <path>...|pre-commit}  (or pipe PreToolUse hook JSON)" >&2
     exit 2
     ;;
 esac

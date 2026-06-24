@@ -19,10 +19,7 @@
       "**/*service_account*.json",
       "**/token*.*",
       "**/jwt*.*",
-      "**/*.session",
-      "**/session*.json",
-      "**/session*token*",
-      "**/session*.key",
+      "**/session*.*",
       "**/middleware/**"
     ],
     "payments": [
@@ -56,7 +53,7 @@
       ".claude/settings.local.json",
       "**/claude/hooks/**",
       "**/.claude/hooks/**",
-      "**/p3-paths.json"
+      "ai/p3-paths.json"
     ]
   }
 }
