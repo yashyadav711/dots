@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """nhq-linkcheck — verify links (200 + not homepage), images, and intra-doc anchors."""
-import sys, re, urllib.request, urllib.parse
+import sys, re, urllib.request, urllib.parse, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
 def is_homepage(url):
@@ -9,23 +9,39 @@ def is_homepage(url):
     if depth == 0 and not p.query: return True, "bare homepage"
     return False, ""
 
+# Definitively-dead codes: drop. Everything else (incl. 403/405/429/5xx bot-blocks
+# + throttling) means the URL is LIVE but unverifiable — keep it, don't gut sections.
+DEAD = {0, 404, 410}
+
 def _head(url):
-    try:
-        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent":"nhq-linkcheck/1.0"})
-        r = urllib.request.urlopen(req, timeout=15); return r.status, r.headers.get("Content-Type","")
-    except Exception:
+    for method in ("HEAD", "GET"):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent":"nhq-linkcheck/1.0"})
-            r = urllib.request.urlopen(req, timeout=15); return r.status, r.headers.get("Content-Type","")
-        except Exception as e: return 0, str(e)
+            kw = {"method": "HEAD"} if method == "HEAD" else {}
+            req = urllib.request.Request(url, headers={"User-Agent": "nhq-linkcheck/1.0"}, **kw)
+            r = urllib.request.urlopen(req, timeout=15)
+            return r.status, r.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as e:
+            if method == "HEAD":  # some servers reject HEAD — retry as GET
+                continue
+            return e.code, (e.headers.get("Content-Type", "") if e.headers else "")
+        except Exception:
+            if method == "HEAD":
+                continue
+            return 0, ""
+    return 0, ""
 
 def check_url(url):
     hp, why = is_homepage(url)
     if hp: return False, why
-    st, _ = _head(url); return (200 <= st < 400), f"status {st}"
+    st, _ = _head(url)
+    if st in DEAD: return False, f"dead {st}"
+    return True, (f"ok {st}" if 200 <= st < 400 else f"unverified {st}")
 
 def check_image(url):
-    st, ct = _head(url); return 200 <= st < 400 and ct.startswith("image/")
+    st, ct = _head(url)
+    if st in DEAD: return False
+    if 200 <= st < 400: return ct.startswith("image/")  # reachable → must be an image
+    return True  # blocked/throttled (403/429/5xx) — live but unverifiable, keep
 
 def _slug(h): return "#" + re.sub(r"[^a-z0-9]+","-", h.strip().lower()).strip("-")
 
