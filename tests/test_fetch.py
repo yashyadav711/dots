@@ -45,3 +45,9 @@ def test_fresh_filters_old_rss():
     assert ndf._fresh({"published_parsed": old}, 3) is False   # stale → dropped
     assert ndf._fresh({}, 3) is True                            # no date → kept
     assert ndf._fresh({"published_parsed": old}, 0) is True     # filter off
+
+def test_rss_image_extraction():
+    assert ndf._rss_image({"media_thumbnail":[{"url":"https://x/t.jpg"}]}, None) == "https://x/t.jpg"
+    assert ndf._rss_image({"media_content":[{"url":"https://x/c.jpg"}]}, None) == "https://x/c.jpg"
+    assert ndf._rss_image({"links":[{"rel":"enclosure","type":"image/jpeg","href":"https://x/e.jpg"}]}, None) == "https://x/e.jpg"
+    assert ndf._rss_image({}, None) is None

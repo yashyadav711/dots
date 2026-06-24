@@ -55,6 +55,21 @@ def _fresh(r, max_age_days):
     if not t: return True
     return (time.time() - calendar.timegm(t)) / 86400.0 <= max_age_days
 
+def _rss_image(r, cfg_field):
+    """Pull the item's real photo from an RSS entry, robustly — so each item gets
+    its OWN og:image instead of falling back to a repeated section tile. Tries the
+    configured field, then media_thumbnail, media_content, and image enclosures/links."""
+    if cfg_field:
+        v = _field(r, cfg_field)
+        if v: return v
+    for k in ("media_thumbnail", "media_content"):
+        m = r.get(k)
+        if isinstance(m, list) and m and m[0].get("url"): return m[0]["url"]
+    for lst in ((r.get("links") or []), (r.get("enclosures") or [])):
+        for l in lst:
+            if "image" in (l.get("type") or "") and l.get("href"): return l["href"]
+    return None
+
 def fetch_source(entry, rating_min=7):
     t = entry["type"]; f = entry["fields"]; out = []
     if isinstance(entry["url"], list):  # multi-feed section: fetch each, merge, dedup within
@@ -83,7 +98,7 @@ def fetch_source(entry, rating_min=7):
             summ = getf("summary") or r.get("description") or r.get("subtitle")
             if not summ and r.get("content"): summ = r["content"][0].get("value")
             item = {"headline": getf("title"), "url": getf("url"),
-                    "image": _field(r, f.get("image")), "summary": summ, "rating": None}
+                    "image": _rss_image(r, f.get("image")), "summary": summ, "rating": None}
         else:
             item = {"headline": _field(r, f["title"]), "url": _field(r, f["url"]),
                     "image": _field(r, f.get("image")), "summary": _field(r, f.get("summary")),
