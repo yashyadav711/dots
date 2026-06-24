@@ -23,3 +23,11 @@ def test_rss_adapter_maps_fields():
     items = ndf.fetch_source(entry, rating_min=7)
     assert len(items) <= 3 and items[0]["url"].startswith("http")
     assert items[0]["section"] == "Around the World"
+
+def test_fetch_all_skips_failing_source():
+    good = {"section":"Around the World","part":"world","type":"rss","count":2,
+            "url":"file://"+FX+"/rss_sample.xml","fields":{"title":"title","url":"link"}}
+    bad = {"section":"Dead API","part":"world","type":"json","count":1,
+           "url":"https://127.0.0.1:1/nope.json","fields":{"root":"x","title":"t","url":"u"}}
+    items = ndf.fetch_all([good, bad], 7)   # must not raise
+    assert len(items) >= 1 and all(i["section"] == "Around the World" for i in items)

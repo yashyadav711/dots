@@ -60,11 +60,22 @@ def fetch_source(entry, rating_min=7):
         if len(out) >= entry.get("count", 10): break
     return out
 
+def fetch_all(sources, rmin):
+    """Fetch every source; a failing source (503/timeout/bad data) is skipped,
+    not fatal — one dead feed must never empty the whole magazine."""
+    items = []
+    for s in sources:
+        try:
+            items.extend(fetch_source(s, rmin))
+        except Exception as e:  # noqa: BLE001 - per-source isolation is the point
+            print(f"[skip] {s.get('section','?')}: {e}", file=sys.stderr)
+    return items
+
 def main():
     cfg = yaml.safe_load(open(CFG)); rmin = cfg["thresholds"]["rating_min"]
     want = sys.argv[1] if len(sys.argv) > 1 else "--all"
     sources = cfg["sources"] if want == "--all" else [s for s in cfg["sources"] if s["section"] == want]
-    print(json.dumps([i for s in sources for i in fetch_source(s, rmin)], indent=2))
+    print(json.dumps(fetch_all(sources, rmin), indent=2))
 
 if __name__ == "__main__":
     main()
