@@ -43,5 +43,14 @@ def test_format_issues_catches_render_defects():
     bad2 = "<p>raw</p>\n\ngo https:&#x2F;&#x2F;x\n"
     iss = nlc.format_issues(bad2)
     assert any("raw HTML" in x for x in iss) and any("entity" in x for x in iss)
-    good = "## 🌍 THE WORLD\n\n**H**\n\nsummary\n\n![](https://x/a.jpg)\n\n↗ [source](https://x/1)\n"
+    good = "## 🌍 THE WORLD\n\n**H**\n\nA real summary sentence long enough to clear the thin-content gate cleanly.\n\n![](https://x/a.jpg)\n\n↗ [source](https://x/1)\n"
+    assert nlc.format_issues(good) == []
+
+def test_empty_summary_gate():
+    # headline jumps straight to image = no summary → flagged
+    bad = "## 🌍 THE WORLD\n\n**Big news**\n\n![](https://x/a.jpg)\n\n↗ [source](https://x/1)\n"
+    assert any("no summary" in x for x in nlc.format_issues(bad))
+    # real summary present → clears; index bold headers + part lists do NOT false-positive
+    good = ("## 📑 In this edition\n\n**🌍 THE WORLD**\n- [Around the World](#around-the-world) · 8\n\n"
+            "## 🌍 THE WORLD\n\n**Big news**\n\nA real two-sentence summary of what happened and why it matters today.\n\n![](https://x/a.jpg)\n\n↗ [source](https://x/1)\n")
     assert nlc.format_issues(good) == []
