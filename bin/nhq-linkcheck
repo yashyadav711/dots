@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""nhq-linkcheck — verify links (200 + not homepage), images, and intra-doc anchors."""
+import sys, re, urllib.request, urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+
+def is_homepage(url):
+    p = urllib.parse.urlparse(url)
+    depth = len([x for x in p.path.split("/") if x])
+    if depth == 0 and not p.query: return True, "bare homepage"
+    return False, ""
+
+def _head(url):
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent":"nhq-linkcheck/1.0"})
+        r = urllib.request.urlopen(req, timeout=15); return r.status, r.headers.get("Content-Type","")
+    except Exception:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent":"nhq-linkcheck/1.0"})
+            r = urllib.request.urlopen(req, timeout=15); return r.status, r.headers.get("Content-Type","")
+        except Exception as e: return 0, str(e)
+
+def check_url(url):
+    hp, why = is_homepage(url)
+    if hp: return False, why
+    st, _ = _head(url); return (200 <= st < 400), f"status {st}"
+
+def check_image(url):
+    st, ct = _head(url); return 200 <= st < 400 and ct.startswith("image/")
+
+def _slug(h): return "#" + re.sub(r"[^a-z0-9]+","-", h.strip().lower()).strip("-")
+
+def check_anchors(md):
+    headings = {_slug(m.group(1)) for m in re.finditer(r"^#{1,6} (.+)$", md, re.M)}
+    refs = re.findall(r"\]\((#[^)]+)\)", md)
+    return [r for r in refs if r not in headings]
+
+def audit(md):
+    links = re.findall(r"(?<!!)\[[^\]]+\]\((https?://[^)]+)\)", md)
+    imgs  = re.findall(r"!\[[^\]]*\]\((https?://[^)]+)\)", md) + re.findall(r'<img[^>]+src="(https?://[^"]+)"', md)
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        bl = [u for u,(ok,_) in zip(links, ex.map(check_url, links)) if not ok]
+        bi = [u for u,ok in zip(imgs, ex.map(check_image, imgs)) if not ok]
+    return {"broken_links": bl, "broken_images": bi, "broken_anchors": check_anchors(md)}
+
+def main():
+    md = open(sys.argv[1]).read(); res = audit(md)
+    bad = sum(len(v) for v in res.values())
+    import json; print(json.dumps(res, indent=2))
+    sys.exit(1 if bad else 0)
+
+if __name__ == "__main__":
+    main()
