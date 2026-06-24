@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""nhq-daily-ledger — seen-ledger for never-repeat lists + tick absorption."""
+import sys, os, json, re
+
+def canonical_id(item):
+    return (item.get("url") or item.get("headline") or "").strip().lower().rstrip("/")
+
+def _load(p): 
+    try: return set(json.load(open(p)))
+    except (OSError, ValueError): return set()
+
+def filter_unseen(items, ledger_path):
+    seen = _load(ledger_path); out=[]
+    for it in items:
+        cid = canonical_id(it)
+        if cid and cid not in seen: out.append(it); seen.add(cid)  # also dedup within batch
+    return out
+
+def append(items, ledger_path):
+    seen = _load(ledger_path)
+    seen |= {canonical_id(i) for i in items if canonical_id(i)}
+    os.makedirs(os.path.dirname(ledger_path) or ".", exist_ok=True)
+    json.dump(sorted(seen), open(ledger_path,"w"))
+
+def absorb_ticks(edition_md_path, ledger_path):
+    """Add URLs from ticked '- [x] Already know this' blocks to the ledger."""
+    try: text = open(edition_md_path).read()
+    except OSError: return 0
+    blocks = re.split(r"(?=^#{2,4} )", text, flags=re.M)
+    urls=[]
+    for b in blocks:
+        if re.search(r"- \[x\] Already know this", b, re.I):
+            urls += re.findall(r"\((https?://[^)]+)\)", b)
+    if urls: append([{"url":u} for u in urls], ledger_path)
+    return len(urls)
+
+def main():
+    cmd = sys.argv[1]
+    if cmd in ("filter","append"):
+        items = json.load(open(sys.argv[2])); led = sys.argv[3]
+        if cmd=="filter": print(json.dumps(filter_unseen(items, led), indent=2))
+        else: append(items, led); print(f"appended {len(items)}")
+    elif cmd=="absorb":
+        print(f"absorbed {absorb_ticks(sys.argv[2], sys.argv[3])}")
+
+if __name__ == "__main__":
+    main()
