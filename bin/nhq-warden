@@ -40,6 +40,10 @@ STATE_CMD         = os.environ.get("NHQ_WARDEN_STATE_CMD", "")
 _last_alert: dict[str, float] = {}
 _oom_log_pos = 0
 _zombie_consecutive = 0  # consecutive checks with zombie count >= ZOMBIE_WARN
+# PID-set we last sent a DESKTOP zombie alert for. A re-detected, UNCHANGED set that
+# is entirely parented to the omp runtime is a diagnosed-benign repeat → keep
+# detecting (log) but suppress the desktop re-nag. Reset when zombies clear.
+_zombie_alerted: frozenset[int] = frozenset()
 
 
 def log(msg: str) -> None:
@@ -84,19 +88,55 @@ def disk_used_pct(path: str = "/") -> float:
         return 0.0
 
 
-def zombie_count() -> int:
-    count = 0
+def _proc_text(pid: int, name: str) -> str:
+    try:
+        with open(f"/proc/{pid}/{name}") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _is_omp_runtime(pid: int) -> bool:
+    """True if `pid` is the omp harness itself or its /tmp/omp-python-runner eval-runner
+    (the diagnosed-benign zombie parents — see envy store/LOG.md 2026-06-25). Anything
+    else parenting a zombie is treated as a real new leak."""
+    if _proc_text(pid, "comm").strip() == "omp":
+        return True
+    if "omp-python-runner" in _proc_text(pid, "cmdline").replace("\x00", " "):
+        return True
+    return False
+
+
+def zombie_scan() -> tuple[frozenset[int], bool]:
+    """Scan /proc for zombies. Returns (set of zombie PIDs, foreign) where `foreign`
+    is True if ANY zombie is parented to something OTHER than the omp runtime — i.e. a
+    genuinely new leak (e.g. a Fleet-Kit service failing to reap), which always alerts."""
+    pids: set[int] = set()
+    foreign = False
     try:
         for d in glob.glob("/proc/[0-9]*/stat"):
             try:
                 with open(d) as f:
-                    if f.read().split()[2] == "Z":
-                        count += 1
-            except (OSError, IndexError):
-                pass
+                    data = f.read()
+            except OSError:
+                continue
+            rpar = data.rfind(")")          # comm is parenthesised + may contain spaces
+            if rpar < 0:
+                continue
+            fields = data[rpar + 2:].split()
+            if len(fields) < 2 or fields[0] != "Z":
+                continue
+            try:
+                pid = int(os.path.basename(os.path.dirname(d)))
+                ppid = int(fields[1])
+            except ValueError:
+                continue
+            pids.add(pid)
+            if not _is_omp_runtime(ppid):
+                foreign = True
     except OSError:
         pass
-    return count
+    return frozenset(pids), foreign
 
 
 def check_oom_log() -> None:
@@ -261,16 +301,28 @@ def check_all() -> None:
               "⚠️ Disk almost full",
               f"/ at {disk_pct:.1f}% used")
 
-    z = zombie_count()
-    global _zombie_consecutive
+    zpids, foreign = zombie_scan()
+    z = len(zpids)
+    global _zombie_consecutive, _zombie_alerted
     if z >= ZOMBIE_WARN:
         _zombie_consecutive += 1
         if _zombie_consecutive >= 2:
-            alert("zombie",
-                  "⚠️ Zombie processes accumulating",
-                  f"{z} zombie processes detected (sustained {_zombie_consecutive} checks)")
+            # A genuinely NEW leak alerts: a non-omp parent (foreign), OR a zombie PID
+            # we haven't already alerted on (count grew / PID-set changed). A re-detected
+            # subset of the already-alerted, all-omp-runtime set is a benign repeat —
+            # keep detecting (log) but don't re-nag the desktop every cooldown.
+            new_leak = foreign or not zpids <= _zombie_alerted
+            body = (f"{z} zombie processes detected (sustained {_zombie_consecutive} checks)"
+                    + ("" if foreign else " — all parented to the omp runtime"))
+            if new_leak:
+                _zombie_alerted = zpids
+                alert("zombie", "⚠️ Zombie processes accumulating", body)
+            else:
+                log(f"zombie: {z} (sustained {_zombie_consecutive}) — unchanged omp-runtime "
+                    f"set, desktop alert suppressed (benign repeat)")
     else:
         _zombie_consecutive = 0
+        _zombie_alerted = frozenset()
 
     check_oom_log()
 
