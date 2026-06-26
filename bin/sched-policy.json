@@ -1,0 +1,11 @@
+{
+  "_comment": "nhq-sched admission policy for the HP Envy 13 (7.5GB RAM, zram). Tuned for the laptop's real constraint: RAM + concurrency, not cost (nhq-econ owns cost). nhq-sched reads these; absent file → same defaults baked into the bin. Flip enforcement via NHQ_SCHED_MODE=enforce (gated on Yash lifting D6).",
+  "max_alive": 3,
+  "min_free_ram_mb": 1024,
+  "soft_free_ram_mb": 2048,
+  "_fields": {
+    "max_alive": "concurrency cap — RUNNING+IDLE fleet sessions before a new spawn is QUEUEd (D-F1: maxConcurrency ~2-3 on this box)",
+    "min_free_ram_mb": "hard floor — projected free RAM below this → REJECT (admitting risks OOM / earlyoom kill)",
+    "soft_free_ram_mb": "soft floor — projected free RAM below this → QUEUE (memory pressure; recommend reaping the longest-IDLE session)"
+  }
+}

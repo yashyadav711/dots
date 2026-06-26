@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# nhq-sched-selftest — deterministic coverage of the admission-gate decision logic.
+# Uses an empty temp NHQ_STATE_DIR (alive=0), the NHQ_SCHED_FREE_RAM_MB seam, and
+# crafted policies to hit ADMIT / QUEUE(ram) / QUEUE(concurrency) / REJECT + the
+# RAM projection + enforce-mode exit codes. No live fleet / real RAM dependency.
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+SCHED="$BIN/nhq-sched"
+
+TMP="$(mktemp -d /tmp/sched-selftest.XXXX)"
+POL_CAP0="$TMP/policy-cap0.json"
+printf '{"max_alive":0,"min_free_ram_mb":1024,"soft_free_ram_mb":2048}\n' > "$POL_CAP0"
+trap 'rm -rf "$TMP"' EXIT
+
+pass=0; fail=0
+ck() { # $1=label $2=expected $3=actual
+  if [[ "$2" == "$3" ]]; then pass=$((pass+1)); printf '  ✓ %s → %s\n' "$1" "$3"
+  else fail=$((fail+1)); printf '  ✗ %s → expected %s, got %s\n' "$1" "$2" "$3"; fi
+}
+
+# decision for: free-ram, [policy], [est-ram] — empty state dir so alive=0
+dec() { # $1=free  $2=policy(or "")  $3=est(or 0)
+  local pol_env=(); [[ -n "$2" ]] && pol_env=(NHQ_SCHED_POLICY="$2")
+  env NHQ_STATE_DIR="$TMP/state" NHQ_SCHED_FREE_RAM_MB="$1" "${pol_env[@]}" \
+    "$SCHED" admit test --est-ram-mb "${3:-0}" --json 2>/dev/null | jq -r '.decision'
+}
+
+echo "nhq-sched-selftest"
+mkdir -p "$TMP/state"
+
+# --- decision branches (alive=0 throughout) ---
+ck "ADMIT  (free 4000, default)"             ADMIT  "$(dec 4000 '' 0)"
+ck "REJECT (free 500 < hard 1024)"           REJECT "$(dec 500 '' 0)"
+ck "QUEUE  (free 1500 < soft 2048, ram)"     QUEUE  "$(dec 1500 '' 0)"
+ck "QUEUE  (free 4000, max_alive=0, conc)"   QUEUE  "$(dec 4000 "$POL_CAP0" 0)"
+ck "REJECT (free 4000, est 3800 → proj 200)" REJECT "$(dec 4000 '' 3800)"
+ck "QUEUE  (free 4000, est 2500 → proj 1500)" QUEUE "$(dec 4000 '' 2500)"
+
+# --- observe mode never blocks (exit 0 regardless of decision) ---
+env NHQ_STATE_DIR="$TMP/state" NHQ_SCHED_FREE_RAM_MB=500 "$SCHED" admit test >/dev/null 2>&1
+ck "observe REJECT exit code = 0"            0 "$?"
+
+# --- enforce mode exit codes: ADMIT 0 / QUEUE 75 / REJECT 1 ---
+env NHQ_STATE_DIR="$TMP/state" NHQ_SCHED_MODE=enforce NHQ_SCHED_FREE_RAM_MB=4000 "$SCHED" admit test >/dev/null 2>&1
+ck "enforce ADMIT exit code = 0"             0 "$?"
+env NHQ_STATE_DIR="$TMP/state" NHQ_SCHED_MODE=enforce NHQ_SCHED_FREE_RAM_MB=1500 "$SCHED" admit test >/dev/null 2>&1
+ck "enforce QUEUE exit code = 75"            75 "$?"
+env NHQ_STATE_DIR="$TMP/state" NHQ_SCHED_MODE=enforce NHQ_SCHED_FREE_RAM_MB=500 "$SCHED" admit test >/dev/null 2>&1
+ck "enforce REJECT exit code = 1"            1 "$?"
+
+# --- status + queue run clean ---
+env NHQ_STATE_DIR="$TMP/state" NHQ_SCHED_FREE_RAM_MB=4000 "$SCHED" status >/dev/null 2>&1
+ck "status exit 0"                           0 "$?"
+env NHQ_STATE_DIR="$TMP/state" "$SCHED" queue >/dev/null 2>&1
+ck "queue exit 0"                            0 "$?"
+
+echo "──────────────────────────────────────────"
+printf "  %s passed · %s failed\n" "$pass" "$fail"
+[[ "$fail" -eq 0 ]]

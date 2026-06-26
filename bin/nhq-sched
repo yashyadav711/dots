@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# nhq-sched — fleet admission-gate kernel. OBSERVE by default (D6: never blocks).
+#
+# The deferred piece v0/v1 named as the prerequisite for real resource enforcement
+# (D1: "v0 telemetry is the prerequisite that makes v1 enforcement trustworthy;
+# building the gate first risks the proven Fleet Kit with no data to tune it").
+# This is that gate — built telemetry-first: it computes the ADMIT / QUEUE / REJECT
+# decision it WOULD make for a proposed spawn, against live RAM + concurrency on the
+# 7.5GB box, and LOGS it — WITHOUT blocking. That gathers the data to tune thresholds
+# before anyone flips it to enforce.
+#
+# Decision (per admit request):
+#   REJECT  free RAM below the hard floor (admitting risks OOM / earlyoom kill)
+#   QUEUE   at the concurrency cap, OR free RAM under the soft floor — names the
+#           longest-IDLE session as a preempt/reap candidate (recommendation only)
+#   ADMIT   resources available
+#
+# Mode (NHQ_SCHED_MODE, default "observe"):
+#   observe  log + print the decision, ALWAYS exit 0 (the Fleet Kit proceeds unchanged)
+#   enforce  exit 0 on ADMIT, 75 on QUEUE, 1 on REJECT (so a caller can hold/defer) —
+#            gated behind this flag + Yash lifting D6; do NOT default it on.
+#
+#   nhq-sched admit <agent> [--est-ram-mb N]   decision for spawning <agent>
+#   nhq-sched status [--json]                  live resource snapshot vs policy
+#   nhq-sched queue [--json]                   recent would-queue / would-reject log
+#
+# Env: NHQ_STATE_DIR, NHQ_SCHED_MODE, NHQ_SCHED_POLICY, NHQ_SCHED_LOG.
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+source "$BIN/nhq-lib.sh"
+nhq_ensure_state_dir
+
+SCHED_MODE="${NHQ_SCHED_MODE:-observe}"
+sched_policy() { printf '%s' "${NHQ_SCHED_POLICY:-$BIN/sched-policy.json}"; }
+sched_log()    { printf '%s' "${NHQ_SCHED_LOG:-$NHQ_STATE_DIR/sched-log.jsonl}"; }
+
+# Policy value with a baked-in default if the file is absent/missing the key.
+pol() { # $1=key $2=default
+  local f; f="$(sched_policy)"
+  [[ -f "$f" ]] && jq -e -r --arg k "$1" '.[$k] // empty' "$f" 2>/dev/null || true
+} 
+polv() { local v; v="$(pol "$1")"; [[ -n "$v" ]] && printf '%s' "$v" || printf '%s' "$2"; }
+
+# Free RAM in MB. NHQ_SCHED_FREE_RAM_MB overrides (selftest seam; never set in prod).
+free_ram_mb() {
+  [[ -n "${NHQ_SCHED_FREE_RAM_MB:-}" ]] && { printf '%s' "$NHQ_SCHED_FREE_RAM_MB"; return; }
+  free -m 2>/dev/null | awk '/^Mem:/{print $7; found=1} END{if(!found) print 0}'
+}
+
+# Walk the fleet .meta files → counts + the longest-IDLE session (preempt candidate).
+fleet_state() {
+  local running=0 idle=0 alive=0 dead=0
+  local preempt="" preempt_idle=-1
+  shopt -s nullglob
+  local f s st idle_s
+  for f in "$NHQ_STATE_DIR"/*.meta; do
+    [[ -f "$f" ]] || continue
+    s="$(basename "$f" .meta)"
+    st="$(nhq_session_state "$s" 2>/dev/null || echo DEAD)"
+    case "$st" in
+      RUNNING) running=$((running+1)); alive=$((alive+1)) ;;
+      IDLE)    idle=$((idle+1));    alive=$((alive+1))
+               idle_s="$(nhq_idle_seconds "$s" 2>/dev/null || echo 0)"
+               if [[ "$idle_s" -gt "$preempt_idle" ]]; then preempt_idle="$idle_s"; preempt="$s"; fi ;;
+      *)       dead=$((dead+1)) ;;
+    esac
+  done
+  jq -n --argjson r "$running" --argjson i "$idle" --argjson a "$alive" --argjson d "$dead" \
+        --arg pre "$preempt" --argjson prei "$([[ $preempt_idle -lt 0 ]] && echo 0 || echo $preempt_idle)" \
+    '{running:$r, idle:$i, alive:$a, dead:$d, preempt_candidate:$pre, preempt_idle_s:$prei}'
+}
+
+snapshot() {
+  local fs; fs="$(fleet_state)"
+  local free; free="$(free_ram_mb)"
+  jq -n --argjson fs "$fs" --argjson free "${free:-0}" \
+        --argjson maxa "$(polv max_alive 3)" \
+        --argjson hard "$(polv min_free_ram_mb 1024)" \
+        --argjson soft "$(polv soft_free_ram_mb 2048)" \
+        --arg mode "$SCHED_MODE" \
+    '{mode:$mode, free_ram_mb:$free, fleet:$fs,
+      policy:{max_alive:$maxa, min_free_ram_mb:$hard, soft_free_ram_mb:$soft}}'
+}
+
+# Decide for a proposed spawn. Echoes the decision JSON (and never alters state).
+decide_admit() { # $1=agent  $2=est_ram_mb(optional)
+  local agent="${1:-?}" est="${2:-0}"
+  local snap; snap="$(snapshot)"
+  local free alive maxa hard soft pre prei
+  free="$(jq -r '.free_ram_mb' <<<"$snap")"
+  alive="$(jq -r '.fleet.alive' <<<"$snap")"
+  maxa="$(jq -r '.policy.max_alive' <<<"$snap")"
+  hard="$(jq -r '.policy.min_free_ram_mb' <<<"$snap")"
+  soft="$(jq -r '.policy.soft_free_ram_mb' <<<"$snap")"
+  pre="$(jq -r '.fleet.preempt_candidate' <<<"$snap")"
+  prei="$(jq -r '.fleet.preempt_idle_s' <<<"$snap")"
+  local projected=$(( free - est ))
+
+  local decision reason rec=""
+  if [[ "$projected" -lt "$hard" ]]; then
+    decision="REJECT"; reason="projected free RAM ${projected}MB < hard floor ${hard}MB (OOM risk)"
+    [[ -n "$pre" ]] && rec="reap longest-IDLE session '$pre' (idle ${prei}s) to free RAM, then retry"
+  elif [[ "$alive" -ge "$maxa" ]]; then
+    decision="QUEUE"; reason="fleet at concurrency cap (alive ${alive} ≥ max ${maxa})"
+    [[ -n "$pre" ]] && rec="preempt/reap longest-IDLE session '$pre' (idle ${prei}s) to admit now"
+  elif [[ "$projected" -lt "$soft" ]]; then
+    decision="QUEUE"; reason="projected free RAM ${projected}MB < soft floor ${soft}MB (memory pressure)"
+    [[ -n "$pre" ]] && rec="reap longest-IDLE session '$pre' (idle ${prei}s) to relieve pressure"
+  else
+    decision="ADMIT"; reason="alive ${alive}/${maxa}, projected free RAM ${projected}MB ≥ soft ${soft}MB"
+  fi
+
+  jq -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg agent "$agent" --arg dec "$decision" \
+        --arg reason "$reason" --arg rec "$rec" --argjson est "${est:-0}" --argjson snap "$snap" \
+    '{ts:$ts, agent:$agent, decision:$dec, reason:$reason,
+      recommendation:(if $rec=="" then null else $rec end), est_ram_mb:$est,
+      mode:$snap.mode, free_ram_mb:$snap.free_ram_mb, alive:$snap.fleet.alive}'
+}
+
+# observe → always 0; enforce → ADMIT 0 / QUEUE 75 / REJECT 1.
+exit_code_for() { case "$1" in ADMIT) echo 0 ;; QUEUE) echo 75 ;; REJECT) echo 1 ;; *) echo 0 ;; esac; }
+
+cmd_admit() {
+  local agent="" est=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --est-ram-mb) est="${2:-0}"; shift 2 ;;
+      --json) JSON=1; shift ;;
+      *) agent="$1"; shift ;;
+    esac
+  done
+  [[ -z "$agent" ]] && { echo "usage: nhq-sched admit <agent> [--est-ram-mb N]" >&2; exit 2; }
+  local d; d="$(decide_admit "$agent" "$est")"
+  printf '%s\n' "$d" >> "$(sched_log)"
+  local dec; dec="$(jq -r '.decision' <<<"$d")"
+  if [[ "${JSON:-0}" == 1 ]]; then printf '%s\n' "$d"
+  else
+    local badge; case "$dec" in ADMIT) badge="🟢 ADMIT";; QUEUE) badge="🟡 QUEUE";; REJECT) badge="🔴 REJECT";; esac
+    printf '%s  %s — %s\n' "$badge" "$agent" "$(jq -r '.reason' <<<"$d")"
+    local rec; rec="$(jq -r '.recommendation // empty' <<<"$d")"
+    [[ -n "$rec" ]] && printf '   → %s\n' "$rec"
+    [[ "$SCHED_MODE" == observe ]] && printf '   (observe mode — logged, not enforced; spawn proceeds)\n'
+  fi
+  [[ "$SCHED_MODE" == enforce ]] && exit "$(exit_code_for "$dec")"
+  exit 0
+}
+
+cmd_status() {
+  local snap; snap="$(snapshot)"
+  if [[ "${1:-}" == "--json" ]]; then printf '%s\n' "$snap"; return; fi
+  echo "🚦 NHQ ADMISSION GATE  (mode: $SCHED_MODE)"
+  echo "──────────────────────────────────────────────────────────────────────"
+  printf "  fleet      : %s alive (%s running · %s idle) · %s dead — cap %s\n" \
+    "$(jq -r '.fleet.alive' <<<"$snap")" "$(jq -r '.fleet.running' <<<"$snap")" \
+    "$(jq -r '.fleet.idle' <<<"$snap")" "$(jq -r '.fleet.dead' <<<"$snap")" \
+    "$(jq -r '.policy.max_alive' <<<"$snap")"
+  printf "  free RAM   : %s MB  (soft %s / hard %s)\n" \
+    "$(jq -r '.free_ram_mb' <<<"$snap")" "$(jq -r '.policy.soft_free_ram_mb' <<<"$snap")" \
+    "$(jq -r '.policy.min_free_ram_mb' <<<"$snap")"
+  local pre; pre="$(jq -r '.fleet.preempt_candidate // empty' <<<"$snap")"
+  [[ -n "$pre" ]] && printf "  preempt    : longest-IDLE '%s' (idle %ss) — reap candidate under pressure\n" \
+    "$pre" "$(jq -r '.fleet.preempt_idle_s' <<<"$snap")"
+  # what would a spawn decide right now?
+  local d; d="$(decide_admit "(hypothetical)" 0)"
+  printf "  → a spawn now would: %s (%s)\n" "$(jq -r '.decision' <<<"$d")" "$(jq -r '.reason' <<<"$d")"
+}
+
+cmd_queue() {
+  local lf; lf="$(sched_log)"
+  [[ -f "$lf" ]] || { echo "no admission decisions logged yet ($lf)"; return; }
+  if [[ "${1:-}" == "--json" ]]; then jq -s '[.[]|select(.decision!="ADMIT")]' "$lf"; return; fi
+  echo "🚦 ADMISSION DECISIONS — would-queue / would-reject (recent)"
+  echo "──────────────────────────────────────────────────────────────────────"
+  jq -r 'select(.decision!="ADMIT")
+    | "  \(.ts[5:16])  \(.decision|(.+"      ")[0:6])  \(.agent)  — \(.reason)"' "$lf" | tail -20
+}
+
+case "${1:-}" in
+  admit)  shift; cmd_admit "$@" ;;
+  status) shift; cmd_status "${1:-}" ;;
+  queue)  shift; cmd_queue "${1:-}" ;;
+  ""|--help) echo "usage: nhq-sched <admit <agent>|status|queue> [--json]  (mode via NHQ_SCHED_MODE)" >&2; exit 2 ;;
+  *) echo "nhq-sched: unknown command '${1:-}'" >&2; exit 2 ;;
+esac
