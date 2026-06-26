@@ -112,7 +112,7 @@ decide_admit() { # $1=agent  $2=est_ram_mb(optional)
     decision="ADMIT"; reason="alive ${alive}/${maxa}, projected free RAM ${projected}MB ≥ soft ${soft}MB"
   fi
 
-  jq -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg agent "$agent" --arg dec "$decision" \
+  jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg agent "$agent" --arg dec "$decision" \
         --arg reason "$reason" --arg rec "$rec" --argjson est "${est:-0}" --argjson snap "$snap" \
     '{ts:$ts, agent:$agent, decision:$dec, reason:$reason,
       recommendation:(if $rec=="" then null else $rec end), est_ram_mb:$est,
