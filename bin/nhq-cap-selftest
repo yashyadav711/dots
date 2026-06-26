@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# nhq-cap-selftest — hermetic acceptance for the v1 capability router (nhq-cap).
+#
+# Same shape as nhq-fleet-p1-selftest: a throwaway state dir, assert helpers, a
+# PASS/FAIL summary, exit 0 on green / 1 on any failure. NEVER touches the real
+# ~/.nhq-fleet — the runtime overlay is redirected into a temp NHQ_STATE_DIR, and
+# the committed seed (capability-registry.jsonl) is only ever READ.
+set -uo pipefail
+
+BIN="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+CAP="$BIN/nhq-cap"
+SEED="$BIN/capability-registry.jsonl"
+
+# Hermetic state: runtime adds land here, never in the real fleet state dir.
+export NHQ_STATE_DIR="$(mktemp -d)"
+cleanup() { rm -rf "$NHQ_STATE_DIR"; }
+trap cleanup EXIT
+
+pass=0; fail=0
+ok() { echo "  PASS: $1"; pass=$((pass + 1)); }
+no() { echo "  FAIL: $1"; fail=$((fail + 1)); }
+
+echo "── seed registry is well-formed JSONL ──────────────────────────────────"
+seed_lines=$(grep -c . "$SEED")
+seed_ok=$(jq -s 'all(.[]; (.type|type=="string") and (.type|length>0) and (.agent|type=="string") and (.agent|length>0))' "$SEED")
+if [ "$seed_ok" = "true" ] && [ "$seed_lines" -ge 8 ]; then
+  ok "seed: $seed_lines lines, every routing has type+agent"
+else
+  no "seed malformed (lines=$seed_lines all_ok=$seed_ok)"
+fi
+
+echo "── list --json is a JSON array covering the seed ───────────────────────"
+listed=$("$CAP" list --json | jq 'length')
+has_types=$("$CAP" list --json | jq -r 'map(.type) | (index("explore") != null) and (index("debugging") != null)')
+if [ "$listed" -ge 8 ] && [ "$has_types" = "true" ]; then
+  ok "list --json: $listed routings incl. explore + debugging"
+else
+  no "list --json wrong (len=$listed has_types=$has_types)"
+fi
+
+echo "── list (human) prints the routing table ───────────────────────────────"
+human="$("$CAP" list)"
+if grep -q '^TYPE' <<<"$human" && grep -q 'explore' <<<"$human" && grep -q 'oracle' <<<"$human"; then
+  ok "list human: header + explore + oracle present"
+else
+  no "list human missing rows: $human"
+fi
+
+echo "── suggest routes free-text tasks to the right lane ────────────────────"
+# helper: assert suggest --json picks the expected type+agent
+expect() {
+  local query="$1" want_type="$2" want_agent="$3"
+  local got_type got_agent
+  got_type="$("$CAP" suggest "$query" --json | jq -r '.type')"
+  got_agent="$("$CAP" suggest "$query" --json | jq -r '.agent')"
+  if [ "$got_type" = "$want_type" ] && [ "$got_agent" = "$want_agent" ]; then
+    ok "suggest \"$query\" → $got_type/$got_agent"
+  else
+    no "suggest \"$query\" → $got_type/$got_agent (wanted $want_type/$want_agent)"
+  fi
+}
+expect "scout the auth module and map the call sites" explore        explore
+expect "fix the login bug in the upload queue"        code-fix       task
+expect "design the new landing page UI"               design         designer
+expect "research best practices for rate limiting"    research       librarian
+expect "debug a hard crash and find the root cause"   debugging      oracle
+expect "review this diff before we merge"             review         reviewer
+expect "write a plan for the new subsystem architecture" architecture plan
+
+echo "── suggest matches a bare capability type ──────────────────────────────"
+bt="$("$CAP" suggest fleet-mechanism --json | jq -r '.agent')"
+[ "$bt" = "envy" ] && ok "suggest bare type 'fleet-mechanism' → envy" || no "bare type → $bt (wanted envy)"
+
+echo "── suggest reports WHY (human) ─────────────────────────────────────────"
+why="$("$CAP" suggest "scout the codebase")"
+if grep -q 'why:' <<<"$why" && grep -q 'agent:' <<<"$why"; then
+  ok "suggest human prints agent + why"
+else
+  no "suggest human missing why/agent: $why"
+fi
+
+echo "── unmatched query falls back to the general lane ──────────────────────"
+fb="$("$CAP" suggest "zzqqx wibble frobnicate xyzzy" --json)"
+fb_type="$(jq -r '.type'     <<<"$fb")"
+fb_flag="$(jq -r '.fallback' <<<"$fb")"
+fb_score="$(jq -r '.score'   <<<"$fb")"
+if [ "$fb_type" = "code-fix" ] && [ "$fb_flag" = "true" ] && [ "$fb_score" = "0" ]; then
+  ok "no-match → fallback code-fix (score 0, fallback=true)"
+else
+  no "fallback wrong (type=$fb_type flag=$fb_flag score=$fb_score)"
+fi
+
+echo "── add writes ONLY the runtime overlay (seed stays pristine) ───────────"
+seed_before=$(grep -c . "$SEED")
+"$CAP" add deploy releaser --tier smol --tools bash --notes "ship a release, deploy to prod, run the rollout" >/dev/null
+seed_after=$(grep -c . "$SEED")
+runtime="$NHQ_STATE_DIR/capability-registry.jsonl"
+added_count=$("$CAP" list --json | jq 'map(select(.type=="deploy")) | length')
+suggest_deploy="$("$CAP" suggest "deploy the release to prod" --json | jq -r '.agent')"
+if [ "$seed_before" = "$seed_after" ] && [ -f "$runtime" ] && [ "$added_count" = "1" ] && [ "$suggest_deploy" = "releaser" ]; then
+  ok "add → runtime overlay only; new routing listed + suggestable; seed unchanged ($seed_before lines)"
+else
+  no "add wrong (seed $seed_before→$seed_after runtime=$([ -f "$runtime" ] && echo yes || echo no) listed=$added_count suggest=$suggest_deploy)"
+fi
+
+echo "── add rejects missing args / unknown flags ────────────────────────────"
+if ! "$CAP" add onlytype >/dev/null 2>&1 && ! "$CAP" add t a --bogus x >/dev/null 2>&1; then
+  ok "add rejects missing agent + unknown flag"
+else
+  no "add accepted invalid input"
+fi
+
+echo "────────────────────────────────────────────────────────────────────────"
+echo "nhq-cap selftest: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

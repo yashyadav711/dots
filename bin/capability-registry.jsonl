@@ -1,0 +1,8 @@
+{"type":"explore","agent":"explore","model_tier":"smol","tools":"read-only","notes":"scout the codebase, map structure, locate files, recon, investigate, survey, trace references, understand how something works — read-only reconnaissance on the cheapest tier"}
+{"type":"code-fix","agent":"task","model_tier":"default","tools":"edit","notes":"implement a feature, fix a bug, edit code, write code, refactor, patch, apply a change, build something — the general implementation lane"}
+{"type":"review","agent":"reviewer","model_tier":"default","tools":"read-only","notes":"code review, audit a diff, critique a change, verify correctness, check quality, approve before merge"}
+{"type":"architecture","agent":"plan","model_tier":"slow","tools":"read-only","notes":"design the architecture, write a plan, decompose a spec, system design, high-level strategy, sequence the work — deep-reasoning tier"}
+{"type":"design","agent":"designer","model_tier":"default","tools":"edit","notes":"UI design, frontend, visual design, components, layout, styling, user experience, ux, look and feel"}
+{"type":"fleet-mechanism","agent":"envy","model_tier":"default","tools":"all","notes":"fleet kit mechanism, omp driver, nhq glue scripts, config routing, safety hooks, self-tests, infrastructure plumbing, capability router"}
+{"type":"research","agent":"librarian","model_tier":"default","tools":"read-only","notes":"research a topic, gather sources, web search, documentation lookup, read the literature, find information online, compare options"}
+{"type":"debugging","agent":"oracle","model_tier":"slow","tools":"read-only","notes":"debug a hard problem, root-cause analysis, diagnose a failure, systematic debugging, why is this broken, reproduce a crash — deep-reasoning tier"}
