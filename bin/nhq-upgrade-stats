@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# nhq-upgrade-stats — the MEASURE substrate for `upgrade nhq`, OBSERVE only.
+#
+# The `upgrade nhq` loop's MEASURE stage ("did past upgrades help?") had no data
+# substrate — it was eyeball-only. But every sweep ALREADY writes its candidates to
+# ai/decisions.jsonl (source:"upgrade-nhq"/"protocol-reality-audit" or ref:"upgrade-*"),
+# git records every applied commit + any revert, and the steal-registry tracks pattern
+# decisions. So MEASURE needs no new rot-prone file — just a tool that reads what the
+# flow already produces. This is that tool.
+#
+# Reports, per the did-past-upgrades-help dimension:
+#   • CADENCE      — sweeps to date, last sweep, days since, candidates/sweep
+#   • OUTCOMES     — adopted / deferred / pruned / corrected / measure / other
+#   • CHURN        — rows carrying a `supersedes` (a candidate that had to be walked
+#                    back = the churn signal the guard watches for) + git reverts
+#   • REGISTRY     — steal-registry rot at a glance (pending / adopted, oldest pending)
+#
+#   nhq-upgrade-stats            human report
+#   nhq-upgrade-stats --json     machine snapshot to stdout
+#
+# Env: NHQ_OS_REPO (default ~/Github/nhq-agentic-os), NHQ_DECISIONS, NHQ_STEAL_REGISTRY.
+set -uo pipefail
+
+OS_REPO="${NHQ_OS_REPO:-$HOME/Github/nhq-agentic-os}"
+DECISIONS="${NHQ_DECISIONS:-$OS_REPO/ai/decisions.jsonl}"
+REGISTRY="${NHQ_STEAL_REGISTRY:-$OS_REPO/ai/steal-registry.jsonl}"
+TODAY="$(date -u +%Y-%m-%d)"
+
+# An upgrade-flow decision row: written by a sweep (source) or carrying an upgrade ref.
+UPGRADE_FILTER='select((.source=="upgrade-nhq") or (.source=="protocol-reality-audit") or ((.ref // "")|startswith("upgrade-")))'
+
+# Classify a row by the uppercase verdict tokens the flow writes into `.decision`.
+CLASSIFY='
+  def klass:
+    (.decision // "") as $d
+    | if   ($d|test("MEASURE"))                                   then "measure"
+      elif (has("supersedes")) or ($d|test("CORRECTED"))          then "corrected"
+      elif ($d|test("PRUNED|PRUNE\\b"))                           then "pruned"
+      elif ($d|test("DEFERRED|EXPLORE-PENDING|DEFER-TO-YASH"))    then "deferred"
+      elif ($d|test("ADOPTED|DONE|LOCKED|RESOLVED|VALIDATED"))    then "adopted"
+      else "other" end;'
+
+# Resolve the CURRENT decision per steal pattern (latest date wins; dedupes the
+# pending->adopted history rows the registry keeps append-only).
+REG_RESOLVE='
+  map(select(.type=="pattern"))
+  | group_by((.source_id // "?") + "|" + (.skill // ((.description // "")[0:40])))
+  | map(max_by(.date // "0000-00-00"))'
+
+snapshot() {
+  local dec_json reg_json reverts
+  # --- decisions.jsonl: upgrade-flow rows ---
+  if [[ -f "$DECISIONS" ]]; then
+    dec_json="$(jq -s --argjson nil null "
+      $CLASSIFY
+      [ .[] | $UPGRADE_FILTER ]
+      | { rows: length,
+          sweeps: ([ .[].date ] | unique | length),
+          last_sweep: ([ .[].date ] | max),
+          first_sweep: ([ .[].date ] | min),
+          by_class: ( reduce .[] as \$r ({}; .[\$r|klass] += 1) ),
+          churn: ([ .[] | select(has(\"supersedes\")) ] | length)
+        }" "$DECISIONS" 2>/dev/null)"
+  fi
+  [[ -z "${dec_json:-}" || "$dec_json" == "null" ]] && dec_json='{"rows":0,"sweeps":0,"last_sweep":null,"first_sweep":null,"by_class":{},"churn":0}'
+
+  # --- steal-registry.jsonl: current decision per pattern ---
+  if [[ -f "$REGISTRY" ]]; then
+    reg_json="$(jq -s "
+      $REG_RESOLVE
+      | { patterns: length,
+          by_decision: ( reduce .[] as \$r ({}; .[(\$r.decision // \"pending\")] += 1) ),
+          oldest_pending: ( [ .[] | select((.decision // \"pending\")==\"pending\") | .date ] | min )
+        }" "$REGISTRY" 2>/dev/null)"
+  fi
+  [[ -z "${reg_json:-}" || "$reg_json" == "null" ]] && reg_json='{"patterns":0,"by_decision":{},"oldest_pending":null}'
+
+  # --- git: reverts touching the rulebook (a hard "hurt" signal) ---
+  reverts=0
+  if [[ -d "$OS_REPO/.git" ]]; then
+    reverts="$(git -C "$OS_REPO" log --oneline -i --grep='revert' -- .claude 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+
+  jq -n --argjson dec "$dec_json" --argjson reg "$reg_json" \
+        --argjson reverts "${reverts:-0}" --arg today "$TODAY" \
+    '{today:$today, decisions:$dec, registry:$reg, rulebook_reverts:$reverts}'
+}
+
+days_since() { # $1 = YYYY-MM-DD ; echoes integer days from that date to today
+  [[ -z "${1:-}" || "$1" == "null" ]] && { echo "?"; return; }
+  local a b; a="$(date -u -d "$1" +%s 2>/dev/null)"; b="$(date -u -d "$TODAY" +%s 2>/dev/null)"
+  [[ -z "$a" || -z "$b" ]] && { echo "?"; return; }
+  echo $(( (b - a) / 86400 ))
+}
+
+render() {
+  local s="$1"
+  local rows sweeps last first churn reverts pats pend oldest
+  rows="$(jq -r '.decisions.rows' <<<"$s")"
+  sweeps="$(jq -r '.decisions.sweeps' <<<"$s")"
+  last="$(jq -r '.decisions.last_sweep // "—"' <<<"$s")"
+  first="$(jq -r '.decisions.first_sweep // "—"' <<<"$s")"
+  churn="$(jq -r '.decisions.churn' <<<"$s")"
+  reverts="$(jq -r '.rulebook_reverts' <<<"$s")"
+  pats="$(jq -r '.registry.patterns' <<<"$s")"
+  pend="$(jq -r '.registry.by_decision.pending // 0' <<<"$s")"
+  oldest="$(jq -r '.registry.oldest_pending // "null"' <<<"$s")"
+
+  echo "📊 NHQ UPGRADE MEASURE  (observe only — did past upgrades help?)"
+  echo "──────────────────────────────────────────────────────────────────────"
+  printf "  cadence    : %s sweep(s) over %s candidate row(s); first %s → last %s\n" \
+    "$sweeps" "$rows" "$first" "$last"
+  printf "             : %s day(s) since the last sweep\n" "$(days_since "$last")"
+  echo   "  outcomes   : $(jq -c '.decisions.by_class' <<<"$s")"
+  if [[ "$churn" -gt 0 || "$reverts" -gt 0 ]]; then
+    printf "  ⚠ churn    : %s walked-back/corrected candidate(s); %s rulebook revert(s) in git\n" "$churn" "$reverts"
+  else
+    echo   "  churn      : none — no corrected candidates, no rulebook reverts (clean)"
+  fi
+  echo "  ── steal registry ──"
+  printf "  patterns   : %s tracked; decisions = %s\n" "$pats" "$(jq -c '.registry.by_decision' <<<"$s")"
+  if [[ "$pend" -gt 0 ]]; then
+    printf "  ⚠ pending  : %s un-decided pattern(s); oldest from %s (%s day(s) old)\n" \
+      "$pend" "$oldest" "$(days_since "$oldest")"
+    echo   "             → run \`nhq-steal-review\` to close pending + check REAL/PAPER"
+  else
+    echo   "  pending    : none — every stolen pattern has a decision"
+  fi
+}
+
+case "${1:-}" in
+  --json) snapshot ;;
+  ""|--report) render "$(snapshot)" ;;
+  *) echo "usage: nhq-upgrade-stats [--json]" >&2; exit 2 ;;
+esac

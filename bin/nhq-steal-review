@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# nhq-steal-review — close the steal-registry rot loop for `upgrade nhq`.
+#
+# The steal registry (ai/steal-registry.jsonl) is where the upgrade-architect logs
+# patterns lifted from source repos as `pending`. The known failure mode (the
+# registry's own hone/internal-audit entry): pending entries never get decided, and
+# "adopted" patterns become PAPER — documented but never actually invoked. This tool
+# closes both holes:
+#   • ROT      — lists every tracked pattern with its current decision + age; flags
+#                pending entries older than the rot threshold (default 7d).
+#   • REAL/PAPER — for adopted patterns, greps the rulebook + decisions.jsonl for real
+#                invocation evidence (the PR-7 capability-utilization method) and marks
+#                each REAL (found) or PAPER (adopted but no evidence — bit-rotting).
+#   • DECIDE   — close a pending pattern by appending a decision row (append-only,
+#                matching how the registry already records pending->adopted history).
+#
+#   nhq-steal-review                       full report (rot + REAL/PAPER)
+#   nhq-steal-review --pending             only the un-decided patterns
+#   nhq-steal-review --json                machine snapshot
+#   nhq-steal-review --decide <q> <adopted|rejected|deferred> "<rationale>"
+#                                          close the pattern matching <q> (substring)
+#
+# Env: NHQ_OS_REPO (default ~/Github/nhq-agentic-os), NHQ_STEAL_REGISTRY, NHQ_DECISIONS,
+#      NHQ_STEAL_ROT_DAYS (default 7).
+set -uo pipefail
+
+OS_REPO="${NHQ_OS_REPO:-$HOME/Github/nhq-agentic-os}"
+REGISTRY="${NHQ_STEAL_REGISTRY:-$OS_REPO/ai/steal-registry.jsonl}"
+DECISIONS="${NHQ_DECISIONS:-$OS_REPO/ai/decisions.jsonl}"
+ROT_DAYS="${NHQ_STEAL_ROT_DAYS:-7}"
+TODAY="$(date -u +%Y-%m-%d)"
+
+[[ -f "$REGISTRY" ]] || { echo "nhq-steal-review: no registry at $REGISTRY" >&2; exit 1; }
+
+# Resolve current decision per pattern (latest date wins; dedupe append-only history).
+REG_RESOLVE='
+  map(select(.type=="pattern"))
+  | group_by((.source_id // "?") + "|" + (.skill // ((.description // "")[0:40])))
+  | map(max_by(.date // "0000-00-00"))
+  | sort_by(.date // "0000-00-00")'
+
+resolved() { jq -s "$REG_RESOLVE" "$REGISTRY"; }
+
+days_since() {
+  [[ -z "${1:-}" || "$1" == "null" ]] && { echo "?"; return; }
+  local a b; a="$(date -u -d "$1" +%s 2>/dev/null)"; b="$(date -u -d "$TODAY" +%s 2>/dev/null)"
+  [[ -z "$a" || -z "$b" ]] && { echo "?"; return; }
+  echo $(( (b - a) / 86400 ))
+}
+
+# Invocation evidence (the PR-7 capability-utilization method): is an ADOPTED pattern
+# actually USED, or only documented? DECLARATION surfaces (rulebook + decisions.jsonl)
+# prove it was written down; INVOCATION surfaces (task-ledger + daily/ops-log + real
+# git usage commits) prove it was run. A rule adopted-then-never-invoked is the PAPER
+# rot the audit hunts (the registry's own hone/internal-audit entry: "0 invocation
+# evidence in ledger/git"). Echoes: "<REAL|PAPER|MISSING> <invocation_hits> <needle>"
+#   REAL    = found on an invocation surface (real usage trace)
+#   PAPER   = documented only — adopted into a rule but never invoked (bit-rotting)
+#   MISSING = not even documented (shouldn't happen for an adopted pattern)
+STOP_WORDS=" references document quality within limits visual recap source pattern registry mapping target effort status rationale agent agents skill tooling "
+# Declaration commits (the act of adopting) must NOT count as invocation.
+DECL_COMMIT='adopt|steal|upgrade nhq|prune|registry|pending|candidate'
+evidence_for() { # $1=ref $2=skill $3=description
+  local ref="$1" skill="$2" desc="$3" t
+  local -a needles=()
+  [[ -n "$ref" && "$ref" != "null" ]] && needles+=("$ref")
+  # distinctive identifiers: hyphenated names + dotted filenames (from skill+description)
+  while IFS= read -r t; do [[ -n "$t" ]] && needles+=("$t"); done < <(
+    printf '%s %s' "$skill" "$desc" | grep -oE '[A-Za-z][A-Za-z0-9]*([-.][A-Za-z0-9]+)+' | sort -u)
+  # plus bare distinctive words (>=6 chars, not generic) from the skill label only
+  while IFS= read -r t; do
+    [[ -z "$t" ]] && continue
+    case "$STOP_WORDS" in *" ${t,,} "*) continue ;; esac
+    needles+=("$t")
+  done < <(printf '%s' "$skill" | grep -oE '[A-Za-z]{6,}' | sort -u)
+  [[ "${#needles[@]}" -eq 0 ]] && { echo "MISSING 0 -"; return; }
+  local -a inv_files=() f
+  for f in "$OS_REPO/ai/task-ledger.md" "$OS_REPO/ai/daily-log.md" "$OS_REPO/ai/ops-log.md"; do
+    [[ -f "$f" ]] && inv_files+=("$f")
+  done
+  local inv=0 doc=0 hit_needle="-" n
+  for n in "${needles[@]}"; do
+    local fh=0 gh=0
+    [[ "${#inv_files[@]}" -gt 0 ]] && fh="$(grep -lIiF "$n" "${inv_files[@]}" 2>/dev/null | wc -l | tr -d ' ')"
+    [[ -d "$OS_REPO/.git" ]] && gh="$(git -C "$OS_REPO" log --oneline -i -F --grep="$n" 2>/dev/null | grep -ivE "$DECL_COMMIT" | wc -l | tr -d ' ')"
+    local nh=$(( fh + gh ))
+    if [[ "$nh" -gt 0 ]]; then inv=$(( inv + nh )); [[ "$hit_needle" == "-" ]] && hit_needle="$n"; fi
+    local dh; dh="$(grep -rIiF --exclude='steal-registry.jsonl' "$n" "$OS_REPO/.claude" "$OS_REPO/CLAUDE.md" "$DECISIONS" 2>/dev/null | wc -l | tr -d ' ')"
+    doc=$(( doc + dh ))
+  done
+  if   [[ "$inv" -gt 0 ]]; then echo "REAL $inv $hit_needle"
+  elif [[ "$doc" -gt 0 ]]; then echo "PAPER 0 documented"
+  else echo "MISSING 0 -"; fi
+}
+
+snapshot() {
+  local res; res="$(resolved)"
+  local n; n="$(jq 'length' <<<"$res")"
+  local out='[]' i=0
+  while [[ "$i" -lt "$n" ]]; do
+    local row; row="$(jq -c ".[$i]" <<<"$res")"
+    local sid skill desc dec date ref
+    sid="$(jq -r '.source_id // "?"' <<<"$row")"
+    skill="$(jq -r '.skill // ""' <<<"$row")"
+    desc="$(jq -r '.description // ""' <<<"$row")"
+    dec="$(jq -r '.decision // "pending"' <<<"$row")"
+    date="$(jq -r '.date // "null"' <<<"$row")"
+    ref="$(jq -r '.ref // ""' <<<"$row")"
+    local age; age="$(days_since "$date")"
+    local ev="n/a" evn=0 evn_needle="-"
+    if [[ "$dec" == "adopted" ]]; then read -r ev evn evn_needle < <(evidence_for "$ref" "$skill" "$desc"); fi
+    local rotting=false
+    [[ "$dec" == "pending" && "$age" != "?" && "$age" -gt "$ROT_DAYS" ]] && rotting=true
+    out="$(jq -c --arg sid "$sid" --arg skill "$skill" --arg dec "$dec" --arg date "$date" \
+      --argjson age "$([[ $age == '?' ]] && echo null || echo $age)" --arg ev "$ev" \
+      --argjson evn "${evn:-0}" --arg evneedle "$evn_needle" --argjson rot "$rotting" \
+      '. += [{source_id:$sid, skill:$skill, decision:$dec, date:$date, age_days:$age, evidence:$ev, evidence_hits:$evn, evidence_needle:$evneedle, rotting:$rot}]' <<<"$out")"
+    i=$((i+1))
+  done
+  jq -n --argjson p "$out" --arg today "$TODAY" --argjson rot "$ROT_DAYS" \
+    '{today:$today, rot_threshold_days:$rot, patterns:$p,
+      summary:{ total:($p|length),
+                pending:([$p[]|select(.decision=="pending")]|length),
+                rotting:([$p[]|select(.rotting)]|length),
+                adopted:([$p[]|select(.decision=="adopted")]|length),
+                paper:([$p[]|select(.evidence=="PAPER")]|length),
+                real:([$p[]|select(.evidence=="REAL")]|length),
+                missing:([$p[]|select(.evidence=="MISSING")]|length) }}'
+}
+
+render() {
+  local s="$1" only_pending="${2:-no}"
+  echo "🧲 NHQ STEAL-REGISTRY REVIEW  (rot + REAL/PAPER — close the loop)"
+  echo "──────────────────────────────────────────────────────────────────────"
+  local filt='.patterns[]'
+  [[ "$only_pending" == "pending" ]] && filt='.patterns[]|select(.decision=="pending")'
+  jq -r "$filt | [
+      (if .rotting then \"⚠ ROT\" elif .decision==\"pending\" then \"  pend\"
+        elif .evidence==\"PAPER\" then \"⚠ PAPR\" elif .evidence==\"REAL\" then \"  real\"
+        elif .evidence==\"MISSING\" then \"⚠ MISS\"
+        else \"  \"+.decision end),
+      .decision,
+      ((.age_days|tostring)+\"d\"),
+      (.source_id + (if .skill!=\"\" then \" · \"+.skill else \"\" end))
+    ] | \"  \(.[0]) │ \(.[1] | (. + \"        \")[0:9]) │ \(.[2] | (\". \"+.)[0:5]) │ \(.[3])\"" <<<"$s"
+  echo "──────────────────────────────────────────────────────────────────────"
+  printf "  total %s · pending %s (⚠ %s rotting >%sd) · adopted %s (⚠ %s PAPER)\n" \
+    "$(jq -r '.summary.total' <<<"$s")" "$(jq -r '.summary.pending' <<<"$s")" \
+    "$(jq -r '.summary.rotting' <<<"$s")" "$(jq -r '.rot_threshold_days' <<<"$s")" \
+    "$(jq -r '.summary.adopted' <<<"$s")" "$(jq -r '.summary.paper' <<<"$s")"
+  local nr; nr="$(jq -r '.summary.rotting' <<<"$s")"
+  local np; np="$(jq -r '.summary.paper' <<<"$s")"
+  [[ "$nr" -gt 0 ]] && echo "  → ROT: decide these via \`nhq-steal-review --decide <q> <adopted|rejected|deferred> \"why\"\`"
+  [[ "$np" -gt 0 ]] && echo "  → PAPER: adopted but no invocation evidence — revive (wire a trigger) or prune"
+}
+
+decide() { # $1=query $2=verdict $3=rationale
+  local q="$1" verdict="$2" why="${3:-}"
+  case "$verdict" in adopted|rejected|deferred) ;; *) echo "verdict must be adopted|rejected|deferred" >&2; exit 2 ;; esac
+  [[ -z "$why" ]] && { echo "a rationale is required" >&2; exit 2; }
+  # find matching resolved pattern(s) by substring across source_id+skill+description
+  local matches; matches="$(resolved | jq -c --arg q "$q" \
+    '[ .[] | select(((.source_id//"")+" "+(.skill//"")+" "+(.description//""))|ascii_downcase|contains($q|ascii_downcase)) ]')"
+  local m; m="$(jq 'length' <<<"$matches")"
+  if [[ "$m" -eq 0 ]]; then echo "no pattern matches \"$q\"" >&2; exit 1; fi
+  if [[ "$m" -gt 1 ]]; then
+    echo "ambiguous — \"$q\" matches $m patterns:" >&2
+    jq -r '.[] | "  · \(.source_id) \(.skill // "")"' <<<"$matches" >&2
+    echo "narrow the query." >&2; exit 1
+  fi
+  local sid skill desc
+  sid="$(jq -r '.[0].source_id' <<<"$matches")"
+  skill="$(jq -r '.[0].skill // ""' <<<"$matches")"
+  desc="$(jq -r '.[0].description // ""' <<<"$matches")"
+  local ref="steal-review-${TODAY}"
+  # Carry the matched pattern's identity (skill AND/OR description) so this decision
+  # row resolves to the SAME group as the original entry (key = source_id|skill//desc[0:40]);
+  # otherwise latest-wins dedup can't collapse them and the pattern shows twice.
+  local line; line="$(jq -nc --arg sid "$sid" --arg skill "$skill" --arg desc "$desc" --arg d "$TODAY" \
+    --arg dec "$verdict" --arg why "$why" --arg ref "$ref" \
+    '{type:"pattern", source_id:$sid, date:$d, decision:$dec, decision_date:$d, rationale:$why, ref:$ref, scope:"nhq-steal"}
+     | if $skill!="" then .skill=$skill else . end
+     | if $desc!="" then .description=$desc else . end')"
+  printf '%s\n' "$line" >> "$REGISTRY"
+  echo "✓ closed: $sid${skill:+ · $skill} → $verdict"
+  echo "  appended to $REGISTRY (Director commits — Envy OPS-pane leaves it staged)"
+}
+
+case "${1:-}" in
+  --json)    snapshot ;;
+  --pending) render "$(snapshot)" pending ;;
+  --decide)  shift; decide "${1:-}" "${2:-}" "${3:-}" ;;
+  ""|--report) render "$(snapshot)" ;;
+  *) echo "usage: nhq-steal-review [--pending|--json|--decide <q> <adopted|rejected|deferred> \"why\"]" >&2; exit 2 ;;
+esac
