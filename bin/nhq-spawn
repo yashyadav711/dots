@@ -130,6 +130,13 @@ nhq_touch_activity "$SESSION"
 # Write the complete spawn-owned .meta record for this fresh session.
 write_spawn_meta "$SESSION"
 
+# Admission gate (OBSERVE-only, D6): log the ADMIT/QUEUE/REJECT decision this fresh
+# spawn WOULD get against live RAM + concurrency on the 7.5GB box. NEVER blocks the
+# spawn — observe mode always exits 0, and `|| true` guarantees that even a missing
+# or erroring nhq-sched cannot abort nhq-spawn under `set -e`. Telemetry first (D1):
+# this gathers admission data to tune thresholds before any enforce-flip.
+"$(dirname "$SELF")/nhq-sched" admit "$AGENT" >/dev/null 2>&1 || true
+
 # Launch interactive claude in a detached tmux session, in the repo dir. The
 # trailing `exec fish` is a safety net: if claude ever exits/crashes, the tmux
 # session survives (inspectable, shows DEAD) instead of vanishing. Interactive
