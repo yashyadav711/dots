@@ -1,10 +1,14 @@
-# nhq-glm overlay — routes EVERY omp model role to z.ai (GLM).
+# nhq-glm overlay — routes EVERY omp model role to z.ai (GLM) + web search off Anthropic.
 #
 # Loaded by the nhq-glm launcher via `omp --config <this-file>`. Overrides all
-# modelRoles so an nhq-glm session burns ZERO Anthropic Claude quota (default,
-# subagents, planning, vision, commit, title — everything goes to z.ai). agy is
-# a separate CLI, not an omp provider, so it is not routable here; use agy
-# directly when its rotator accounts are healthy.
+# 10 modelRoles so a session burns ZERO Anthropic Claude quota (default,
+# subagents/task, plan, slow, designer, advisor, smol, commit, title, vision —
+# all go to z.ai). agy is a separate CLI, not an omp provider, so it is not
+# routable here; use agy directly when its rotator accounts are healthy.
+#
+# providers.webSearch is moved off Anthropic too — web_search is a server-side
+# tool billed through the Claude API account, so `anthropic` would still draw
+# on the failing account. Routed to firecrawl (FIRECRAWL_API_KEY is in env).
 #
 # Model choices (all confirmed live via `omp models`):
 #   glm-5.2   — flagship, 1M context → all text/reasoning roles
@@ -21,3 +25,5 @@ modelRoles:
   commit: zai/glm-5.2
   title: zai/glm-5.2
   vision: zai/glm-4.6v
+providers:
+  webSearch: firecrawl
