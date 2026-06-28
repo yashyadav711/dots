@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# nhq-help [filter] — list every nhq-* command with its one-line description.
+#
+# Auto-discovers runnable nhq-* commands in ~/.local/bin (the PATH dir), reads
+# each script's line-2 header (`# nhq-x <args> — <desc>` or python
+# `"""nhq-x — <desc>`), and prints an aligned name — description table.
+# Excludes *-selftest helpers, *.bak* backups, nhq-lib.sh, and itself. No
+# registry to maintain — new aliases appear automatically.
+#
+# Usage: nhq-help            # list all
+#        nhq-help vault      # case-insensitive substring filter on the name
+set -euo pipefail
+
+BIN_DIR="$HOME/.local/bin"
+FILTER="${1:-}"
+
+printf '\nNHQ commands (%s):\n\n' "$BIN_DIR"
+
+for path in "$BIN_DIR"/nhq-*; do
+  [[ -e "$path" ]] || continue
+  name="$(basename "$path")"
+  case "$name" in
+    *-selftest|*.bak*|nhq-lib.sh|nhq-help) continue ;;
+  esac
+  if [[ -n "$FILTER" ]]; then
+    case "${name,,}" in
+      *"${FILTER,,}"*) ;;
+      *) continue ;;
+    esac
+  fi
+  real="$(readlink -f "$path")"
+  line2="$(sed -n '2p' "$real" 2>/dev/null || true)"
+  desc="${line2#\#}"        # drop a leading '#'
+  desc="${desc#\"\"\"}"     # or a leading python '"""'
+  desc="${desc# }"          # drop one leading space
+  if [[ "$desc" == *" — "* ]]; then
+    desc="${desc#* — }"     # keep only text after the em-dash separator
+  fi
+  printf '  %-24s %s\n' "$name" "$desc"
+done
+
+printf '\n'

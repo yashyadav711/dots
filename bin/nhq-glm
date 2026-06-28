@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# nhq-glm [omp-args...] — launch omp with EVERY model role routed to z.ai (GLM).
+#
+# Loads the nhq-glm-config.yml overlay (sits next to this script) so ALL
+# modelRoles — default, subagents (task), plan, slow, designer, advisor, smol,
+# commit, title, vision — resolve to z.ai GLM models. ZERO Anthropic Claude
+# burn for the session (verified: a spawned subagent ran on zai/glm-5.2).
+#
+# agy is a separate CLI (the Antigravity rotator), not an omp model provider,
+# so it is not routable here — use agy directly when its accounts are healthy.
+#
+# NOTE: webSearch still follows ~/.omp/agent/config.yml providers.webSearch
+# (z.ai is not an omp search backend); that one path is outside this alias.
+#
+# Usage: nhq-glm                  # interactive omp, fully on GLM
+#        nhq-glm "fix the build"  # with an initial prompt
+set -euo pipefail
+SRC="$(readlink -f "${BASH_SOURCE[0]:-$0}")"   # resolve the ~/.local/bin symlink
+DIR="$(dirname "$SRC")"
+exec omp --config "$DIR/nhq-glm-config.yml" "$@"

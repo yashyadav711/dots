@@ -1,0 +1,23 @@
+# nhq-glm overlay — routes EVERY omp model role to z.ai (GLM).
+#
+# Loaded by the nhq-glm launcher via `omp --config <this-file>`. Overrides all
+# modelRoles so an nhq-glm session burns ZERO Anthropic Claude quota (default,
+# subagents, planning, vision, commit, title — everything goes to z.ai). agy is
+# a separate CLI, not an omp provider, so it is not routable here; use agy
+# directly when its rotator accounts are healthy.
+#
+# Model choices (all confirmed live via `omp models`):
+#   glm-5.2   — flagship, 1M context → all text/reasoning roles
+#   glm-4.6v  — vision-capable GLM → the vision role
+# Coding-plan usage is not bound by the z.ai balance-API concurrency table.
+modelRoles:
+  default: zai/glm-5.2:high
+  slow: zai/glm-5.2:high
+  plan: zai/glm-5.2:high
+  task: zai/glm-5.2
+  designer: zai/glm-5.2
+  advisor: zai/glm-5.2
+  smol: zai/glm-5.2
+  commit: zai/glm-5.2
+  title: zai/glm-5.2
+  vision: zai/glm-4.6v
