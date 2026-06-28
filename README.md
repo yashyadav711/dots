@@ -51,3 +51,17 @@ bash ~/Github/dots/install.sh        # installs packages, symlinks all configs
 - Shell: [Fish](https://fishshell.com/)
 - Editor: [SpaceVim](https://spacevim.org)
 - Multiplexer: [Tmux + Oh My Tmux](https://github.com/gpakosz/.tmux)
+
+## 🧰 `bin/` — NHQ command scripts
+
+`bin/nhq-*` are the NetrunnersHQ command-line tools (`nhq-status`, `nhq-spawn`, `nhq-threads`, …). They're symlinked into `~/.local/bin` on PATH. `nhq-help` (auto-discovered index) lists every one with its one-line description.
+
+**Header convention (required for `nhq-help` to list a script):** line 2 of each script MUST be a single line in the form:
+
+```
+# nhq-<name> <args...> — <one-line description>
+```
+
+(Python scripts use `"""nhq-<name> — <desc>` on line 2 instead of `# …`.) `nhq-help` reads line 2, strips the `#`/`"""`, and keeps the text after the ` — ` em-dash as the description. A script without the em-dash still lists (it prints the whole stripped line-2) but won't be cleanly formatted. `*-selftest`, `*.bak*`, `nhq-lib.sh`, and `nhq-help` itself are excluded from the index.
+
+When adding a new `nhq-*` script: write it here, follow the line-2 header, `chmod +x`, symlink into `~/.local/bin`. It appears in `nhq-help` automatically — no registry to touch.
