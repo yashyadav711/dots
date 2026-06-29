@@ -4,16 +4,35 @@ ai/open-threads.md tree (render-from-truth; kills thread-dropping).
 
 Director must PASTE this output verbatim instead of hand-typing the thread
 tree from memory. The tool parses every `[id]` thread line out of the fenced
-```text tree block, then emits the header + grouped markdown table that
-replies.md RULE 1 expects. A built-in self-test guarantees the rendered row
-count == the number of thread-start lines in the source, so no thread can be
-silently dropped.
+```text tree block, then emits the header + grouped table that replies.md
+RULE 1 expects. A built-in self-test guarantees the rendered row count == the
+number of thread-start lines in the source, so no thread can be silently
+dropped.
+
+Three render modes:
+  latex  (default) — `$\\textcolor{...}$` cells, render inside the omp TUI.
+  web    (--web)   — markdown bold + emoji chips, for the omp WEB client.
+  ansi   (--ansi)  — truecolor ANSI escapes, for a real terminal pane (kitty).
+
+`--live` runs an `os.path.getmtime` poll loop: clear + re-render on file
+change, Ctrl-C to exit. Designed for Yash to keep open in a side pane so
+Director stops pasting the 49-row table every reply (usage win).
+
+Filters compose with every mode + --live:
+  --mirror --heydaddy --ops --julian --firststone --off-work   (category)
+  --category NAME   (repeatable; also covers custom categories)
+  --needs-you --active --waiting --nearly --close              (status preset)
+  --status EMOJI    (repeatable, exact)
+  --id LETTER       (repeatable; matches any id in a `tr/vr` pair)
 
 Usage:
-  nhq-threads                 # print header + table to stdout
-  nhq-threads --file PATH      # override the source file
-  nhq-threads --needs-you      # only 🔴 (needs-you / blocked) threads
-  nhq-threads --verify         # also run self-test, print parse stats to stderr
+  nhq-threads                       # latex header + table (Director paste)
+  nhq-threads --web                 # web-safe markdown (Director paste, web client)
+  nhq-threads --ansi                # truecolor ANSI table (terminal pane)
+  nhq-threads --live                # live ANSI view, redraws on file change
+  nhq-threads --live --mirror --needs-you   # live view, only Mirror's 🔴
+  nhq-threads --file PATH           # override the source file
+  nhq-threads --verify              # also run self-test, print parse stats to stderr
 
 Exit non-zero if the self-test fails (rendered rows != source [id] lines),
 listing the missing IDs.
@@ -24,6 +43,7 @@ import argparse
 import os
 import re
 import sys
+import time
 
 DEFAULT_FILE = os.path.expanduser("~/Github/nhq-agentic-os/ai/open-threads.md")
 
@@ -67,14 +87,14 @@ ACTION_BY_STATUS = {
 # Terminal-mode colour for the Who chip (NHQ palette).
 WHO_COLOR = {"Yash": "#F2B705", "Julian/ext": "#7C873E", "Director": "#BDB8AC"}
 
-# Category theme: (colour hex, single-line ASCII motif) for the header row.
+# Category theme: (colour hex, glyph, motif label) for the header row.
 CAT_THEME = {
-    "HEYDADDY":   ("#C8102E", "❤ ─────────── companion chat ───────────"),
-    "MIRROR":     ("#F2B705", "◧ ─────────── reflection ───────────"),
-    "FIRSTSTONE": ("#ECE7DA", "▣ ─────────── foundation ───────────"),
-    "JULIAN":     ("#7C873E", "✦ ─────────── partner ───────────"),
-    "OPS":        ("#BDB8AC", "⚙ ─────────── the machine ───────────"),
-    "OFF-WORK":   ("#BDB8AC", "☾ ─────────── after hours ───────────"),
+    "HEYDADDY":   ("#C8102E", "❤", "companion chat"),
+    "MIRROR":     ("#F2B705", "◧", "reflection"),
+    "FIRSTSTONE": ("#ECE7DA", "▣", "foundation"),
+    "JULIAN":     ("#7C873E", "✦", "partner"),
+    "OPS":        ("#BDB8AC", "⚙", "the machine"),
+    "OFF-WORK":   ("#BDB8AC", "☾", "after hours"),
 }
 
 # State-sort order within a category (🔴 first ... ✅/close-ready last).
@@ -90,6 +110,14 @@ NEXT_RE = re.compile(r"▶\s*next:\s*(.+?)\s*$")
 THREAD_RE = re.compile(r"^[\s│]*[├└]──\s+(\[[^\]]+\](?:\s*/\s*\[[^\]]+\])*)\s*(.*)$")
 # A category header: leading whitespace then ALL-CAPS word(s), maybe a "(...)" note.
 CAT_RE = re.compile(r"^(\s*)([A-Z][A-Z0-9\- ]*?)(\s*\(.*\))?\s*$")
+
+# ANSI escapes.
+_ANSI_RESET = "\033[0m"
+_ANSI_BOLD = "\033[1m"
+_ANSI_DIM = "\033[2m"
+_CLEAR = "\033[2J\033[H"  # clear screen + cursor home
+_HIDE = "\033[?25l"       # hide cursor (live mode)
+_SHOW = "\033[?25h"       # show cursor
 
 
 def extract_block(text: str) -> list[str]:
@@ -193,10 +221,27 @@ def _cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ").strip()
 
 
-def _color(text: str, hexcolor: str, web: bool, bold: bool = False) -> str:
-    """Wrap text in the active render mode's colour/emphasis."""
-    if web:
+def _hex_rgb(hexcolor: str) -> tuple[int, int, int]:
+    """`#C8102E` -> (200, 16, 46)."""
+    h = hexcolor.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _color(text: str, hexcolor: str, mode: str, bold: bool = False) -> str:
+    """Wrap text in the active render mode's colour/emphasis.
+
+    mode ∈ {"latex", "web", "ansi"}. latex/web output is byte-stable with the
+    prior single-bool implementation; ansi emits truecolor escapes.
+    """
+    if mode == "web":
         return f"**{text}**" if bold else text
+    if mode == "ansi":
+        r, g, b = _hex_rgb(hexcolor)
+        pre = f"\033[38;2;{r};{g};{b}m"
+        if bold:
+            pre += _ANSI_BOLD
+        return f"{pre}{text}{_ANSI_RESET}"
+    # latex (default) — byte-identical to the original emit.
     inner = (r"\textbf{%s}" if bold else r"\text{%s}") % text
     return r"$\textcolor{%s}{%s}$" % (hexcolor, inner)
 
@@ -218,9 +263,9 @@ def _action(t: dict) -> str:
     return ACTION_BY_STATUS.get(t["emoji"], "—")
 
 
-def _action_cell(t: dict, web: bool) -> str:
+def _action_cell(t: dict, mode: str) -> str:
     who = _who(t)
-    who_str = _color(who, WHO_COLOR.get(who, "#BDB8AC"), web, bold=True)
+    who_str = _color(who, WHO_COLOR.get(who, "#BDB8AC"), mode, bold=True)
     action = _cell(_action(t))
     return f"{action} · {who_str}"
 
@@ -237,41 +282,52 @@ def _status_cell(t: dict) -> str:
 CAT_ORDER = ["HEYDADDY", "MIRROR", "FIRSTSTONE", "JULIAN", "OPS", "OFF-WORK", "WORK"]
 
 
-def _cat_header_row(cat: str, web: bool) -> str:
-    """Render a category header row: coloured name + themed single-line motif."""
-    theme = CAT_THEME.get(cat)
-    if theme is None:
-        return f"| **{cat}** | | | |"
-    hexcolor, motif = theme
-    name = _color(cat, hexcolor, web, bold=True)
-    motif_cell = _color(motif, hexcolor, web, bold=False)
-    return f"| {name} | {motif_cell} | | |"
-
-
-def render(threads: list[dict], needs_you: bool = False,
-           web: bool = False) -> tuple[str, int]:
-    """Render header + 4-column table. Returns (text, rendered_row_count)."""
-    shown = [t for t in threads if (not needs_you or t["emoji"] == "🔴")]
-
-    # header counts
-    n_needs = sum(1 for t in shown if t["emoji"] == "🔴")
-    n_active = sum(1 for t in shown if t["emoji"] == "👉")
-    n_close = sum(1 for t in shown if t["emoji"] == "✅")
-    header_bits = ["🧵 OPEN THREADS"]
-    if n_needs:
-        header_bits.append(f"🔴 {n_needs} need you")
-    if n_active:
-        header_bits.append(f"👉 {n_active} active")
-    if n_close:
-        header_bits.append(f"✅ {n_close} close?")
-    header = " · ".join(header_bits)
-
-    # group, then state-sort within each category (stable on source order)
+def _group(shown: list[dict]) -> list[tuple[str, list[dict]]]:
+    """Group by category + state-sort within each (stable on source order)."""
     by_cat: dict[str, list[dict]] = {}
     for t in shown:
         by_cat.setdefault(t["cat"], []).append(t)
     for items in by_cat.values():
         items.sort(key=lambda t: (STATE_ORDER.get(t["emoji"], 99), t["idx"]))
+    ordered = [c for c in CAT_ORDER if c in by_cat]
+    ordered += [c for c in by_cat if c not in CAT_ORDER]
+    return [(c, by_cat[c]) for c in ordered if by_cat[c]]
+
+
+def _header_line(shown: list[dict]) -> str:
+    n_needs = sum(1 for t in shown if t["emoji"] == "🔴")
+    n_active = sum(1 for t in shown if t["emoji"] == "👉")
+    n_close = sum(1 for t in shown if t["emoji"] == "✅")
+    bits = ["🧵 OPEN THREADS"]
+    if n_needs:
+        bits.append(f"🔴 {n_needs} need you")
+    if n_active:
+        bits.append(f"👉 {n_active} active")
+    if n_close:
+        bits.append(f"✅ {n_close} close?")
+    return " · ".join(bits)
+
+
+def _cat_header_row(cat: str, mode: str) -> str:
+    """Render a category header row: coloured name + themed single-line motif."""
+    theme = CAT_THEME.get(cat)
+    if theme is None:
+        return f"| **{cat}** | | | |"
+    hexcolor, glyph, label = theme
+    _dash = "─" * 11
+    motif = f"{glyph} {_dash} {label} {_dash}"
+    name = _color(cat, hexcolor, mode, bold=True)
+    motif_cell = _color(motif, hexcolor, mode, bold=False)
+    return f"| {name} | {motif_cell} | | |"
+
+
+def render(shown: list[dict], mode: str = "latex") -> tuple[str, int]:
+    """Render header + 4-column markdown table. Returns (text, rendered_row_count).
+
+    `shown` is the already-filtered list to display. The markdown shape is
+    byte-stable with the original latex/web output.
+    """
+    header = _header_line(shown)
 
     lines = [
         header, "",
@@ -279,17 +335,12 @@ def render(threads: list[dict], needs_you: bool = False,
         "| --- | --- | --- | --- |",
     ]
     rows = 0
-    ordered = [c for c in CAT_ORDER if c in by_cat]
-    ordered += [c for c in by_cat if c not in CAT_ORDER]
-    for c in ordered:
-        items = by_cat[c]
-        if not items:
-            continue
-        lines.append(_cat_header_row(c, web))
+    for c, items in _group(shown):
+        lines.append(_cat_header_row(c, mode))
         for t in items:
             lines.append(
                 f"| `{t['id']}` | {_thread_cell(t)} | "
-                f"{_action_cell(t, web)} | {_status_cell(t)} |"
+                f"{_action_cell(t, mode)} | {_status_cell(t)} |"
             )
             rows += 1
 
@@ -297,10 +348,166 @@ def render(threads: list[dict], needs_you: bool = False,
     close_ids = [t["id"] for t in shown if t["emoji"] == "✅"]
     if close_ids:
         joined = " ".join(f"`{i}`" for i in close_ids)
-        who_str = _color("Yash", WHO_COLOR["Yash"], web, bold=True)
+        who_str = _color("Yash", WHO_COLOR["Yash"], mode, bold=True)
         lines.append(f"| ✅ | close?: {joined} | confirm close · {who_str} | ✅ |")
 
     return "\n".join(lines), rows
+
+
+# ── ANSI pretty render (for --ansi / --live terminal panes) ──────────────
+# A clean aligned layout (no markdown pipes): coloured category banner, then
+# one line per thread with id (gold), status emoji, name, action · who.
+
+_WHO_NAME = {"Yash": "Yash", "Julian/ext": "Julian", "Director": "Director"}
+
+
+def _pad(text: str, width: int) -> str:
+    """Left-pad to `width` using display-width approximation (ascii count)."""
+    n = len(text)
+    return text + " " * max(0, width - n)
+
+
+def _ansi_cat_banner(cat: str) -> str:
+    theme = CAT_THEME.get(cat)
+    if theme is None:
+        return f"  {_ANSI_BOLD}{cat}{_ANSI_RESET}"
+    hexcolor, glyph, label = theme
+    r, g, b = _hex_rgb(hexcolor)
+    bar = "─" * 44
+    return (f"\033[38;2;{r};{g};{b}m  {glyph} {_ANSI_BOLD}{cat}{_ANSI_RESET}"
+            f"\033[38;2;{r};{g};{b}m  {bar} {label}{_ANSI_RESET}")
+
+
+def _ansi_row(t: dict) -> str:
+    tid = _color(_pad(t["id"], 5), "#F2B705", "ansi", bold=True)
+    emo = t["emoji"] or " "
+    name = _truncate(t["name"], 46)
+    who = _who(t)
+    who_str = _color(_WHO_NAME.get(who, who), WHO_COLOR.get(who, "#BDB8AC"), "ansi")
+    action = _ANSI_DIM + _truncate(_action(t), 30) + _ANSI_RESET
+    return f"   {tid} {emo}  {_pad(name, 46)} {action} · {who_str}"
+
+
+def render_ansi(shown: list[dict]) -> str:
+    lines = [_color(_ANSI_BOLD + _header_line(shown) + _ANSI_RESET, "#ECE7DA", "ansi")]
+    lines.append("")
+    for c, items in _group(shown):
+        lines.append(_ansi_cat_banner(c))
+        for t in items:
+            lines.append(_ansi_row(t))
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ── filters ─────────────────────────────────────────────────────────────
+
+# Map of --category shorthand flags to canonical category names.
+_CAT_FLAGS = {
+    "heydaddy": "HEYDADDY",
+    "mirror": "MIRROR",
+    "ops": "OPS",
+    "julian": "JULIAN",
+    "firststone": "FIRSTSTONE",
+    "off_work": "OFF-WORK",
+    "offwork": "OFF-WORK",
+}
+
+# Map of status-preset flags to the emoji they select.
+_STATUS_PRESETS = {
+    "needs_you": "🔴",
+    "active": "👉",
+    "waiting": "⏳",
+    "nearly": "🟢",
+    "close": "✅",
+}
+
+
+def apply_filters(threads: list[dict], args) -> tuple[list[dict], bool]:
+    """Return (filtered_list, is_filtered). No filter args -> (threads, False)."""
+    cats: set[str] = set()
+    for flag, name in _CAT_FLAGS.items():
+        if getattr(args, flag, False):
+            cats.add(name)
+    if args.category:
+        cats.update(c.strip().upper() for c in args.category)
+
+    statuses: set[str] = set()
+    for flag, emo in _STATUS_PRESETS.items():
+        if getattr(args, flag, False):
+            statuses.add(emo)
+    if args.status:
+        statuses.update(s.strip() for s in args.status)
+
+    want_ids: set[str] = set()
+    if args.id:
+        want_ids.update(i.strip() for i in args.id)
+
+    is_filtered = bool(cats or statuses or want_ids)
+    if not is_filtered:
+        return threads, False
+
+    out = threads
+    if cats:
+        out = [t for t in out if t["cat"] in cats]
+    if statuses:
+        out = [t for t in out if t["emoji"] in statuses]
+    if want_ids:
+        out = [t for t in out if any(p in want_ids for p in t["id"].split("/"))]
+    return out, True
+
+
+# ── live mode (mtime poll, clear + redraw) ──────────────────────────────
+
+def _load_render(path: str, args, mode: str) -> tuple[str, int, int]:
+    """Parse + filter + render. Returns (output, shown_n, total_n)."""
+    text = open(path, encoding="utf-8").read()
+    block = extract_block(text)
+    threads, _ = parse(block)
+    shown, _ = apply_filters(threads, args)
+    if mode == "ansi":
+        out = render_ansi(shown)
+    else:
+        out, _ = render(shown, mode)
+    return out, len(shown), len(threads)
+
+
+def run_live(path: str, args, mode: str, interval: float) -> int:
+    """Poll the file mtime; clear + re-render on change. Ctrl-C to exit."""
+    sys.stdout.write(_HIDE)
+    last_mtime: float | None = None
+    try:
+        while True:
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                sys.stdout.write(_CLEAR)
+                sys.stdout.write(f"nhq-threads: source vanished: {path}\n")
+                sys.stdout.flush()
+                time.sleep(interval)
+                continue
+            if mtime != last_mtime:
+                try:
+                    out, shown_n, total_n = _load_render(path, args, mode)
+                except Exception as e:  # render never crashes the pane
+                    out = f"nhq-threads: render error: {e}"
+                    shown_n = total_n = 0
+                stamp = time.strftime("%H:%M:%S")
+                filt = " · filtered" if (apply_filters([], args))[1] else ""
+                footer = (f"\n\n{_ANSI_DIM}  ⏵ live · {stamp} · "
+                          f"{shown_n}/{total_n} shown{filt} · Ctrl-C to exit"
+                          f"{_ANSI_RESET}")
+                sys.stdout.write(_CLEAR)
+                sys.stdout.write(out + footer + "\n")
+                sys.stdout.flush()
+                last_mtime = mtime
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write(_CLEAR + _SHOW)
+        sys.stdout.write("nhq-threads: live view stopped.\n")
+        sys.stdout.flush()
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -314,9 +521,46 @@ def main(argv: list[str] | None = None) -> int:
                     help="run self-test + print parse stats to stderr")
     ap.add_argument("--web", action="store_true",
                     help="web-safe output (bold + emoji chips, no LaTeX colour)")
+    ap.add_argument("--ansi", action="store_true",
+                    help="truecolor ANSI output (real terminal pane)")
+    ap.add_argument("--live", action="store_true",
+                    help="live view: clear + redraw on file change (Ctrl-C exits)")
+    ap.add_argument("--interval", type=float, default=1.0,
+                    help="live poll interval seconds (default 1.0)")
+    # category filters
+    for flag in _CAT_FLAGS:
+        ap.add_argument(f"--{flag.replace('_', '-')}", action="store_true",
+                        help=f"only {flag.replace('_', ' ')} threads")
+    ap.add_argument("--category", action="append", metavar="NAME",
+                    help="only this category (repeatable)")
+    # status filters
+    for flag in _STATUS_PRESETS:
+        if flag == "needs_you":
+            continue  # already --needs-you above
+        ap.add_argument(f"--{flag.replace('_', '-')}", action="store_true",
+                        help=f"only {flag.replace('_', ' ')} threads")
+    ap.add_argument("--status", action="append", metavar="EMOJI",
+                    help="only this status emoji (repeatable)")
+    ap.add_argument("--id", action="append", metavar="LETTER",
+                    help="only this thread id (repeatable; matches tr/vr pairs)")
     args = ap.parse_args(argv)
 
+    # render mode: --live forces ansi; else --ansi; else --web; else latex.
+    if args.live:
+        mode = "ansi"
+    elif args.ansi:
+        mode = "ansi"
+    elif args.web:
+        mode = "web"
+    else:
+        mode = "latex"
+
     path = os.path.expanduser(args.file)
+
+    # Live mode short-circuits the one-shot path (no self-test chatter).
+    if args.live:
+        return run_live(path, args, mode, max(0.1, args.interval))
+
     try:
         text = open(path, encoding="utf-8").read()
     except OSError as e:
@@ -325,18 +569,24 @@ def main(argv: list[str] | None = None) -> int:
 
     block = extract_block(text)
     threads, source_count = parse(block)
-    table, rows = render(threads, needs_you=args.needs_you, web=args.web)
+    shown, is_filtered = apply_filters(threads, args)
+
+    if mode == "ansi":
+        table = render_ansi(shown)
+        rows = len(shown)
+    else:
+        table, rows = render(shown, mode)
 
     print(table)
 
-    # Completeness self-test (the whole point). When filtering with
-    # --needs-you the rendered rows are a deliberate subset, so the strict
-    # equality test only applies to the full parse.
+    # Completeness self-test (the whole point). Strict equality applies only to
+    # the full parse; any filter is a deliberate subset so we fall back to the
+    # parsed-count invariant (parse must catch every thread-start line).
     parsed_n = len(threads)
     print(f"nhq-threads: parsed {parsed_n} open threads "
           f"({source_count} thread-start lines in source)", file=sys.stderr)
 
-    full_rows = rows if not args.needs_you else parsed_n
+    full_rows = parsed_n if is_filtered else rows
     if full_rows != source_count:
         rendered_ids = {t["id"] for t in threads}
         # recover the raw ids from source for the diff
@@ -352,8 +602,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.verify:
-        print(f"nhq-threads: self-test OK — {rows} rendered rows == "
-              f"{source_count} source thread lines (no drops)", file=sys.stderr)
+        note = " (filtered view)" if is_filtered else ""
+        print(f"nhq-threads: self-test OK — parse integrity holds{note} "
+              f"({source_count} source thread lines, no drops)", file=sys.stderr)
     return 0
 
 
