@@ -1,0 +1,18 @@
+# nhq-omp-claude overlay — main seat = Anthropic Opus (quality-first), workers = cheap agy pool.
+# Loaded via `omp --config <this-file>` (per-key merge over ~/.omp/agent/config.yml).
+# Seat: anthropic/claude-opus-4-8. Strong-code worker (task/designer): agy/claude-sonnet-4-6.
+# Plan/slow reasoning: agy/claude-opus-4-6-thinking. Cheap roles: agy/gemini-3.5-flash-medium.
+# web search: codex (off the Anthropic API account so the seat keeps full quota).
+modelRoles:
+  default: anthropic/claude-opus-4-8:high
+  vision: anthropic/claude-opus-4-8:medium
+  plan: agy/claude-opus-4-6-thinking
+  slow: agy/claude-opus-4-6-thinking
+  task: agy/claude-sonnet-4-6
+  designer: agy/claude-sonnet-4-6
+  advisor: agy/gemini-3.5-flash-medium
+  smol: agy/gemini-3.5-flash-medium
+  commit: agy/gemini-3.5-flash-medium
+  title: agy/gemini-3.5-flash-medium
+providers:
+  webSearch: codex
