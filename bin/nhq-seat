@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# nhq-seat — read omp usage and recommend the main seat (Anthropic vs Codex).
+#
+# Quality-first manual swap (Approach B): if the current top seat's 5h OR weekly
+# is >= THRESHOLD%, recommend swapping to the other top seat. No daemon; advice only.
+#
+# Usage: nhq-seat
+set -euo pipefail
+THRESHOLD="${NHQ_SEAT_THRESHOLD:-70}"
+U="$(omp usage 2>/dev/null)"
+
+# Highest % seen in a provider's account block (5h or weekly, whichever is larger).
+CL="$(printf '%s\n' "$U" | awk '/Anthropic — 1 account/{f=1; next} /^[A-Za-z].* —|^Openai|^Zai|^Google/{f=0} f&&/% used/{print}' \
+  | grep -oE '[0-9]+(\.[0-9]+)?% used' | grep -oE '^[0-9]+' | sort -rn | head -1)"
+CX="$(printf '%s\n' "$U" | awk '/Openai Codex/{f=1; next} /^[A-Za-z].* —|^Zai|^Google|^Anthropic/{f=0} f&&/% used/{print}' \
+  | grep -oE '[0-9]+(\.[0-9]+)?% used' | grep -oE '^[0-9]+' | sort -rn | head -1)"
+CL="${CL:-0}"; CX="${CX:-0}"
+
+echo "main-seat usage (max of 5h/weekly):"
+echo "  Anthropic (nhq-omp-claude): ${CL}%"
+echo "  Codex     (nhq-omp-codex):  ${CX}%"
+echo "threshold: ${THRESHOLD}%"
+if   (( CL < THRESHOLD )); then echo "REC: STAY on Anthropic (nhq-omp-claude)"
+elif (( CX < THRESHOLD )); then echo "REC: SWAP to Codex (nhq-omp-codex) — Anthropic >= ${THRESHOLD}%"
+else echo "REC: both seats >= ${THRESHOLD}% — pick the lower, or pause heavy work"; fi
