@@ -1,0 +1,23 @@
+# nhq-omp-fleet overlay — for FLEET AGENTS (workers), not the Director seat.
+# Loaded by nhq-spawn via `omp --config <this-file>`. Fleet agents are workers,
+# so the MAIN model is the strong-but-cheap worker model (agy-Claude), NOT the
+# premium Anthropic-direct seat reserved for the Director chat. Everything routes
+# off the cheap agy pool / Codex; ZERO Anthropic-direct burn for fleet work.
+#
+# Strong-code main = agy/claude-sonnet-4-6 (falls back to Codex if agy-Claude down:
+#   swap default/task/designer to openai-codex/gpt-5.5).
+# Heavy reasoning = agy/claude-opus-4-6-thinking. Cheap roles = agy/gemini-3.5-flash-medium.
+# web search = codex.
+modelRoles:
+  default: agy/claude-sonnet-4-6
+  vision: agy/gemini-3.5-flash-medium
+  plan: agy/claude-opus-4-6-thinking
+  slow: agy/claude-opus-4-6-thinking
+  task: agy/claude-sonnet-4-6
+  designer: agy/claude-sonnet-4-6
+  advisor: agy/gemini-3.5-flash-medium
+  smol: agy/gemini-3.5-flash-medium
+  commit: agy/gemini-3.5-flash-medium
+  title: agy/gemini-3.5-flash-medium
+providers:
+  webSearch: codex

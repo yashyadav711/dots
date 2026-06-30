@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # nhq-spawn <agent> "<task>" — spawn an autonomous, talkable NHQ fleet agent.
 #
-# Launches an INTERACTIVE `claude --dangerously-skip-permissions` inside a tmux
+# Launches an INTERACTIVE `omp --config <seat-overlay> --approval-mode yolo` inside a tmux
 # session living in the agent's repo dir, then sends the task plus the standard
 # FLEET PROTOCOL footer. The agent stays talkable (nhq-tell) and reports back to
 # Director when finished (nhq-done — baked into the footer).
 #
-# Rides Yash's existing Claude subscription via the `claude` CLI. NO API key.
+# Rides Yash's model stack via omp (unified env: main seat + cheap agy workers). NO API key.
 #
-# v2: sessions are PERSISTENT + REUSABLE. A spawned session keeps claude running
+# v2: sessions are PERSISTENT + REUSABLE. A spawned session keeps omp running
 # idle-at-prompt after a task (talkable via nhq-tell), and nhq-spawn REUSES a live
 # fleet-<agent> session instead of spawning a duplicate. It also prints the exact
 # `nhq-await` line Director runs to get a real completion notification.
@@ -64,11 +64,15 @@ write_spawn_meta() {
     >/dev/null 2>&1 || echo "nhq-spawn: warning — could not write .meta for $1" >&2
 }
 
-CLAUDE_BIN="$HOME/.local/bin/claude"
-if [[ ! -x "$CLAUDE_BIN" ]]; then
-  echo "nhq-spawn: claude CLI not found at $CLAUDE_BIN" >&2
+OMP_BIN="$(command -v omp || echo "$HOME/.local/bin/omp")"
+if [[ ! -x "$OMP_BIN" ]]; then
+  echo "nhq-spawn: omp CLI not found ($OMP_BIN)" >&2
   exit 1
 fi
+# Unified env: fleet AGENTS are workers — they run on omp with the FLEET overlay
+# (strong-but-cheap agy-Claude main, agy-Gemini cheap roles), NEVER the premium
+# Anthropic-direct seat reserved for the Director chat. Zero Anthropic-direct burn.
+SEAT_OVERLAY="$HOME/Github/dots/bin/nhq-omp-fleet-config.yml"
 
 # Standard FLEET PROTOCOL footer (agent name baked in for the callback)
 FOOTER="--- FLEET PROTOCOL: You are an autonomous NHQ fleet agent. BRANCHES ONLY — no push, no merge, no deploy unless Yash explicitly says so. Surgical changes; flag Protocol-3 (auth/payments/PII/security), don't silently commit it. Keep a live progress file in this repo's ai/ dir. WHEN YOU FINISH (or are blocked), you MUST run: nhq-done ${AGENT} \"<one-paragraph result: what you did / blocked-on / branch>\" — this reports back to Director. If you hit a human gate you cannot pass autonomously (a decision, credential, or approval only Yash can give), run nhq-blocked ${AGENT} \"<what you need to be unblocked>\" instead of stalling. Do not end silently."
@@ -76,8 +80,8 @@ FOOTER="--- FLEET PROTOCOL: You are an autonomous NHQ fleet agent. BRANCHES ONLY
 MESSAGE="${TASK} ${FOOTER}"
 
 # ── REUSE (v2): if a live fleet-<agent> session already exists, send the new task
-# into it instead of spawning a duplicate claude (RAM-aware; one agent, one claude).
-# Prefer an IDLE session (claude at its prompt) over a RUNNING one. DEAD sessions
+# into it instead of spawning a duplicate omp (RAM-aware; one agent, one omp).
+# Prefer an IDLE session (omp at its prompt) over a RUNNING one. DEAD sessions
 # (dropped to fish) are skipped — we spawn fresh below.
 REUSE=""
 while IFS= read -r s; do
@@ -137,17 +141,19 @@ write_spawn_meta "$SESSION"
 # this gathers admission data to tune thresholds before any enforce-flip.
 "$(dirname "$SELF")/nhq-sched" admit "$AGENT" >/dev/null 2>&1 || true
 
-# Launch interactive claude in a detached tmux session, in the repo dir. The
-# trailing `exec fish` is a safety net: if claude ever exits/crashes, the tmux
+# Launch interactive omp in a detached tmux session, in the repo dir. The
+# trailing `exec fish` is a safety net: if omp ever exits/crashes, the tmux
 # session survives (inspectable, shows DEAD) instead of vanishing. Interactive
-# claude itself stays alive idle-at-prompt after a task — that's the talkable
+# omp itself stays alive idle-at-prompt after a task — that's the talkable
 # persistence; this just keeps the pane from disappearing on an unexpected exit.
+# Unified env: omp + the cheap-worker overlay (--config) + auto thinking + yolo
+# approvals (the fleet equivalent of the old --dangerously-skip-permissions).
 # tmux -e exports NHQ_AGENT into the session env (tmux ≥3.2) so the agent — and any
 # nhq-* callback it runs — knows its own canonical name without re-deriving it.
 tmux new-session -d -s "$SESSION" -e "NHQ_AGENT=$NAME" -c "$REPO" \
-  "$CLAUDE_BIN --dangerously-skip-permissions; exec fish"
+  "$OMP_BIN --config '$SEAT_OVERLAY' --approval-mode yolo; exec fish"
 
-# Wait for claude (node) to boot before sending the task. Poll the pane's
+# Wait for omp (node/bun) to boot before sending the task. Poll the pane's
 # current command until it's no longer a bare shell, capped at ~30s.
 booted=0
 for _ in $(seq 1 60); do
@@ -161,7 +167,7 @@ done
 sleep 3
 
 if [[ "$booted" -eq 0 ]]; then
-  echo "nhq-spawn: warning — claude pane didn't look booted; sending task anyway." >&2
+  echo "nhq-spawn: warning — omp pane didn't look booted; sending task anyway." >&2
 fi
 
 # Send the task as a single literal line, then Enter (0.3s apart so the TUI
@@ -172,7 +178,7 @@ tmux send-keys -t "$SESSION" Enter
 
 # CONFIRM-SUBMIT: on a RAM-loaded boot the TUI can be slow to wire up its input
 # widget, so the first Enter sometimes lands as a no-op (the task sits typed-but-
-# unsubmitted). Use the reliable v2 state detector: if claude doesn't go RUNNING
+# unsubmitted). Use the reliable v2 state detector: if omp doesn't go RUNNING
 # shortly, the message is still in the box — re-press Enter until it submits.
 for _ in 1 2 3 4 5 6; do
   sleep 2
