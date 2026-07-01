@@ -51,6 +51,7 @@ DEFAULT_FILE = os.path.expanduser("~/Github/nhq-agentic-os/ai/open-threads.md")
 # for the summary counts in the header line (None = not summarised there).
 STATUS = {
     "🔴": ("needs you",    "needs"),
+    "🆕": ("new",          None),
     "👉": ("active",       "active"),
     "🟡": ("in-progress",  None),
     "⏳": ("waiting",      None),
@@ -99,8 +100,8 @@ CAT_THEME = {
 
 # State-sort order within a category (🔴 first ... ✅/close-ready last).
 STATE_ORDER = {
-    "🔴": 0, "👉": 1, "🟡": 2, "⏳": 3, "🟢": 4,
-    "🅿️": 5, "🕒": 6, "🔵": 7, "❓": 8, "✅": 9,
+    "🔴": 0, "🆕": 1, "👉": 2, "🟡": 3, "⏳": 4, "🟢": 5,
+    "🅿️": 6, "🕒": 7, "🔵": 8, "❓": 9, "✅": 10,
 }
 
 # An optional `▶ next: <phrase>` action field inside a thread block.
@@ -378,14 +379,36 @@ def _ansi_cat_banner(cat: str) -> str:
             f"\033[38;2;{r};{g};{b}m  {bar} {label}{_ANSI_RESET}")
 
 
-def _ansi_row(t: dict) -> str:
+def _ansi_row(t: dict, grouped: bool = False) -> str:
     tid = _color(_pad(t["id"], 5), "#F2B705", "ansi", bold=True)
-    emo = t["emoji"] or " "
     name = _truncate(t["name"], 46)
     who = _who(t)
     who_str = _color(_WHO_NAME.get(who, who), WHO_COLOR.get(who, "#BDB8AC"), "ansi")
     action = _ANSI_DIM + _truncate(_action(t), 30) + _ANSI_RESET
+    if grouped:
+        # emoji lives in the status sub-header; drop it here → shorter row, deeper indent.
+        return f"     {tid} {_pad(name, 46)} {action} · {who_str}"
+    emo = t["emoji"] or " "
     return f"   {tid} {emo}  {_pad(name, 46)} {action} · {who_str}"
+
+
+def _status_subgroups(items: list[dict]) -> list[tuple[str, str, list[dict]]]:
+    """Split an already-state-sorted category into (emoji, label, rows) buckets,
+    preserving the STATE_ORDER the list is sorted in (consecutive same-emoji runs)."""
+    out: list[tuple[str, str, list[dict]]] = []
+    for t in items:
+        emo = t["emoji"] or "❓"
+        if out and out[-1][0] == emo:
+            out[-1][2].append(t)
+        else:
+            label = STATUS.get(emo, ("", None))[0] or "other"
+            out.append((emo, label, [t]))
+    return out
+
+
+def _ansi_status_subheader(emo: str, label: str, n: int) -> str:
+    """Compact dim status sub-header, e.g. `   👉 active (2)`. Kept short for tmux."""
+    return f"   {emo} {_ANSI_DIM}{label} ({n}){_ANSI_RESET}"
 
 
 def render_ansi(shown: list[dict]) -> str:
@@ -393,8 +416,10 @@ def render_ansi(shown: list[dict]) -> str:
     lines.append("")
     for c, items in _group(shown):
         lines.append(_ansi_cat_banner(c))
-        for t in items:
-            lines.append(_ansi_row(t))
+        for emo, label, group in _status_subgroups(items):
+            lines.append(_ansi_status_subheader(emo, label, len(group)))
+            for t in group:
+                lines.append(_ansi_row(t, grouped=True))
         lines.append("")
     return "\n".join(lines)
 
