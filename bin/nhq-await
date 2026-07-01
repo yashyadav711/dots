@@ -212,8 +212,39 @@ while :; do
 
   now=$(date +%s)
   if [[ $(( now - START )) -ge "$TIMEOUT" ]]; then
-    # Own timeout: NOT a failure — the agent is (almost certainly) still working.
-    # Exit 0 with STILL-RUNNING so Director re-arms instead of seeing a FAILED card.
+    # Own timeout: do a FINAL marker re-check before concluding STILL-RUNNING.
+    # An agent that finished right at the deadline will have dropped a marker AND
+    # exited tmux — reading those markers here prevents the false "STILL-RUNNING +
+    # DEAD" contradiction that occurs when we skip this check.
+    if marker_fresh "$BLOCKED_MARKER"; then
+      echo "── ${SESSION} BLOCKED — needs a human gate ──────────────────────"
+      cat "$BLOCKED_MARKER"
+      echo "─────────────────────────────────────────────────────────────────"
+      echo "NHQ-AWAIT-STATUS: BLOCKED"
+      exit 0
+    fi
+    if marker_fresh "$STALLED_MARKER"; then
+      echo "── ${SESSION} STALLED — no progress (warden) ────────────────────"
+      cat "$STALLED_MARKER"
+      echo "─────────────────────────────────────────────────────────────────"
+      echo "NHQ-AWAIT-STATUS: STALLED"
+      exit 0
+    fi
+    if marker_is_fresh; then
+      echo "── ${SESSION} reported ──────────────────────────────────────────"
+      cat "$MARKER"
+      echo "─────────────────────────────────────────────────────────────────"
+      echo "NHQ-AWAIT-STATUS: REPORTED"
+      echo "NHQ-AWAIT-STATUS: DONE"
+      exit 0
+    fi
+    # No fresh marker — check if the session is actually gone (agent died silently).
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+      echo "GONE — ${SESSION} no longer exists and left no report (detected at timeout)."
+      echo "NHQ-AWAIT-STATUS: GONE"
+      exit 3
+    fi
+    # Session is alive, no marker — this is the ONLY genuine still-running case.
     state="$(nhq_session_state "$SESSION")"
     echo "STILL-RUNNING — ${SESSION} has not reported within ${TIMEOUT}s (under the 10-min harness cap)."
     echo "  state: $(nhq_state_badge "$state")"
