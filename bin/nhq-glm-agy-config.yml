@@ -1,0 +1,34 @@
+# nhq-glm-agy overlay — balances z.ai GLM + agy (rotator: Claude + Gemini) so
+# the session is NOT GLM-only. Loaded via `omp --config <this-file>` (merges
+# per-key over the base ~/.omp/agent/config.yml modelRoles).
+#
+# Split (uses BOTH plans; burns ZERO Anthropic-direct quota):
+#   GLM (stable core)        → default (main seat) + vision
+#   agy/Claude (quality)     → plan + slow + task (subagents) + designer
+#   agy/Gemini (cheap/fast)  → advisor + smol + commit + title
+#   web search               → firecrawl (off the Claude API account)
+#
+# All agy routes verified live 2026-06-28:
+#   agy/claude-sonnet-4-6 + agy/claude-opus-4-6-thinking serve via the
+#   rotator's OpenAI /v1/chat/completions endpoint (the path omp's agy
+#   provider uses); agy/gemini-3.5-flash-medium serves (advisor already uses
+#   it in nhq-glm). agy = pi-antigravity-rotator @ localhost:51200,
+#   OpenAI-compatible, registered in ~/.omp/agent/models.yml.
+#
+# Volatility note: agy account health varies (was exhausted earlier today,
+# healthy now). The main seat stays on GLM so a mid-session agy hiccup
+# degrades only the specialized roles (plan/slow/task/designer + the cheap
+# roles) — not the seat — and task subagents respawn on failure.
+modelRoles:
+  default: zai/glm-5.2:high
+  vision: zai/glm-4.6v
+  plan: agy/claude-opus-4-6-thinking
+  slow: agy/claude-opus-4-6-thinking
+  task: anthropic/claude-opus-4-8        # native: agy-Claude weekly pool exhausts (503s); native weekly has headroom
+  designer: anthropic/claude-opus-4-8    # native (paired with task)
+  advisor: agy/gemini-3.5-flash-medium
+  smol: agy/gemini-3.5-flash-medium
+  commit: agy/gemini-3.5-flash-medium
+  title: agy/gemini-3.5-flash-medium
+providers:
+  webSearch: firecrawl

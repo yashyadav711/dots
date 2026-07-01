@@ -4,12 +4,15 @@
 # Plan/slow reasoning: agy/claude-opus-4-6-thinking. Cheap roles: agy/gemini-3.5-flash-medium.
 # web search: codex (off the Anthropic API account so the seat keeps full quota).
 modelRoles:
-  default: anthropic/claude-opus-4-8:high
+  default: anthropic/claude-opus-4-8:auto
   vision: anthropic/claude-opus-4-8:medium
-  plan: agy/claude-opus-4-6-thinking
-  slow: agy/claude-opus-4-6-thinking
-  task: agy/claude-sonnet-4-6
-  designer: agy/claude-sonnet-4-6
+  # 2026-07-01: agy-Claude weekly pool EXHAUSTED (100%, resets ~2d) → these routed there
+  # and 503'd every subagent. Native weekly is ~4% used (wide headroom) → point delegation
+  # roles at native until agy-Claude resets. Cheap roles stay on agy-Gemini (low-token).
+  plan: anthropic/claude-opus-4-8:high
+  slow: anthropic/claude-opus-4-8:high
+  task: anthropic/claude-opus-4-8
+  designer: anthropic/claude-opus-4-8
   advisor: agy/gemini-3.5-flash-medium
   smol: agy/gemini-3.5-flash-medium
   commit: agy/gemini-3.5-flash-medium
