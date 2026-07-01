@@ -535,6 +535,160 @@ def run_live(path: str, args, mode: str, interval: float) -> int:
     return 0
 
 
+# ── write path (--set / --done): edit a thread in place, integrity-checked ──
+# Fleet-shared: any agent can keep threads live without hand-editing the md.
+
+# Status name/alias -> emoji (accepts a raw emoji too).
+STATUS_ALIAS = {
+    "needs": "🔴", "needs-you": "🔴", "new": "🆕", "active": "👉",
+    "in-progress": "🟡", "wip": "🟡", "waiting": "⏳", "nearly": "🟢",
+    "near-done": "🟢", "done": "✅", "close": "✅", "close-ready": "✅",
+    "parked": "🅿️", "deferred": "🕒", "review": "🔵", "unclear": "❓",
+}
+# Captures (gutter+branch+id+gap)(body) so we can rewrite the status emoji only.
+_WRITE_THREAD_RE = re.compile(
+    r"^([\s│]*[├└]──\s+\[[^\]]+\](?:\s*/\s*\[[^\]]+\])*\s+)(.*)$"
+)
+
+
+def _block_bounds(lines: list[str]) -> tuple[int, int]:
+    """(start, end) line indices of the ```text fenced tree in the full file."""
+    start = end = -1
+    for i, line in enumerate(lines):
+        if start == -1:
+            if line.strip() == "```text":
+                start = i + 1
+            continue
+        if line.strip() == "```":
+            end = i
+            break
+    if start == -1 or end == -1:
+        raise SystemExit("nhq-threads: no ```text tree block found in source")
+    return start, end
+
+
+def _find_thread_idx(lines: list[str], tid: str, b0: int, b1: int) -> int | None:
+    for i in range(b0, b1):
+        m = _WRITE_THREAD_RE.match(lines[i])
+        if m and _clean_id(re.match(r"\s*[├└]──\s+(\[[^\]]+\](?:\s*/\s*\[[^\]]+\])*)", lines[i]).group(1)) == tid:
+            return i
+    return None
+
+
+def _thread_end_idx(lines: list[str], start: int, b1: int) -> int:
+    """End (exclusive) of the thread block: next thread-start / category / fence."""
+    for j in range(start + 1, b1):
+        if _WRITE_THREAD_RE.match(lines[j]):
+            return j
+        cm = CAT_RE.match(lines[j])
+        if cm and cm.group(2).strip() in CATEGORIES:
+            return j
+    return b1
+
+
+def _rewrite_status(lines: list[str], idx: int, emoji: str) -> None:
+    m = _WRITE_THREAD_RE.match(lines[idx])
+    prefix, body = m.group(1), m.group(2)
+    _, rest = _match_status(body)  # drop old emoji if present
+    lines[idx] = f"{prefix}{emoji} {rest}"
+
+
+def _rewrite_note(lines: list[str], start: int, end: int, note: str) -> bool:
+    for j in range(start, end):
+        k = lines[j].find("💬 last:")
+        if k != -1:
+            lines[j] = f"{lines[j][:k]}💬 last: {note}"
+            return True
+    return False
+
+
+def _current_note(lines: list[str], start: int, end: int) -> tuple[int, str] | None:
+    for j in range(start, end):
+        k = lines[j].find("💬 last:")
+        if k != -1:
+            return j, lines[j][k + len("💬 last:"):].strip()
+    return None
+
+
+def _rewrite_next(lines: list[str], start: int, end: int, nexttext: str) -> int:
+    for j in range(start, end):
+        k = lines[j].find("▶ next:")
+        if k != -1:
+            lines[j] = f"{lines[j][:k]}▶ next: {nexttext}"
+            return end
+    # insert a ▶ next line just before the 💬 last line, mirroring its gutter
+    for j in range(start, end):
+        k = lines[j].find("💬 last:")
+        if k != -1:
+            gutter = lines[j][:k].replace("└──", "├──", 1)
+            lines.insert(j, f"{gutter}▶ next: {nexttext}")
+            return end + 1
+    return end
+
+
+def do_write(path: str, tid: str, to_status=None, note=None,
+             next_=None, done=False) -> int:
+    """Apply an in-place edit to thread `tid`, integrity-checked + atomic."""
+    import datetime
+    try:
+        raw = open(path, encoding="utf-8").read()
+    except OSError as e:
+        print(f"nhq-threads: cannot read {path}: {e}", file=sys.stderr)
+        return 2
+    before, _ = parse(extract_block(raw))
+    if tid not in {t["id"] for t in before}:
+        ids = ", ".join(sorted(t["id"] for t in before))
+        print(f"nhq-threads: no thread '{tid}'. known ids: {ids}", file=sys.stderr)
+        return 2
+    lines = raw.split("\n")
+    b0, b1 = _block_bounds(lines)
+    idx = _find_thread_idx(lines, tid, b0, b1)
+    if idx is None:
+        print(f"nhq-threads: thread '{tid}' not locatable for write", file=sys.stderr)
+        return 2
+    end = _thread_end_idx(lines, idx, b1)
+    today = datetime.date.today().isoformat()
+    changed: list[str] = []
+
+    if done and to_status is None:
+        to_status = "done"
+    if to_status is not None:
+        emoji = STATUS_ALIAS.get(to_status.strip().lower(), to_status.strip())
+        _rewrite_status(lines, idx, emoji)
+        changed.append(f"status→{emoji}")
+    if note is not None:
+        stamped = f"{today} — {note}"
+        if _rewrite_note(lines, idx, end, stamped):
+            changed.append("note")
+    elif done:
+        cur = _current_note(lines, idx, end)
+        if cur is not None:
+            _rewrite_note(lines, idx, end, f"{today} ✅ done — {cur[1]}")
+            changed.append("note(done-stamp)")
+    if next_ is not None:
+        end = _rewrite_next(lines, idx, end, next_)
+        changed.append("next")
+
+    if not changed:
+        print("nhq-threads: nothing to set (use --to / --note / --next / --done)",
+              file=sys.stderr)
+        return 2
+
+    new_raw = "\n".join(lines)
+    # integrity gate: re-parse must yield the SAME thread set (no drops/dupes).
+    after, _ = parse(extract_block(new_raw))
+    if {t["id"] for t in after} != {t["id"] for t in before}:
+        print("nhq-threads: WRITE ABORTED — thread set changed post-edit "
+              "(file untouched)", file=sys.stderr)
+        return 1
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new_raw)
+    os.replace(tmp, path)
+    print(f"nhq-threads: {tid} updated ({', '.join(changed)})")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="nhq-threads",
@@ -568,7 +722,27 @@ def main(argv: list[str] | None = None) -> int:
                     help="only this status emoji (repeatable)")
     ap.add_argument("--id", action="append", metavar="LETTER",
                     help="only this thread id (repeatable; matches tr/vr pairs)")
+    # ── write path ──
+    ap.add_argument("--set", metavar="ID",
+                    help="edit thread ID in place (combine with --to/--note/--next)")
+    ap.add_argument("--done", metavar="ID",
+                    help="mark thread ID close-ready (✅) + stamp its 💬 last note")
+    ap.add_argument("--to", metavar="STATUS",
+                    help="new status for --set (name or emoji: new/active/wip/"
+                         "waiting/nearly/done/parked/deferred/review)")
+    ap.add_argument("--note", metavar="TEXT",
+                    help="replace the thread's 💬 last note (date-stamped)")
+    ap.add_argument("--next", dest="next_", metavar="TEXT",
+                    help="set the thread's ▶ next action (inserts if absent)")
     args = ap.parse_args(argv)
+
+    _wpath = os.path.expanduser(args.file)
+    if args.done:
+        return do_write(_wpath, args.done, to_status=args.to, note=args.note,
+                        next_=args.next_, done=True)
+    if args.set:
+        return do_write(_wpath, args.set, to_status=args.to, note=args.note,
+                        next_=args.next_, done=False)
 
     # render mode: --live forces ansi; else --ansi; else --web; else latex.
     if args.live:
