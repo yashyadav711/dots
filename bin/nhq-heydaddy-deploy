@@ -1,24 +1,31 @@
 #!/usr/bin/env bash
 # nhq-heydaddy-deploy — one dispatcher, four faces (symlinked):
-#   nhq-heydaddy-dev-fe-deploy    → dev  · heydaddy-web (frontend)
-#   nhq-heydaddy-dev-be-deploy    → dev  · heydaddy     (backend)
-#   nhq-heydaddy-prod-fe-deploy   → prod · heydaddy-web (frontend)
-#   nhq-heydaddy-prod-be-deploy   → prod · heydaddy     (backend)
+#   nhq-heydaddy-dev-fe-deploy    → dev  · heydaddy-web (frontend)  · from-source
+#   nhq-heydaddy-dev-be-deploy    → dev  · heydaddy     (backend)   · from-source
+#   nhq-heydaddy-prod-fe-deploy   → prod · heydaddy-web (frontend)  · from-source
+#   nhq-heydaddy-prod-be-deploy   → prod · heydaddy     (backend)   · TARBALL (deploy.sh)
 #
-# Deploys the LATEST COMMITTED tip of the service's GitHub-connected branch via
-# `railway redeploy --from-source` — it pulls the latest commit from the branch
-# Railway already tracks and redeploys it. It NEVER uploads local/uncommitted
-# state and NEVER changes the service source connection.
+# Two deploy methods, because the services aren't wired the same:
+#   • GitHub-CONNECTED services (dev-fe, dev-be, prod-fe) → `railway redeploy
+#     --from-source` pulls + redeploys the latest committed tip of the branch
+#     Railway tracks. No local upload, no source-connection change.
+#   • The PROD BACKEND (heydaddy) has NO GitHub source — it deploys via TARBALL
+#     upload of the working tree, using the repo's own scripts/deploy.sh (which
+#     polls to SUCCESS + health-checks api.heydaddy.app). So prod-be links to
+#     prod, runs deploy.sh server, then RESTORES your prior link.
+#     (Found the hard way 2026-07-01: a main push auto-deploys prod-fe but NOT
+#      prod-be, leaving prod half-shipped — this path closes that gap.)
 #
-# Flags:  --dry-run   print the railway command, don't run it
+# Flags:  --dry-run   print what it would run, don't run it
 #         -y|--yes    skip the prod typed-confirmation (for scripted use)
 #
-# Made by Director for Yash — 2026-06-30.
+# Made by Director for Yash — 2026-06-30 (prod-be tarball fix 2026-07-01).
 set -euo pipefail
 
 PROJECT_ID="0a52cb6e-d0da-49d2-b608-ea1fa6b4c68f"   # heydaddy
 FE_SERVICE="34c5d9e7-3054-46d9-81b7-e65ae2fe50be"    # heydaddy-web  (frontend)
 BE_SERVICE="d1d4d627-4cdf-4a26-bb36-12fe8a58f648"    # heydaddy      (backend)
+HEYDADDY_DIR="${HEYDADDY_DIR:-$HOME/Github/heydaddy}"
 
 self="$(basename "$0")"
 dry_run=0
@@ -31,12 +38,13 @@ for arg in "$@"; do
   esac
 done
 
-# ── Resolve env + service from the invoked name ──────────────────────────────
+# ── Resolve env + service + method from the invoked name ─────────────────────
+METHOD="from-source"
 case "$self" in
   *-dev-fe-*)  ENV_NAME="dev";        SERVICE_ID="$FE_SERVICE"; LABEL="DEV · frontend (heydaddy-web)" ;;
   *-dev-be-*)  ENV_NAME="dev";        SERVICE_ID="$BE_SERVICE"; LABEL="DEV · backend (heydaddy)" ;;
   *-prod-fe-*) ENV_NAME="production"; SERVICE_ID="$FE_SERVICE"; LABEL="PROD · frontend (heydaddy-web)" ;;
-  *-prod-be-*) ENV_NAME="production"; SERVICE_ID="$BE_SERVICE"; LABEL="PROD · backend (heydaddy)" ;;
+  *-prod-be-*) ENV_NAME="production"; SERVICE_ID="$BE_SERVICE"; LABEL="PROD · backend (heydaddy)"; METHOD="tarball" ;;
   *)
     echo "nhq-heydaddy-deploy: call me via one of the symlinks:" >&2
     echo "  nhq-heydaddy-{dev,prod}-{fe,be}-deploy" >&2
@@ -47,12 +55,17 @@ is_prod=0; [[ "$ENV_NAME" == "production" ]] && is_prod=1
 
 echo "──────────────────────────────────────────────"
 echo "  HeyDaddy deploy → $LABEL"
-echo "  method: railway redeploy --from-source (latest committed branch tip)"
+if [[ "$METHOD" == "tarball" ]]; then
+  echo "  method: TARBALL via scripts/deploy.sh (prod backend has no GitHub source)"
+else
+  echo "  method: railway redeploy --from-source (latest committed branch tip)"
+fi
 echo "──────────────────────────────────────────────"
 
 # ── PROD gate — typed confirmation (Protocol-3 posture; prod is never silent) ─
 if [[ "$is_prod" == 1 && "$assume_yes" == 0 && "$dry_run" == 0 ]]; then
-  echo "⚠️  PRODUCTION deploy. This ships the latest committed tip to LIVE users."
+  echo "⚠️  PRODUCTION deploy. This ships to LIVE users."
+  [[ "$METHOD" == "tarball" ]] && echo "    (uploads your CURRENT working tree in $HEYDADDY_DIR — commit/checkout first)"
   read -r -p "  Type DEPLOY PROD to continue: " confirm
   if [[ "$confirm" != "DEPLOY PROD" ]]; then
     echo "  aborted — not confirmed."
@@ -60,6 +73,45 @@ if [[ "$is_prod" == 1 && "$assume_yes" == 0 && "$dry_run" == 0 ]]; then
   fi
 fi
 
+# ── TARBALL path (prod backend) ──────────────────────────────────────────────
+if [[ "$METHOD" == "tarball" ]]; then
+  if [[ ! -d "$HEYDADDY_DIR" ]]; then
+    echo "ERROR: HEYDADDY_DIR not found: $HEYDADDY_DIR" >&2; exit 1
+  fi
+  if [[ ! -f "$HEYDADDY_DIR/scripts/deploy.sh" ]]; then
+    echo "ERROR: scripts/deploy.sh missing in $HEYDADDY_DIR" >&2; exit 1
+  fi
+
+  # Capture current link so we can restore it (deploy.sh deploys the LINKED env;
+  # we must link prod for the deploy, then put your link back where it was).
+  prior_env="$(railway status --json 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("environment",{}).get("name","dev"))' 2>/dev/null || echo dev)"
+  prior_svc="$(railway status --json 2>/dev/null | python3 -c 'import sys,json;print((json.load(sys.stdin).get("service") or {}).get("name","heydaddy-web"))' 2>/dev/null || echo heydaddy-web)"
+  echo "  (prior link: $prior_env / $prior_svc — will restore after)"
+
+  restore_link() {
+    railway link --project "$PROJECT_ID" --environment "$prior_env" --service "$prior_svc" >/dev/null 2>&1 \
+      && echo "  ↩ link restored → $prior_env / $prior_svc" \
+      || echo "  ⚠ could not restore link — run: railway link (env=$prior_env svc=$prior_svc)"
+  }
+
+  if [[ "$dry_run" == 1 ]]; then
+    echo "DRY RUN — would:"
+    echo "  1. railway link --project $PROJECT_ID --environment production --service heydaddy"
+    echo "  2. (cd $HEYDADDY_DIR && bash scripts/deploy.sh server --skip-local --migrations-ok)"
+    echo "  3. railway link back → $prior_env / $prior_svc"
+    exit 0
+  fi
+
+  trap restore_link EXIT
+  echo "  linking prod/heydaddy backend…"
+  railway link --project "$PROJECT_ID" --environment production --service heydaddy >/dev/null 2>&1
+  echo "  running deploy.sh server (polls to SUCCESS + health-checks prod)…"
+  ( cd "$HEYDADDY_DIR" && bash scripts/deploy.sh server --skip-local --migrations-ok )
+  # restore_link fires on EXIT
+  exit 0
+fi
+
+# ── FROM-SOURCE path (dev-fe, dev-be, prod-fe) ───────────────────────────────
 cmd=(railway redeploy --from-source
      --project "$PROJECT_ID"
      --environment "$ENV_NAME"
