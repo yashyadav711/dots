@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# nhq-heydaddy-deploy — one dispatcher, four faces (symlinked):
+#   nhq-heydaddy-dev-fe-deploy    → dev  · heydaddy-web (frontend)
+#   nhq-heydaddy-dev-be-deploy    → dev  · heydaddy     (backend)
+#   nhq-heydaddy-prod-fe-deploy   → prod · heydaddy-web (frontend)
+#   nhq-heydaddy-prod-be-deploy   → prod · heydaddy     (backend)
+#
+# Deploys the LATEST COMMITTED tip of the service's GitHub-connected branch via
+# `railway redeploy --from-source` — it pulls the latest commit from the branch
+# Railway already tracks and redeploys it. It NEVER uploads local/uncommitted
+# state and NEVER changes the service source connection.
+#
+# Flags:  --dry-run   print the railway command, don't run it
+#         -y|--yes    skip the prod typed-confirmation (for scripted use)
+#
+# Made by Director for Yash — 2026-06-30.
+set -euo pipefail
+
+PROJECT_ID="0a52cb6e-d0da-49d2-b608-ea1fa6b4c68f"   # heydaddy
+FE_SERVICE="34c5d9e7-3054-46d9-81b7-e65ae2fe50be"    # heydaddy-web  (frontend)
+BE_SERVICE="d1d4d627-4cdf-4a26-bb36-12fe8a58f648"    # heydaddy      (backend)
+
+self="$(basename "$0")"
+dry_run=0
+assume_yes=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) dry_run=1 ;;
+    -y|--yes)  assume_yes=1 ;;
+    *) echo "unknown flag: $arg" >&2; exit 2 ;;
+  esac
+done
+
+# ── Resolve env + service from the invoked name ──────────────────────────────
+case "$self" in
+  *-dev-fe-*)  ENV_NAME="dev";        SERVICE_ID="$FE_SERVICE"; LABEL="DEV · frontend (heydaddy-web)" ;;
+  *-dev-be-*)  ENV_NAME="dev";        SERVICE_ID="$BE_SERVICE"; LABEL="DEV · backend (heydaddy)" ;;
+  *-prod-fe-*) ENV_NAME="production"; SERVICE_ID="$FE_SERVICE"; LABEL="PROD · frontend (heydaddy-web)" ;;
+  *-prod-be-*) ENV_NAME="production"; SERVICE_ID="$BE_SERVICE"; LABEL="PROD · backend (heydaddy)" ;;
+  *)
+    echo "nhq-heydaddy-deploy: call me via one of the symlinks:" >&2
+    echo "  nhq-heydaddy-{dev,prod}-{fe,be}-deploy" >&2
+    exit 2 ;;
+esac
+
+is_prod=0; [[ "$ENV_NAME" == "production" ]] && is_prod=1
+
+echo "──────────────────────────────────────────────"
+echo "  HeyDaddy deploy → $LABEL"
+echo "  method: railway redeploy --from-source (latest committed branch tip)"
+echo "──────────────────────────────────────────────"
+
+# ── PROD gate — typed confirmation (Protocol-3 posture; prod is never silent) ─
+if [[ "$is_prod" == 1 && "$assume_yes" == 0 && "$dry_run" == 0 ]]; then
+  echo "⚠️  PRODUCTION deploy. This ships the latest committed tip to LIVE users."
+  read -r -p "  Type DEPLOY PROD to continue: " confirm
+  if [[ "$confirm" != "DEPLOY PROD" ]]; then
+    echo "  aborted — not confirmed."
+    exit 1
+  fi
+fi
+
+cmd=(railway redeploy --from-source
+     --project "$PROJECT_ID"
+     --environment "$ENV_NAME"
+     --service "$SERVICE_ID"
+     --yes)
+
+if [[ "$dry_run" == 1 ]]; then
+  echo "DRY RUN — would run:"
+  printf '  %q ' "${cmd[@]}"; echo
+  exit 0
+fi
+
+echo "deploying…"
+"${cmd[@]}"
+echo ""
+echo "✅ deploy triggered for $LABEL."
+echo "   watch: railway logs --project $PROJECT_ID --environment $ENV_NAME --service $SERVICE_ID"
