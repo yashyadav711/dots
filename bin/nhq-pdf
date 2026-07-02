@@ -244,22 +244,22 @@ html{ background:var(--ink); -webkit-print-color-adjust:exact; print-color-adjus
 body{
   background:var(--ink);
   font-family:"Inter","Open Sans","Noto Sans",-apple-system,"Segoe UI",Roboto,"Helvetica Neue","Noto Color Emoji",sans-serif;
-  color:var(--body); font-size:10.4pt; line-height:1.62; margin:0; padding:0 15mm;
+  color:var(--body); font-size:10.4pt; line-height:1.66; margin:0; padding:0 15mm;
   font-feature-settings:"kern" 1,"liga" 1;
   text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased;
 }
 h1,h2,h3,h4,h5,h6{ font-weight:700; line-height:1.24; letter-spacing:-0.006em; break-after:avoid; -webkit-column-break-after:avoid; }
 h1{ font-size:21pt; margin:.2em 0 .5em; color:var(--red-bright); letter-spacing:-0.02em; }
-h2{ font-size:15.5pt; margin:0 0 .6em; padding:11mm 0 .26em; color:var(--red-bright); letter-spacing:-0.02em;
+h2{ font-size:15.5pt; margin:0 0 .62em; padding:12mm 0 .28em; color:var(--red-bright); letter-spacing:-0.02em;
   border-width:0 0 2px; border-style:solid;
   border-image:linear-gradient(to right, var(--red) 0%, var(--gold) 55%, rgba(59,57,47,0) 100%) 1;
   break-before:page; page-break-before:always; }
 /* first section starts on the page right after the cover — no blank page */
 h2:first-of-type{ break-before:auto; page-break-before:auto; }
-h3{ font-size:12.5pt; margin:1.35em 0 .45em; color:var(--olive-bright); letter-spacing:-0.012em; }
-h4{ font-size:9.6pt; margin:1.1em 0 .35em; color:var(--brass); text-transform:uppercase; letter-spacing:.09em; }
+h3{ font-size:12.5pt; margin:2.1em 0 .4em; color:var(--olive-bright); letter-spacing:-0.012em; }
+h4{ font-size:9.6pt; margin:1.7em 0 .32em; color:var(--brass); text-transform:uppercase; letter-spacing:.09em; }
 h5,h6{ font-size:10pt; color:var(--stone); margin:.9em 0 .3em; }
-p{ margin:0 0 .7em; orphans:2; widows:2; }
+p{ margin:0 0 .95em; orphans:2; widows:2; }
 a{ color:var(--link); text-decoration:none; border-bottom:1px solid var(--link-soft); }
 strong{ font-weight:700; color:#FBF7EC; }
 em{ font-style:italic; color:var(--stone); }
@@ -268,7 +268,7 @@ mark{ background:var(--gold); color:var(--ink); padding:.02em .28em; border-radi
 hr{ border:0; height:1px; margin:1.8em auto; max-width:340px;
   background:linear-gradient(to right, rgba(59,57,47,0), var(--red) 30%, var(--gold) 70%, rgba(59,57,47,0)); }
 
-ul,ol{ margin:.2em 0 .8em; padding-left:1.35em; }
+ul,ol{ margin:.3em 0 1.1em; padding-left:1.35em; }
 li{ margin:.22em 0; }
 li::marker{ color:var(--red); }
 ul ul>li::marker{ color:var(--olive-bright); }
@@ -287,7 +287,7 @@ pre{ background:var(--carbon); border:1px solid var(--char); border-radius:8px;
   padding:.85em 1.05em; overflow:auto; margin:0 0 1em; break-inside:avoid; }
 pre code{ background:none; border:0; padding:0; color:var(--body-soft); font-size:.82em; line-height:1.5; }
 
-blockquote{ margin:.9em 0; padding:.66em 1.1em; background:var(--carbon);
+blockquote{ margin:1.25em 0; padding:.66em 1.1em; background:var(--carbon);
   border:1px solid var(--char); border-left:4px solid var(--red);
   border-radius:0 8px 8px 0; color:var(--stone); break-inside:avoid; }
 blockquote p{ margin:.28em 0; }
@@ -295,7 +295,7 @@ blockquote p:first-child{ margin-top:0; }
 blockquote p:last-child{ margin-bottom:0; }
 blockquote strong{ color:var(--bone); }
 
-table{ border-collapse:collapse; width:100%; margin:1em 0 1.25em; font-size:9.2pt; }
+table{ border-collapse:collapse; width:100%; margin:1.4em 0 1.7em; font-size:9.2pt; break-inside:avoid; }
 thead{ display:table-header-group; }
 th,td{ border:1px solid var(--char); padding:.42em .68em; text-align:left; vertical-align:top; }
 th{ background:var(--slate); font-weight:700; color:var(--gold); text-transform:uppercase;
@@ -306,7 +306,7 @@ tr{ break-inside:avoid; }
 tbody tr:nth-child(even){ background:var(--zebra); }
 
 img{ max-width:100%; height:auto; }
-figure{ margin:1.1em 0; text-align:center; break-inside:avoid; }
+figure{ margin:1.5em 0; text-align:center; break-inside:avoid; }
 figure.diagram img{ max-width:100%; max-height:8.3in; object-fit:contain;
   border:1px solid var(--char); border-radius:8px; padding:9px; background:#1a1c1f; }
 figcaption{ font-size:8.6pt; color:var(--ash); margin-top:.4em; }
