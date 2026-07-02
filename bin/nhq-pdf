@@ -163,7 +163,7 @@ def render_mermaid_blocks(text, tmp, mmdc, puppeteer_cfg):
         png = tmp / f"diagram-{rendered}.png"
         mmd.write_text(code, encoding="utf-8")
         log(f"   🎨 diagram {rendered}/{total} → rendering…")
-        cmd = mmdc + ["-i", str(mmd), "-o", str(png), "-s", "3", "-b", "white",
+        cmd = mmdc + ["-i", str(mmd), "-o", str(png), "-s", "3", "-b", "#1a1c1f",
                       "-p", str(puppeteer_cfg)]
         ok = False
         try:
@@ -291,7 +291,7 @@ tbody tr:nth-child(even){ background:var(--zebra); }
 img{ max-width:100%; height:auto; }
 figure{ margin:1.1em 0; text-align:center; break-inside:avoid; }
 figure.diagram img{ max-width:100%; max-height:8.3in; object-fit:contain;
-  border:1px solid var(--rule); border-radius:8px; padding:9px; background:#fff; }
+  border:1px solid var(--rule); border-radius:8px; padding:9px; background:#1a1c1f; }
 figcaption{ font-size:8.6pt; color:var(--muted); margin-top:.4em; }
 
 section.cover{ break-after:page; padding-top:2.3in; min-height:9.5in; }
