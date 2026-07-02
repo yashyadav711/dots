@@ -227,82 +227,99 @@ def build_cover(title, meta):
 
 CSS = r"""
 :root{
-  --ink:#20242c; --ink-soft:#3c424e; --muted:#8a8f99;
-  --accent:#b3122e; --accent-soft:#e7c9cf;
-  --rule:#e4e2dd; --rule-strong:#c9c6bf;
-  --code-bg:#f6f7f9; --code-ink:#b3122e;
-  --zebra:#faf9f7; --thead:#f1efeb;
-  --callout-bg:#f7f8fa; --callout-bar:#b3122e;
+  /* ── NHQ "Warline" palette — canonical hexes (mirrors design/nhq-palette.css) ── */
+  --ink:#14130F; --carbon:#1E1D17; --slate:#2A2820; --char:#3B392F;
+  --ash:#8C887E; --stone:#BDB8AC; --bone:#ECE7DA;
+  --red:#C8102E; --red-bright:#E22740; --ember:#8A0F1E;
+  --gold:#F2B705; --gold-bright:#FFC836; --brass:#C28A06;
+  --olive:#7C873E; --olive-bright:#98A451; --rust:#C75B39;
+  /* ── derived surfaces / roles ── */
+  --body:#ECE7DA; --body-soft:#D7D1C2;
+  --zebra:#1E1D17; --code-ink:#FFC836;
+  --link:#E22740; --link-soft:rgba(226,39,64,0.45);
 }
 *{box-sizing:border-box}
-html{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+html{ background:var(--ink); -webkit-print-color-adjust:exact; print-color-adjust:exact; }
 @page{ size:A4; }
 body{
+  background:var(--ink);
   font-family:"Inter","Open Sans","Noto Sans",-apple-system,"Segoe UI",Roboto,"Helvetica Neue","Noto Color Emoji",sans-serif;
-  color:var(--ink); font-size:10.4pt; line-height:1.62; margin:0;
+  color:var(--body); font-size:10.4pt; line-height:1.62; margin:0; padding:0 15mm;
   font-feature-settings:"kern" 1,"liga" 1;
-  text-rendering:optimizeLegibility;
+  text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased;
 }
-h1,h2,h3,h4,h5,h6{ font-weight:700; line-height:1.24; color:#12151b; letter-spacing:-0.006em; break-after:avoid; -webkit-column-break-after:avoid; }
-h1{ font-size:21pt; margin:.2em 0 .5em; }
-h2{ font-size:15.5pt; margin:1.55em 0 .55em; padding-bottom:.26em; border-bottom:2px solid var(--rule-strong); }
-h3{ font-size:12.5pt; margin:1.3em 0 .45em; color:#1c2029; }
-h4{ font-size:11pt; margin:1.05em 0 .35em; color:var(--ink-soft); }
-h5,h6{ font-size:10pt; color:var(--muted); margin:.9em 0 .3em; }
+h1,h2,h3,h4,h5,h6{ font-weight:700; line-height:1.24; letter-spacing:-0.006em; break-after:avoid; -webkit-column-break-after:avoid; }
+h1{ font-size:21pt; margin:.2em 0 .5em; color:var(--red-bright); letter-spacing:-0.02em; }
+h2{ font-size:15.5pt; margin:0 0 .6em; padding:11mm 0 .26em; color:var(--red-bright); letter-spacing:-0.02em;
+  border-width:0 0 2px; border-style:solid;
+  border-image:linear-gradient(to right, var(--red) 0%, var(--gold) 55%, rgba(59,57,47,0) 100%) 1;
+  break-before:page; page-break-before:always; }
+/* first section starts on the page right after the cover — no blank page */
+h2:first-of-type{ break-before:auto; page-break-before:auto; }
+h3{ font-size:12.5pt; margin:1.35em 0 .45em; color:var(--olive-bright); letter-spacing:-0.012em; }
+h4{ font-size:9.6pt; margin:1.1em 0 .35em; color:var(--brass); text-transform:uppercase; letter-spacing:.09em; }
+h5,h6{ font-size:10pt; color:var(--stone); margin:.9em 0 .3em; }
 p{ margin:0 0 .7em; orphans:2; widows:2; }
-a{ color:var(--accent); text-decoration:none; border-bottom:1px solid var(--accent-soft); }
-strong{ font-weight:700; color:#12151b; }
-em{ font-style:italic; }
-del{ color:var(--muted); }
-hr{ border:0; border-top:1px solid var(--rule); margin:1.6em 0; }
+a{ color:var(--link); text-decoration:none; border-bottom:1px solid var(--link-soft); }
+strong{ font-weight:700; color:#FBF7EC; }
+em{ font-style:italic; color:var(--stone); }
+del{ color:var(--ash); }
+mark{ background:var(--gold); color:var(--ink); padding:.02em .28em; border-radius:3px; }
+hr{ border:0; height:1px; margin:1.8em auto; max-width:340px;
+  background:linear-gradient(to right, rgba(59,57,47,0), var(--red) 30%, var(--gold) 70%, rgba(59,57,47,0)); }
 
 ul,ol{ margin:.2em 0 .8em; padding-left:1.35em; }
 li{ margin:.22em 0; }
-li::marker{ color:var(--accent); }
+li::marker{ color:var(--red); }
+ul ul>li::marker{ color:var(--olive-bright); }
+ul ul ul>li::marker{ color:var(--rust); }
 ul ul,ul ol,ol ul,ol ol{ margin:.15em 0; }
 li.task{ list-style:none; margin-left:-1.15em; }
 li.task .chk{ display:inline-flex; align-items:center; justify-content:center;
   width:.92em; height:.92em; margin-right:.45em; vertical-align:-0.12em;
-  border:1.5px solid var(--rule-strong); border-radius:3px; font-size:.72em; color:#fff; line-height:1; }
-li.task.done .chk{ background:var(--accent); border-color:var(--accent); }
+  border:1.5px solid var(--char); border-radius:3px; font-size:.72em; color:var(--ink); line-height:1; background:var(--carbon); }
+li.task.done .chk{ background:var(--olive); border-color:var(--olive); color:var(--ink); }
 
-code{ font-family:"Noto Sans Mono","JetBrains Mono","Caskaydia Cove Nerd Font Mono",ui-monospace,monospace;
-  font-size:.85em; background:var(--code-bg); color:var(--code-ink);
-  padding:.1em .36em; border-radius:4px; border:1px solid #ecedf0; }
-pre{ background:var(--code-bg); border:1px solid #e7e9ec; border-radius:8px;
+code{ font-family:"JetBrains Mono","Noto Sans Mono","Caskaydia Cove Nerd Font Mono",ui-monospace,monospace;
+  font-size:.85em; background:var(--carbon); color:var(--code-ink);
+  padding:.1em .36em; border-radius:4px; border:1px solid var(--char); }
+pre{ background:var(--carbon); border:1px solid var(--char); border-radius:8px;
   padding:.85em 1.05em; overflow:auto; margin:0 0 1em; break-inside:avoid; }
-pre code{ background:none; border:0; padding:0; color:#2b2f36; font-size:.82em; line-height:1.5; }
+pre code{ background:none; border:0; padding:0; color:var(--body-soft); font-size:.82em; line-height:1.5; }
 
-blockquote{ margin:.9em 0; padding:.62em 1.05em; background:var(--callout-bg);
-  border-left:4px solid var(--callout-bar); border-radius:0 8px 8px 0;
-  color:var(--ink-soft); break-inside:avoid; }
+blockquote{ margin:.9em 0; padding:.66em 1.1em; background:var(--carbon);
+  border:1px solid var(--char); border-left:4px solid var(--red);
+  border-radius:0 8px 8px 0; color:var(--stone); break-inside:avoid; }
 blockquote p{ margin:.28em 0; }
 blockquote p:first-child{ margin-top:0; }
 blockquote p:last-child{ margin-bottom:0; }
-blockquote strong{ color:#12151b; }
+blockquote strong{ color:var(--bone); }
 
 table{ border-collapse:collapse; width:100%; margin:1em 0 1.25em; font-size:9.2pt; }
 thead{ display:table-header-group; }
-th,td{ border:1px solid var(--rule); padding:.42em .68em; text-align:left; vertical-align:top; }
-th{ background:var(--thead); font-weight:700; color:#12151b; border-bottom:2px solid var(--rule-strong); }
+th,td{ border:1px solid var(--char); padding:.42em .68em; text-align:left; vertical-align:top; }
+th{ background:var(--slate); font-weight:700; color:var(--gold); text-transform:uppercase;
+  letter-spacing:.05em; font-size:.92em; border-bottom:2px solid var(--red); }
+td{ color:var(--body); }
+td strong{ color:var(--bone); }
 tr{ break-inside:avoid; }
 tbody tr:nth-child(even){ background:var(--zebra); }
 
 img{ max-width:100%; height:auto; }
 figure{ margin:1.1em 0; text-align:center; break-inside:avoid; }
 figure.diagram img{ max-width:100%; max-height:8.3in; object-fit:contain;
-  border:1px solid var(--rule); border-radius:8px; padding:9px; background:#1a1c1f; }
-figcaption{ font-size:8.6pt; color:var(--muted); margin-top:.4em; }
+  border:1px solid var(--char); border-radius:8px; padding:9px; background:#1a1c1f; }
+figcaption{ font-size:8.6pt; color:var(--ash); margin-top:.4em; }
 
 section.cover{ break-after:page; padding-top:2.3in; min-height:9.5in; }
-section.cover .kicker{ font-size:9pt; letter-spacing:.22em; text-transform:uppercase;
-  color:var(--accent); font-weight:700; margin-bottom:1.05em; }
+section.cover .kicker{ font-size:9pt; letter-spacing:.24em; text-transform:uppercase;
+  color:var(--gold); font-weight:700; margin-bottom:1.05em; }
 section.cover h1.title{ font-size:33pt; line-height:1.1; letter-spacing:-0.02em;
-  border:0; margin:0; color:#0e1116; }
-section.cover .rule{ width:82px; height:4px; background:var(--accent);
+  border:0; margin:0; color:var(--bone); font-weight:800; }
+section.cover .rule{ width:82px; height:4px; background:var(--red);
   margin:1.05em 0 1.25em; border-radius:2px; }
-section.cover .subtitle{ font-size:12.5pt; color:var(--ink-soft); line-height:1.5; max-width:84%; }
-section.cover .meta{ margin-top:2.5in; font-size:9.3pt; color:var(--muted); }
+section.cover .subtitle{ font-size:12.5pt; color:var(--stone); line-height:1.5; max-width:84%; }
+section.cover .meta{ margin-top:2.5in; font-size:9.3pt; color:var(--ash); }
 """
 
 HTML_TMPL = """<!doctype html>
@@ -313,11 +330,15 @@ HTML_TMPL = """<!doctype html>
 
 def build_printer(pdf_title):
     footer_left = _html.escape(pdf_title or "")[:70]
-    footer = ('<div style="width:100%;font-size:8px;color:#9aa0a6;'
-              'font-family:Inter,\'Open Sans\',sans-serif;padding:0 15mm;'
+    footer = ('<div style="width:100%;height:14mm;margin:0;background:#14130F;'
+              'box-sizing:border-box;padding:0 15mm;border-top:0.5px solid #3B392F;'
+              '-webkit-print-color-adjust:exact;print-color-adjust:exact;'
+              'font-size:7.5px;font-family:Inter,\'Open Sans\',sans-serif;'
               'display:flex;justify-content:space-between;align-items:center;">'
-              f'<span>{footer_left}</span>'
-              '<span><span class="pageNumber"></span> / <span class="totalPages"></span></span></div>')
+              f'<span style="text-transform:uppercase;letter-spacing:.12em;color:#BDB8AC;">{footer_left}</span>'
+              '<span style="color:#BDB8AC;"><span class="pageNumber" style="color:#F2B705;font-weight:700;"></span>'
+              ' / <span class="totalPages"></span></span></div>')
+    header = '<div></div>'
     return """
 const { chromium } = require('playwright');
 const [,, htmlPath, pdfPath] = process.argv;
@@ -328,14 +349,14 @@ const [,, htmlPath, pdfPath] = process.argv;
   await page.emulateMedia({ media:'print' });
   await page.pdf({
     path: pdfPath, format:'A4', printBackground:true, displayHeaderFooter:true,
-    margin:{ top:'15mm', bottom:'17mm', left:'15mm', right:'15mm' },
-    headerTemplate:'<div></div>',
+    margin:{ top:'0', bottom:'14mm', left:'0', right:'0' },
+    headerTemplate: %s,
     footerTemplate: %s,
   });
   await browser.close();
   console.log('ok');
 })().catch(e => { console.error(e); process.exit(1); });
-""" % json.dumps(footer)
+""" % (json.dumps(header), json.dumps(footer))
 
 # ---------------------------------------------------------------- print
 def print_pdf(html_path, pdf_path, pdf_title, tmp):
