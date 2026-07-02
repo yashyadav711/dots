@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""
+nhq-pdf — turn a vault markdown doc into a STUNNING, CORRECT PDF.
+
+Usage:
+    nhq-pdf "<input.md>" ["<output.pdf>"]
+
+Pipeline:
+  1. Read the md; drop YAML frontmatter + the `- [ ] **Read**` tracker line from the body.
+  2. Render EVERY ```mermaid block to a hi-res white-bg PNG via mermaid-cli (keeps the
+     block's own %%{init}%% theme line) and swap the fence for an <img> in a temp copy.
+  3. Convert temp md -> HTML (tables, task-lists, nested lists, blockquotes/callouts,
+     code, emoji) and print to PDF with a premium stylesheet via headless Chromium
+     (Playwright) — cover page from the H1, page numbers, page-break-safe tables/diagrams.
+  4. Clean up temp files.
+
+Generic + reusable: handles N mermaid blocks and any vault doc, not hardcoded to one file.
+"""
+import base64
+import html as _html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+from datetime import date
+from pathlib import Path
+
+# ---------------------------------------------------------------- ui helpers
+def log(msg):    print(msg, flush=True)
+def die(msg):    print(f"\033[31m✗ {msg}\033[0m", file=sys.stderr); sys.exit(1)
+
+# ---------------------------------------------------------------- tool resolution
+def find_mmdc():
+    """Return an argv prefix that runs mermaid-cli. Prefer a cached binary; else npx."""
+    direct = shutil.which("mmdc")
+    if direct:
+        return [direct]
+    cands = sorted(Path.home().glob(".npm/_npx/*/node_modules/.bin/mmdc"))
+    # prefer a v11+ build if we can tell
+    best = None
+    for c in cands:
+        if not c.exists():
+            continue
+        try:
+            v = subprocess.run([str(c), "--version"], capture_output=True, text=True, timeout=30)
+            ver = (v.stdout or "").strip()
+            if ver.startswith("11") or ver.startswith("1"):
+                return [str(c)]
+            best = best or c
+        except Exception:
+            best = best or c
+    if best:
+        return [str(best)]
+    return ["npx", "-y", "@mermaid-js/mermaid-cli"]
+
+def node_path():
+    """Where global node modules (playwright) live."""
+    try:
+        r = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True, timeout=20)
+        p = r.stdout.strip()
+        if p and Path(p, "playwright").exists():
+            return p
+    except Exception:
+        pass
+    for guess in ("~/.npm-global/lib/node_modules", "/usr/lib/node_modules",
+                  "/usr/local/lib/node_modules"):
+        g = Path(guess).expanduser()
+        if (g / "playwright").exists():
+            return str(g)
+    return ""
+
+def find_chromium():
+    """Fallback Chromium binary (Playwright / puppeteer caches)."""
+    for pat in (".cache/ms-playwright/chromium-*/chrome-linux*/chrome",
+                ".cache/puppeteer/chrome/*/chrome-linux*/chrome",
+                ".cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux*/chrome-headless-shell"):
+        hits = sorted(Path.home().glob(pat))
+        if hits:
+            return str(hits[-1])
+    for name in ("chromium", "chromium-browser", "google-chrome", "chrome"):
+        w = shutil.which(name)
+        if w:
+            return w
+    return ""
+
+# ---------------------------------------------------------------- markdown prep
+FRONTMATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
+READ_LINE_RE   = re.compile(r"^\s*[-*]\s*\[[ xX]\]\s*\*{0,2}Read\*{0,2}\s*$", re.MULTILINE)
+CALLOUT_RE     = re.compile(r"^>\s*\[!([A-Za-z]+)\]([+-]?)\s*(.*)$")
+
+CALLOUT_EMOJI = {
+    "note": "📝", "info": "ℹ️", "tip": "💡", "hint": "💡", "important": "❗",
+    "warning": "⚠️", "caution": "⚠️", "danger": "🚫", "error": "🚫",
+    "success": "✅", "check": "✅", "done": "✅", "question": "❓", "faq": "❓",
+    "example": "🔎", "quote": "❝", "abstract": "📄", "summary": "📄", "todo": "🗒️",
+    "bug": "🐛", "failure": "❌",
+}
+
+def parse_frontmatter(text):
+    meta = {}
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        return meta, text
+    block = m.group(0)
+    for line in block.splitlines():
+        fm = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", line)
+        if fm:
+            key, val = fm.group(1).strip(), fm.group(2).strip()
+            if val and not val.startswith("|") and not val.startswith(">"):
+                meta[key.lower()] = val.strip().strip('"').strip("'")
+    return meta, text[m.end():]
+
+def transform_callouts(text):
+    """Turn Obsidian `> [!type] Title` headers into clean bold blockquote headers."""
+    out = []
+    for line in text.splitlines():
+        m = CALLOUT_RE.match(line)
+        if m:
+            typ = m.group(1).lower()
+            title = m.group(3).strip()
+            emoji = CALLOUT_EMOJI.get(typ, "🔹")
+            label = title if title else typ.upper()
+            out.append(f"> **{emoji} {label}**")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+def extract_h1(text):
+    """Pull the first level-1 heading for the cover; strip it from the body."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^#\s+(.*\S)\s*$", line)
+        if m:
+            title = m.group(1).strip()
+            del lines[i]
+            return title, "\n".join(lines)
+    return None, text
+
+# ---------------------------------------------------------------- mermaid render
+def render_mermaid_blocks(text, tmp, mmdc, puppeteer_cfg):
+    """Replace each ```mermaid fence with a rendered <img> figure. Returns (text, count)."""
+    lines = text.splitlines()
+    out, i, n, rendered = [], 0, len(lines), 0
+    open_re  = re.compile(r"^(\s*)```+\s*mermaid\s*$", re.IGNORECASE)
+    close_re = re.compile(r"^\s*```+\s*$")
+    total = sum(1 for ln in lines if open_re.match(ln))
+    while i < n:
+        mo = open_re.match(lines[i])
+        if not mo:
+            out.append(lines[i]); i += 1; continue
+        # capture until closing fence
+        body, j = [], i + 1
+        while j < n and not close_re.match(lines[j]):
+            body.append(lines[j]); j += 1
+        j += 1  # consume closing fence
+        rendered += 1
+        code = textwrap.dedent("\n".join(body)).strip() + "\n"
+        mmd = tmp / f"diagram-{rendered}.mmd"
+        png = tmp / f"diagram-{rendered}.png"
+        mmd.write_text(code, encoding="utf-8")
+        log(f"   🎨 diagram {rendered}/{total} → rendering…")
+        cmd = mmdc + ["-i", str(mmd), "-o", str(png), "-s", "3", "-b", "white",
+                      "-p", str(puppeteer_cfg)]
+        ok = False
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            ok = (r.returncode == 0 and png.exists() and png.stat().st_size > 0)
+            if not ok:
+                sys.stderr.write((r.stderr or r.stdout or "")[-800:] + "\n")
+        except Exception as e:
+            sys.stderr.write(f"{e}\n")
+        if ok:
+            uri = png.resolve().as_uri()
+            out += ["", f'<figure class="diagram"><img src="{uri}" alt="diagram {rendered}"/></figure>', ""]
+        else:
+            log(f"   ⚠️  diagram {rendered} failed to render — keeping source block")
+            out += ["", "```mermaid", *body, "```", ""]
+        i = j
+    return "\n".join(out), rendered
+
+# ---------------------------------------------------------------- html assembly
+def md_to_html(md_text):
+    import markdown
+    html = markdown.markdown(
+        md_text,
+        extensions=["tables", "fenced_code", "sane_lists", "attr_list",
+                    "md_in_html", "def_list", "footnotes"],
+        output_format="html5",
+    )
+    # task-list checkboxes (generic; the tracker line is already stripped)
+    html = re.sub(r"<li>(\s*<p>)?\s*\[ \]\s*",
+                  lambda m: '<li class="task">' + (m.group(1) or "") + '<span class="chk"></span> ',
+                  html)
+    html = re.sub(r"<li>(\s*<p>)?\s*\[[xX]\]\s*",
+                  lambda m: '<li class="task done">' + (m.group(1) or "") + '<span class="chk">✓</span> ',
+                  html)
+    return html
+
+def build_cover(title, meta):
+    if not title:
+        return ""
+    kicker = (meta.get("project") or meta.get("type") or "").strip()
+    subtitle_bits = []
+    if meta.get("type"):    subtitle_bits.append(meta["type"].replace("-", " ").title())
+    if meta.get("project"): subtitle_bits.append(meta["project"])
+    subtitle = " · ".join(dict.fromkeys(subtitle_bits))
+    meta_bits = []
+    if meta.get("status"):  meta_bits.append(f"Status — {meta['status']}")
+    created = meta.get("created") or meta.get("date")
+    if created:             meta_bits.append(f"Created — {created}")
+    meta_bits.append(f"Rendered — {date.today().isoformat()}")
+    e = _html.escape
+    parts = ['<section class="cover">']
+    if kicker:
+        parts.append(f'<div class="kicker">{e(kicker)}</div>')
+    parts.append(f'<h1 class="title">{e(title)}</h1>')
+    parts.append('<div class="rule"></div>')
+    if subtitle:
+        parts.append(f'<div class="subtitle">{e(subtitle)}</div>')
+    parts.append(f'<div class="meta">{" &nbsp;·&nbsp; ".join(e(b) for b in meta_bits)}</div>')
+    parts.append("</section>")
+    return "\n".join(parts)
+
+CSS = r"""
+:root{
+  --ink:#20242c; --ink-soft:#3c424e; --muted:#8a8f99;
+  --accent:#b3122e; --accent-soft:#e7c9cf;
+  --rule:#e4e2dd; --rule-strong:#c9c6bf;
+  --code-bg:#f6f7f9; --code-ink:#b3122e;
+  --zebra:#faf9f7; --thead:#f1efeb;
+  --callout-bg:#f7f8fa; --callout-bar:#b3122e;
+}
+*{box-sizing:border-box}
+html{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+@page{ size:A4; }
+body{
+  font-family:"Inter","Open Sans","Noto Sans",-apple-system,"Segoe UI",Roboto,"Helvetica Neue","Noto Color Emoji",sans-serif;
+  color:var(--ink); font-size:10.4pt; line-height:1.62; margin:0;
+  font-feature-settings:"kern" 1,"liga" 1;
+  text-rendering:optimizeLegibility;
+}
+h1,h2,h3,h4,h5,h6{ font-weight:700; line-height:1.24; color:#12151b; letter-spacing:-0.006em; break-after:avoid; -webkit-column-break-after:avoid; }
+h1{ font-size:21pt; margin:.2em 0 .5em; }
+h2{ font-size:15.5pt; margin:1.55em 0 .55em; padding-bottom:.26em; border-bottom:2px solid var(--rule-strong); }
+h3{ font-size:12.5pt; margin:1.3em 0 .45em; color:#1c2029; }
+h4{ font-size:11pt; margin:1.05em 0 .35em; color:var(--ink-soft); }
+h5,h6{ font-size:10pt; color:var(--muted); margin:.9em 0 .3em; }
+p{ margin:0 0 .7em; orphans:2; widows:2; }
+a{ color:var(--accent); text-decoration:none; border-bottom:1px solid var(--accent-soft); }
+strong{ font-weight:700; color:#12151b; }
+em{ font-style:italic; }
+del{ color:var(--muted); }
+hr{ border:0; border-top:1px solid var(--rule); margin:1.6em 0; }
+
+ul,ol{ margin:.2em 0 .8em; padding-left:1.35em; }
+li{ margin:.22em 0; }
+li::marker{ color:var(--accent); }
+ul ul,ul ol,ol ul,ol ol{ margin:.15em 0; }
+li.task{ list-style:none; margin-left:-1.15em; }
+li.task .chk{ display:inline-flex; align-items:center; justify-content:center;
+  width:.92em; height:.92em; margin-right:.45em; vertical-align:-0.12em;
+  border:1.5px solid var(--rule-strong); border-radius:3px; font-size:.72em; color:#fff; line-height:1; }
+li.task.done .chk{ background:var(--accent); border-color:var(--accent); }
+
+code{ font-family:"Noto Sans Mono","JetBrains Mono","Caskaydia Cove Nerd Font Mono",ui-monospace,monospace;
+  font-size:.85em; background:var(--code-bg); color:var(--code-ink);
+  padding:.1em .36em; border-radius:4px; border:1px solid #ecedf0; }
+pre{ background:var(--code-bg); border:1px solid #e7e9ec; border-radius:8px;
+  padding:.85em 1.05em; overflow:auto; margin:0 0 1em; break-inside:avoid; }
+pre code{ background:none; border:0; padding:0; color:#2b2f36; font-size:.82em; line-height:1.5; }
+
+blockquote{ margin:.9em 0; padding:.62em 1.05em; background:var(--callout-bg);
+  border-left:4px solid var(--callout-bar); border-radius:0 8px 8px 0;
+  color:var(--ink-soft); break-inside:avoid; }
+blockquote p{ margin:.28em 0; }
+blockquote p:first-child{ margin-top:0; }
+blockquote p:last-child{ margin-bottom:0; }
+blockquote strong{ color:#12151b; }
+
+table{ border-collapse:collapse; width:100%; margin:1em 0 1.25em; font-size:9.2pt; }
+thead{ display:table-header-group; }
+th,td{ border:1px solid var(--rule); padding:.42em .68em; text-align:left; vertical-align:top; }
+th{ background:var(--thead); font-weight:700; color:#12151b; border-bottom:2px solid var(--rule-strong); }
+tr{ break-inside:avoid; }
+tbody tr:nth-child(even){ background:var(--zebra); }
+
+img{ max-width:100%; height:auto; }
+figure{ margin:1.1em 0; text-align:center; break-inside:avoid; }
+figure.diagram img{ max-width:100%; max-height:8.3in; object-fit:contain;
+  border:1px solid var(--rule); border-radius:8px; padding:9px; background:#fff; }
+figcaption{ font-size:8.6pt; color:var(--muted); margin-top:.4em; }
+
+section.cover{ break-after:page; padding-top:2.3in; min-height:9.5in; }
+section.cover .kicker{ font-size:9pt; letter-spacing:.22em; text-transform:uppercase;
+  color:var(--accent); font-weight:700; margin-bottom:1.05em; }
+section.cover h1.title{ font-size:33pt; line-height:1.1; letter-spacing:-0.02em;
+  border:0; margin:0; color:#0e1116; }
+section.cover .rule{ width:82px; height:4px; background:var(--accent);
+  margin:1.05em 0 1.25em; border-radius:2px; }
+section.cover .subtitle{ font-size:12.5pt; color:var(--ink-soft); line-height:1.5; max-width:84%; }
+section.cover .meta{ margin-top:2.5in; font-size:9.3pt; color:var(--muted); }
+"""
+
+HTML_TMPL = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><style>{css}</style></head>
+<body>{cover}
+{content}
+</body></html>"""
+
+def build_printer(pdf_title):
+    footer_left = _html.escape(pdf_title or "")[:70]
+    footer = ('<div style="width:100%;font-size:8px;color:#9aa0a6;'
+              'font-family:Inter,\'Open Sans\',sans-serif;padding:0 15mm;'
+              'display:flex;justify-content:space-between;align-items:center;">'
+              f'<span>{footer_left}</span>'
+              '<span><span class="pageNumber"></span> / <span class="totalPages"></span></span></div>')
+    return """
+const { chromium } = require('playwright');
+const [,, htmlPath, pdfPath] = process.argv;
+(async () => {
+  const browser = await chromium.launch({ args:['--no-sandbox','--disable-setuid-sandbox'] });
+  const page = await browser.newPage();
+  await page.goto('file://' + htmlPath, { waitUntil:'networkidle', timeout:120000 });
+  await page.emulateMedia({ media:'print' });
+  await page.pdf({
+    path: pdfPath, format:'A4', printBackground:true, displayHeaderFooter:true,
+    margin:{ top:'15mm', bottom:'17mm', left:'15mm', right:'15mm' },
+    headerTemplate:'<div></div>',
+    footerTemplate: %s,
+  });
+  await browser.close();
+  console.log('ok');
+})().catch(e => { console.error(e); process.exit(1); });
+""" % json.dumps(footer)
+
+# ---------------------------------------------------------------- print
+def print_pdf(html_path, pdf_path, pdf_title, tmp):
+    npath = node_path()
+    if npath:
+        printer = tmp / "print.cjs"
+        printer.write_text(build_printer(pdf_title), encoding="utf-8")
+        env = dict(os.environ, NODE_PATH=npath)
+        r = subprocess.run(["node", str(printer), str(html_path.resolve()), str(pdf_path.resolve())],
+                           capture_output=True, text=True, env=env, timeout=300)
+        if r.returncode == 0 and pdf_path.exists():
+            return True
+        sys.stderr.write((r.stderr or r.stdout or "")[-1200:] + "\n")
+        log("   ⚠️  Playwright print failed — trying direct Chromium fallback (no page numbers)")
+    chrome = find_chromium()
+    if not chrome:
+        die("No PDF engine available (need global 'playwright' or a Chromium binary).")
+    r = subprocess.run([chrome, "--headless=new", "--no-sandbox", "--disable-setuid-sandbox",
+                        "--no-pdf-header-footer", f"--print-to-pdf={pdf_path.resolve()}",
+                        html_path.resolve().as_uri()],
+                       capture_output=True, text=True, timeout=300)
+    if pdf_path.exists() and pdf_path.stat().st_size > 0:
+        return True
+    sys.stderr.write((r.stderr or r.stdout or "")[-1200:] + "\n")
+    return False
+
+def page_count(pdf_path):
+    try:
+        from pypdf import PdfReader
+        return len(PdfReader(str(pdf_path)).pages)
+    except Exception:
+        try:
+            r = subprocess.run(["pdfinfo", str(pdf_path)], capture_output=True, text=True)
+            m = re.search(r"Pages:\s*(\d+)", r.stdout)
+            return int(m.group(1)) if m else 0
+        except Exception:
+            return 0
+
+# ---------------------------------------------------------------- main
+def main():
+    args = [a for a in sys.argv[1:] if a not in ("-h", "--help")]
+    if len(sys.argv) == 1 or any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(__doc__.strip()); sys.exit(0 if len(sys.argv) > 1 else 1)
+    if not args:
+        die("Usage: nhq-pdf \"<input.md>\" [\"<output.pdf>\"]")
+
+    src = Path(args[0]).expanduser()
+    if not src.exists():
+        die(f"Input not found: {src}")
+    out = Path(args[1]).expanduser() if len(args) > 1 else src.with_suffix(".pdf")
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import markdown  # noqa: F401
+    except ImportError:
+        die("Python 'markdown' package required:  pip install --user markdown")
+
+    log(f"📄 nhq-pdf  ·  {src.name}")
+    text = src.read_text(encoding="utf-8")
+
+    meta, text = parse_frontmatter(text)
+    text = READ_LINE_RE.sub("", text)
+    text = transform_callouts(text)
+    title, text = extract_h1(text)
+    pdf_title = title or meta.get("title") or src.stem
+
+    mmdc = find_mmdc()
+    log(f"   🖇  mermaid engine: {mmdc[0] if len(mmdc)==1 else ' '.join(mmdc)}")
+
+    with tempfile.TemporaryDirectory(prefix="nhq-pdf-") as td:
+        tmp = Path(td)
+        puppeteer_cfg = tmp / "puppeteer.json"
+        puppeteer_cfg.write_text(json.dumps({"args": ["--no-sandbox", "--disable-setuid-sandbox"]}),
+                                 encoding="utf-8")
+
+        text, n = render_mermaid_blocks(text, tmp, mmdc, puppeteer_cfg)
+        if n:
+            log(f"   ✅ {n} diagram(s) rendered")
+        else:
+            log("   ·  no mermaid blocks")
+
+        content_html = md_to_html(text)
+        cover_html = build_cover(title or meta.get("title"), meta)
+        full = HTML_TMPL.format(css=CSS, cover=cover_html, content=content_html)
+        html_path = tmp / "doc.html"
+        html_path.write_text(full, encoding="utf-8")
+
+        log("   🖨  printing PDF…")
+        ok = print_pdf(html_path, out, pdf_title, tmp)
+        if not ok:
+            die("PDF generation failed.")
+
+    size = out.stat().st_size
+    pages = page_count(out)
+    human = f"{size/1024/1024:.1f}MB" if size >= 1024*1024 else f"{size/1024:.0f}KB"
+    log(f"\n✅ PDF ready → {out}")
+    log(f"   {pages} page(s) · {human}")
+
+if __name__ == "__main__":
+    main()
