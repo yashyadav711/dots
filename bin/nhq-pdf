@@ -348,8 +348,8 @@ const [,, htmlPath, pdfPath] = process.argv;
   await page.goto('file://' + htmlPath, { waitUntil:'networkidle', timeout:120000 });
   await page.emulateMedia({ media:'print' });
   await page.pdf({
-    path: pdfPath, format:'A4', printBackground:true, displayHeaderFooter:true,
-    margin:{ top:'0', bottom:'14mm', left:'0', right:'0' },
+    path: pdfPath, format:'A4', printBackground:true, displayHeaderFooter:false,
+    margin:{ top:'0', bottom:'0', left:'0', right:'0' },
     headerTemplate: %s,
     footerTemplate: %s,
   });
