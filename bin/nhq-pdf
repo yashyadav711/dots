@@ -244,13 +244,13 @@ html{ background:var(--ink); -webkit-print-color-adjust:exact; print-color-adjus
 body{
   background:var(--ink);
   font-family:"Inter","Open Sans","Noto Sans",-apple-system,"Segoe UI",Roboto,"Helvetica Neue","Noto Color Emoji",sans-serif;
-  color:var(--body); font-size:10.4pt; line-height:1.66; margin:0; padding:0 15mm;
+  color:var(--body); font-size:10.4pt; line-height:1.66; margin:0; padding:0 10mm;
   font-feature-settings:"kern" 1,"liga" 1;
   text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased;
 }
 h1,h2,h3,h4,h5,h6{ font-weight:700; line-height:1.24; letter-spacing:-0.006em; break-after:avoid; -webkit-column-break-after:avoid; }
 h1{ font-size:21pt; margin:.2em 0 .5em; color:var(--red-bright); letter-spacing:-0.02em; }
-h2{ font-size:15.5pt; margin:0 0 .62em; padding:12mm 0 .28em; color:var(--red-bright); letter-spacing:-0.02em;
+h2{ font-size:15.5pt; margin:0 0 .62em; padding:5mm 0 .28em; color:var(--red-bright); letter-spacing:-0.02em;
   border-width:0 0 2px; border-style:solid;
   border-image:linear-gradient(to right, var(--red) 0%, var(--gold) 55%, rgba(59,57,47,0) 100%) 1;
   break-before:page; page-break-before:always; }
@@ -330,15 +330,32 @@ HTML_TMPL = """<!doctype html>
 
 def build_printer(pdf_title):
     footer_left = _html.escape(pdf_title or "")[:70]
-    footer = ('<div style="width:100%;height:14mm;margin:0;background:#14130F;'
-              'box-sizing:border-box;padding:0 15mm;border-top:0.5px solid #3B392F;'
-              '-webkit-print-color-adjust:exact;print-color-adjust:exact;'
-              'font-size:7.5px;font-family:Inter,\'Open Sans\',sans-serif;'
+    # ── Dark breathing margins (top+bottom gap that STAYS DARK) ──────────────
+    # Chromium does NOT propagate the root/body background into page margins
+    # (they render WHITE) — the ONLY layer painted inside the margin box is the
+    # header/footer template. So we reserve a 13mm top+bottom margin for the gap
+    # and fill each margin with a full-bleed dark bar. Two measured facts drive
+    # the geometry (pinned Chromium): (a) the header/footer iframe is shifted
+    # ~5mm PAST the margin INTO the content area — a raw bottom:0 lands ~18mm
+    # down, not at the 13mm boundary — so we pull the bar's inner edge back 5mm
+    # (bottom/top:5mm) to stop exactly at the content boundary and NOT clip the
+    # first/last row (e.g. a repeating table header); (b) the iframe leaves a
+    # ~5mm sliver at the very paper edge, so the bar's outer edge overflows PAST
+    # the edge (top/bottom:-12mm) to kill it. Net: dark from the very paper edge
+    # down to the content boundary, every page + every page-break dark→dark,
+    # content never covered.
+    header = ('<div style="position:relative;width:100%;height:100%;margin:0;padding:0;">'
+              '<div style="position:absolute;left:0;right:0;bottom:5mm;top:-12mm;background:#14130F;'
+              '-webkit-print-color-adjust:exact;print-color-adjust:exact;"></div></div>')
+    footer = ('<div style="position:relative;width:100%;height:100%;margin:0;padding:0;">'
+              '<div style="position:absolute;left:0;right:0;top:5mm;bottom:-12mm;background:#14130F;'
+              '-webkit-print-color-adjust:exact;print-color-adjust:exact;"></div>'
+              '<div style="position:absolute;left:0;right:0;top:5mm;height:13mm;box-sizing:border-box;'
+              'padding:0 10mm;font-size:7.5px;font-family:Inter,\'Open Sans\',sans-serif;color:#BDB8AC;'
               'display:flex;justify-content:space-between;align-items:center;">'
-              f'<span style="text-transform:uppercase;letter-spacing:.12em;color:#BDB8AC;">{footer_left}</span>'
-              '<span style="color:#BDB8AC;"><span class="pageNumber" style="color:#F2B705;font-weight:700;"></span>'
-              ' / <span class="totalPages"></span></span></div>')
-    header = '<div></div>'
+              f'<span style="text-transform:uppercase;letter-spacing:.12em;">{footer_left}</span>'
+              '<span><span class="pageNumber" style="color:#F2B705;font-weight:700;"></span>'
+              ' / <span class="totalPages"></span></span></div></div>')
     return """
 const { chromium } = require('playwright');
 const [,, htmlPath, pdfPath] = process.argv;
@@ -348,8 +365,8 @@ const [,, htmlPath, pdfPath] = process.argv;
   await page.goto('file://' + htmlPath, { waitUntil:'networkidle', timeout:120000 });
   await page.emulateMedia({ media:'print' });
   await page.pdf({
-    path: pdfPath, format:'A4', printBackground:true, displayHeaderFooter:false,
-    margin:{ top:'0', bottom:'0', left:'0', right:'0' },
+    path: pdfPath, format:'A4', printBackground:true, displayHeaderFooter:true,
+    margin:{ top:'13mm', bottom:'13mm', left:'0', right:'0' },
     headerTemplate: %s,
     footerTemplate: %s,
   });
