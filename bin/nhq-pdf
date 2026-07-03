@@ -354,8 +354,7 @@ def build_printer(pdf_title):
               'padding:0 10mm;font-size:7.5px;font-family:Inter,\'Open Sans\',sans-serif;color:#BDB8AC;'
               'display:flex;justify-content:space-between;align-items:center;">'
               f'<span style="text-transform:uppercase;letter-spacing:.12em;">{footer_left}</span>'
-              '<span><span class="pageNumber" style="color:#F2B705;font-weight:700;"></span>'
-              ' / <span class="totalPages"></span></span></div></div>')
+              '<span class="pageNumber" style="color:#F2B705;font-weight:700;"></span></div></div>')
     return """
 const { chromium } = require('playwright');
 const [,, htmlPath, pdfPath] = process.argv;
