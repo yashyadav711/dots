@@ -4,7 +4,9 @@
 [transcription]
 provider = "whisper-cpp"
 model = "small"            # 466MB, multilingual — more accurate, supports Hindi/Hinglish
-language = ""              # auto-detect (needed for Hindi/English mixed speech)
+language = "en"            # was "" (auto-detect) — misfired into looping Sinhala garbage
+                            # on real English speech (verified twice). Pin to English;
+                            # revisit "hi" if you're dictating pure Hindi sentences.
 threads = 0                 # 0 = auto (NumCPU - 1)
 
 # hyprvoice doesn't apply a default here when this section is omitted — omitting it
@@ -36,6 +38,8 @@ clipboard_timeout = "3s"
 # empty type defaults to "" which fails validation ("must be desktop, log, or none").
 [notifications]
 enabled = true
-type = "desktop"
+type = "log"                # "desktop" hit this machine's known dunst/xfce4-notifyd
+                              # D-Bus race — toasts rendered as overlapping garbled text.
+                              # Log-only avoids it; the injected text is the real signal.
 
 keywords = ["Hyprland", "Wayland", "PipeWire", "Railway", "TypeScript", "Claude", "NetrunnersHQ"]
