@@ -324,8 +324,9 @@ def check_all() -> None:
             if new_leak:
                 alert("zombie", "⚠️ Zombie processes accumulating", body)
             else:
-                log(f"zombie: {z} (sustained {_zombie_consecutive}) — all-omp set, "
-                    f"desktop alert suppressed (benign; omp not reaping)")
+                log(f"zombie: {z} (sustained {_zombie_consecutive}) — "
+                    + ("foreign set unchanged since last alert" if foreign else "all-omp set")
+                    + ", desktop re-nag suppressed")
     else:
         _zombie_consecutive = 0
         _zombie_alerted = frozenset()
