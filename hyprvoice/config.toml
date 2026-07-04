@@ -16,7 +16,7 @@ sample_rate = 16000
 channels = 1
 format = "s16"
 buffer_size = 8192
-device = ""
+device = "rnnoise_source"  # boosted+denoised virtual mic (dots/pipewire/99-input-denoising.conf)
 channel_buffer_size = 30
 timeout = "5m"
 
