@@ -3,8 +3,8 @@
 
 [transcription]
 provider = "whisper-cpp"
-model = "base.en"          # 142MB, English-only, good daily-use balance
-language = "en"
+model = "small"            # 466MB, multilingual — more accurate, supports Hindi/Hinglish
+language = ""              # auto-detect (needed for Hindi/English mixed speech)
 threads = 0                 # 0 = auto (NumCPU - 1)
 
 # hyprvoice doesn't apply a default here when this section is omitted — omitting it
@@ -31,5 +31,11 @@ backends = ["wtype", "clipboard"]   # ydotoold isn't running on this box; wtype 
 ydotool_timeout = "5s"
 wtype_timeout = "5s"
 clipboard_timeout = "3s"
+
+# Third instance of the same omitted-section bug (recording, injection, now this):
+# empty type defaults to "" which fails validation ("must be desktop, log, or none").
+[notifications]
+enabled = true
+type = "desktop"
 
 keywords = ["Hyprland", "Wayland", "PipeWire", "Railway", "TypeScript", "Claude", "NetrunnersHQ"]
