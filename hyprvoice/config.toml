@@ -24,7 +24,12 @@ timeout = "5m"
 [llm]
 enabled = false
 
+# Same zero-value gotcha as [recording] above: omitting timeouts leaves them at 0s,
+# so every injection attempt hit an instant "context deadline exceeded" (verified live).
 [injection]
 backends = ["wtype", "clipboard"]   # ydotoold isn't running on this box; wtype is native Wayland
+ydotool_timeout = "5s"
+wtype_timeout = "5s"
+clipboard_timeout = "3s"
 
 keywords = ["Hyprland", "Wayland", "PipeWire", "Railway", "TypeScript", "Claude", "NetrunnersHQ"]
