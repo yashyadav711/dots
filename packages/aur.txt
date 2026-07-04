@@ -1,5 +1,7 @@
-iptables-nft
+antigravity-appimage
+elephant-bin
+hyprvoice-bin
 notion-app-electron
-swww
+otf-san-francisco
 xfce4-datetime-plugin
 xfwm4-themes

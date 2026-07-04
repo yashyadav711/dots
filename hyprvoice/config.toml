@@ -1,0 +1,19 @@
+# hyprvoice — local, offline dictation (no API key required)
+# Wired by Envy 2026-07-04. Change providers/models anytime with `hyprvoice configure`.
+
+[transcription]
+provider = "whisper-cpp"
+model = "base.en"          # 142MB, English-only, good daily-use balance
+language = "en"
+threads = 0                 # 0 = auto (NumCPU - 1)
+
+# LLM cleanup (punctuation/grammar/filler removal) needs an OpenAI or Groq API key.
+# Off by default so this works with zero signup. Flip to true + add a key under
+# [providers.groq] / [providers.openai] (free Groq tier works) to enable it.
+[llm]
+enabled = false
+
+[injection]
+backends = ["wtype", "clipboard"]   # ydotoold isn't running on this box; wtype is native Wayland
+
+keywords = ["Hyprland", "Wayland", "PipeWire", "Railway", "TypeScript", "Claude", "NetrunnersHQ"]

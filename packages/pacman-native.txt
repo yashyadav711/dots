@@ -77,6 +77,7 @@ ffmpegthumbs
 file-roller
 firefox
 flatpak
+freerdp
 fsarchiver
 fuse2
 galculator
@@ -85,6 +86,8 @@ git
 github-cli
 glances
 glow
+gnome-text-editor
+google-cloud-cli
 grim
 grub
 grub-btrfs-support
@@ -153,6 +156,7 @@ mousetweaks
 mtools
 nano
 nano-syntax-highlighting
+neovim
 netctl
 network-manager-applet
 networkmanager
@@ -168,6 +172,8 @@ nwg-displays
 nwg-look
 obsidian
 octopi
+ollama
+openai-codex
 opencl-mesa
 openssh
 os-prober
@@ -251,6 +257,7 @@ waybar
 wev
 wget
 which
+whisper-cpp-vulkan
 wireless-regdb
 wireplumber
 wl-clip-persist
@@ -289,3 +296,5 @@ xfsprogs
 xfwm4
 xl2tpd
 xorg-xwayland
+zathura
+zathura-pdf-mupdf
