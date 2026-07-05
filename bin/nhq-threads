@@ -33,6 +33,9 @@ Usage:
   nhq-threads --live --mirror --needs-you   # live view, only Mirror's 🔴
   nhq-threads --file PATH           # override the source file
   nhq-threads --verify              # also run self-test, print parse stats to stderr
+  nhq-threads --issues              # open GitHub issues grouped by project
+  nhq-threads --issues --web --heydaddy   # web-safe, only heydaddy's issues
+  nhq-threads --vault-sync          # write threads + issues to the vault file
 
 Exit non-zero if the self-test fails (rendered rows != source [id] lines),
 listing the missing IDs.
@@ -40,12 +43,30 @@ listing the missing IDs.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
+import subprocess
 import sys
 import time
 
 DEFAULT_FILE = os.path.expanduser("~/Github/nhq-agentic-os/ai/open-threads.md")
+
+# ── GitHub issues ────────────────────────────────────────────────────────
+# Project -> GitHub "owner/repo".  EDITABLE: add a project by dropping a
+# `"<project>": "<owner>/<repo>"` line here (confirm the remote first with
+# `git -C ~/Github/<project> remote get-url origin`).  Seeded with the repos
+# whose GitHub remotes are confirmed on the yashyadav711 account.
+PROJECT_REPOS = {
+    "heydaddy": "yashyadav711/heydaddy",
+    "nhq-agentic-os": "yashyadav711/nhq-agentic-os",
+    "mirror": "yashyadav711/mirror",
+}
+
+# Vault file the --vault-sync writes (Obsidian picks it up).  Module constant
+# so it is trivial to repoint; the sync fails soft if the dir is absent.
+VAULT_FILE = ("/home/yash/Github/product-manager/Yash's Folder/"
+              "Obsidian/nHQ/Threads and Issues.md")
 
 # Status emoji -> (short label, header-bucket).  header-bucket is the key used
 # for the summary counts in the header line (None = not summarised there).
@@ -686,7 +707,180 @@ def do_write(path: str, tid: str, to_status=None, note=None,
         f.write(new_raw)
     os.replace(tmp, path)
     print(f"nhq-threads: {tid} updated ({', '.join(changed)})")
+    _auto_vault_sync(path)
     return 0
+
+
+# ── GitHub issues (--issues) ─────────────────────────────────────────────
+
+class IssuesError(Exception):
+    """A user-facing failure fetching issues (gh missing / unauthed / etc.)."""
+
+
+def fetch_issues(repo: str) -> list[dict]:
+    """Fetch open issues for `owner/repo` via gh; parse the JSON. Raises
+    IssuesError with a clear message when gh is missing, unauthed, or fails."""
+    cmd = ["gh", "issue", "list", "--repo", repo, "--state", "open",
+           "--json", "number,title,labels,state", "--limit", "200"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        raise IssuesError(
+            "gh CLI not found — install GitHub CLI (https://cli.github.com) "
+            "and run `gh auth login`.")
+    except subprocess.TimeoutExpired:
+        raise IssuesError(f"gh timed out fetching issues for {repo}.")
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip().splitlines()
+        msg = err[0] if err else f"gh exited {proc.returncode}"
+        raise IssuesError(f"gh failed for {repo}: {msg}")
+    try:
+        return json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as e:
+        raise IssuesError(f"could not parse gh output for {repo}: {e}")
+
+
+def _selected_projects(args) -> list[str] | None:
+    """Which mapped projects to show (None => all). Reuses the category flags
+    (--heydaddy/--mirror) and --category so filtering matches the threads UX."""
+    sel: list[str] = []
+    for proj in PROJECT_REPOS:
+        if getattr(args, proj.replace("-", "_"), False):
+            sel.append(proj)
+    if getattr(args, "category", None):
+        for c in args.category:
+            c = c.strip().lower()
+            if c in PROJECT_REPOS and c not in sel:
+                sel.append(c)
+    return sel or None
+
+
+def collect_issues(projects: list[str] | None = None):
+    """Return [(project, repo, issues|error_str)] for the mapped projects."""
+    grouped = []
+    for proj, repo in PROJECT_REPOS.items():
+        if projects is not None and proj not in projects:
+            continue
+        try:
+            iss = fetch_issues(repo)
+        except IssuesError as e:
+            iss = str(e)
+        grouped.append((proj, repo, iss))
+    return grouped
+
+
+def _issue_labels(it: dict) -> str:
+    return ", ".join(l.get("name", "") for l in it.get("labels", []) or [])
+
+
+def render_issues(grouped, mode: str = "latex") -> str:
+    """Render open issues as a grouped markdown table (# | Title | Labels |
+    State), one bold project header row per project. latex/web/ansi share the
+    markdown shape; --ansi additionally colours via `_color`."""
+    total = sum(len(i) for _, _, i in grouped if isinstance(i, list))
+    lines = [
+        f"🐛 OPEN ISSUES · {total} open", "",
+        "| # | Title | Labels | State |",
+        "| --- | --- | --- | --- |",
+    ]
+    for proj, repo, iss in grouped:
+        theme = CAT_THEME.get(proj.upper())
+        hexcolor = theme[0] if theme else "#BDB8AC"
+        name = _color(f"{proj} · {repo}", hexcolor, mode, bold=True)
+        lines.append(f"| {name} | | | |")
+        if isinstance(iss, str):
+            lines.append(f"| ⚠ | {_cell(iss)} | | |")
+            continue
+        if not iss:
+            lines.append("| — | _no open issues_ | | |")
+            continue
+        for it in iss:
+            num = f"#{it.get('number', '')}"
+            title = _cell(_truncate(it.get("title", ""), 80))
+            labels = _cell(_issue_labels(it))
+            state = _cell(it.get("state", "").lower())
+            lines.append(f"| {num} | {title} | {labels} | {state} |")
+    return "\n".join(lines)
+
+
+def render_issues_ansi(grouped) -> str:
+    """Aligned, coloured terminal render (no markdown pipes)."""
+    total = sum(len(i) for _, _, i in grouped if isinstance(i, list))
+    head = _color(_ANSI_BOLD + f"🐛 OPEN ISSUES · {total} open" + _ANSI_RESET,
+                  "#ECE7DA", "ansi")
+    lines = [head, ""]
+    for proj, repo, iss in grouped:
+        theme = CAT_THEME.get(proj.upper())
+        hexcolor = theme[0] if theme else "#BDB8AC"
+        lines.append(_color(f"  {proj} · {repo}", hexcolor, "ansi", bold=True))
+        if isinstance(iss, str):
+            lines.append(f"     ⚠ {iss}")
+        elif not iss:
+            lines.append(f"     {_ANSI_DIM}no open issues{_ANSI_RESET}")
+        else:
+            for it in iss:
+                num = _color(_pad(f"#{it.get('number', '')}", 5),
+                             "#F2B705", "ansi", bold=True)
+                title = _truncate(it.get("title", ""), 52)
+                labels = _issue_labels(it)
+                lab = _ANSI_DIM + (f"[{labels}]" if labels else "") + _ANSI_RESET
+                lines.append(f"     {num} {_pad(title, 52)} {lab}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ── vault sync (--vault-sync) ────────────────────────────────────────────
+
+def _render_threads_web(path: str) -> str:
+    """Full (unfiltered) threads table as web-safe markdown for the vault."""
+    text = open(path, encoding="utf-8").read()
+    threads, _ = parse(extract_block(text))
+    table, _ = render(threads, "web")
+    return table
+
+
+def do_vault_sync(path: str, projects: list[str] | None = None,
+                  quiet: bool = False) -> int:
+    """Write the combined THREADS + ISSUES markdown to VAULT_FILE (web-safe).
+    Fails soft (returns 0, prints a notice) when the vault dir is absent."""
+    import datetime
+    vault_dir = os.path.dirname(VAULT_FILE)
+    if not os.path.isdir(vault_dir):
+        if not quiet:
+            print(f"nhq-threads: vault dir absent, skipping sync: {vault_dir}",
+                  file=sys.stderr)
+        return 0
+    threads_md = _render_threads_web(path)
+    issues_md = render_issues(collect_issues(projects), "web")
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    content = (
+        "---\nread: false\n---\n\n"
+        "# Threads and Issues\n\n"
+        "> [!warning] Auto-generated by nhq-threads — do not hand-edit; "
+        "run `nhq-threads --vault-sync` to refresh.\n\n"
+        f"_Last synced: {ts}_\n\n"
+        "---\n\n"
+        "## 🧵 Threads\n\n"
+        f"{threads_md}\n\n"
+        "---\n\n"
+        "## 🐛 Issues\n\n"
+        f"{issues_md}\n"
+    )
+    tmp = f"{VAULT_FILE}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, VAULT_FILE)
+    if not quiet:
+        print(f"nhq-threads: vault synced -> {VAULT_FILE}")
+    return 0
+
+
+def _auto_vault_sync(path: str) -> None:
+    """Best-effort vault refresh after a write-path op; never fails the write."""
+    try:
+        do_vault_sync(path, projects=None, quiet=True)
+    except Exception as e:  # noqa: BLE001 — auto-sync must never break --set/--done
+        print(f"nhq-threads: vault auto-sync skipped ({e})", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -734,6 +928,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="replace the thread's 💬 last note (date-stamped)")
     ap.add_argument("--next", dest="next_", metavar="TEXT",
                     help="set the thread's ▶ next action (inserts if absent)")
+    # ── issues + vault sync ──
+    ap.add_argument("--issues", action="store_true",
+                    help="render open GitHub issues grouped by project "
+                         "(filter with --heydaddy/--mirror/--category)")
+    ap.add_argument("--vault-sync", dest="vault_sync", action="store_true",
+                    help="write threads + issues to the Obsidian vault file")
     args = ap.parse_args(argv)
 
     _wpath = os.path.expanduser(args.file)
@@ -755,6 +955,15 @@ def main(argv: list[str] | None = None) -> int:
         mode = "latex"
 
     path = os.path.expanduser(args.file)
+
+    # issues + vault sync short-circuit the threads render path.
+    if args.vault_sync:
+        return do_vault_sync(path, _selected_projects(args))
+    if args.issues:
+        grouped = collect_issues(_selected_projects(args))
+        print(render_issues_ansi(grouped) if mode == "ansi"
+              else render_issues(grouped, mode))
+        return 0
 
     # Live mode short-circuits the one-shot path (no self-test chatter).
     if args.live:
