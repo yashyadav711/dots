@@ -1,0 +1,210 @@
+" ─────────────────────────────────────────────────────────────
+"  Minimal vim — sane, good-looking, fast. No plugins, no bloat.
+"  Tuned for quick edits in omp's editor mode (Ctrl+E).
+" ─────────────────────────────────────────────────────────────
+
+set nocompatible              " vim, not vi
+filetype plugin indent on     " detect filetype, load indent rules
+syntax enable                 " syntax highlighting
+
+" ── Look ──────────────────────────────────────────────────────
+" Truecolor. Inside tmux (omp Ctrl+E runs here) vim needs t_8f/t_8b explicitly,
+" else `termguicolors` silently no-ops and the NHQ guifg colors never render.
+if has('termguicolors')
+  let &t_8f = "\<Esc>[38;2;%lu;%lu;%lum"
+  let &t_8b = "\<Esc>[48;2;%lu;%lu;%lum"
+  set termguicolors           " true-color (kitty + tmux passthrough)
+endif
+set background=dark
+silent! colorscheme habamax   " base; NHQ overrides below win over it
+
+" ── NHQ 'Warline / Editorial-Modern' theme — red · warm-black · gold · olive ──
+" Canonical palette from vault Design/NHQ Color Palette. No blue, no neon.
+" ink #14130F carbon #1E1D17 slate #2A2820 char #3B392F ash #8C887E
+" stone #BDB8AC bone #ECE7DA | red #C8102E red-bright #E22740 ember #8A0F1E
+" gold #F2B705 gold-bright #FFC836 | olive #7C873E olive-bright #98A451
+" rust #C75B39 plum #8C5B7A
+if has('termguicolors')
+  " -- UI chrome --
+  hi Normal        guifg=#ECE7DA guibg=NONE
+  hi CursorLine    guibg=#1E1D17 cterm=NONE
+  hi CursorLineNr  guifg=#F2B705 guibg=NONE gui=bold
+  hi LineNr        guifg=#3B392F guibg=NONE
+  hi SignColumn    guibg=NONE
+  hi ColorColumn   guibg=#1E1D17
+  hi VertSplit     guifg=#3B392F guibg=NONE
+  hi StatusLine    guifg=#ECE7DA guibg=#2A2820 gui=bold
+  hi StatusLineNC  guifg=#8C887E guibg=#1E1D17 gui=NONE
+  hi Visual        guifg=#ECE7DA guibg=#8A0F1E
+  hi Search        guifg=#14130F guibg=#F2B705
+  hi IncSearch     guifg=#ECE7DA guibg=#E22740
+  hi MatchParen    guifg=#FFC836 guibg=#3B392F gui=bold
+  hi Pmenu         guifg=#BDB8AC guibg=#1E1D17
+  hi PmenuSel      guifg=#14130F guibg=#F2B705 gui=bold
+  hi PmenuSbar     guibg=#2A2820
+  hi PmenuThumb    guibg=#8C887E
+  hi Folded        guifg=#8C887E guibg=#1E1D17
+  hi NonText       guifg=#3B392F
+  hi SpecialKey    guifg=#3B392F
+  hi WildMenu      guifg=#14130F guibg=#F2B705 gui=bold
+  " -- messages / semantics --
+  hi ErrorMsg      guifg=#ECE7DA guibg=#C8102E gui=bold
+  hi WarningMsg    guifg=#F2B705
+  hi Error         guifg=#E22740 guibg=NONE
+  hi Todo          guifg=#14130F guibg=#F2B705 gui=bold
+  " -- syntax (ALL main groups set — no default blue/magenta fallback) --
+  hi Comment       guifg=#8C887E gui=italic
+  hi Constant      guifg=#F2B705
+  hi String        guifg=#98A451
+  hi Character     guifg=#98A451
+  hi Number        guifg=#F2B705
+  hi Boolean       guifg=#F2B705
+  hi Float         guifg=#F2B705
+  hi Identifier    guifg=#BDB8AC gui=NONE
+  hi Function      guifg=#FFC836
+  hi Statement     guifg=#E22740 gui=bold
+  hi Conditional   guifg=#E22740 gui=bold
+  hi Repeat        guifg=#E22740 gui=bold
+  hi Keyword       guifg=#E22740 gui=bold
+  hi Operator      guifg=#BDB8AC
+  hi PreProc       guifg=#C75B39
+  hi Type          guifg=#7C873E
+  hi Special       guifg=#8C5B7A
+  hi Underlined    guifg=#F2B705 gui=underline
+  hi Title         guifg=#C8102E gui=bold
+  " -- markdown (this is a markdown message editor) --
+  hi link markdownH1 Title
+  hi link markdownH2 Title
+  hi link markdownH3 Title
+  hi markdownBold      guifg=#ECE7DA gui=bold
+  hi markdownItalic    guifg=#ECE7DA gui=italic
+  hi markdownCode      guifg=#F2B705 guibg=#1E1D17
+  hi markdownCodeBlock guifg=#F2B705 guibg=#1E1D17
+  hi markdownUrl       guifg=#7C873E gui=underline
+  hi markdownLinkText  guifg=#FFC836
+  hi markdownListMarker guifg=#C8102E gui=bold
+endif
+set number                    " line numbers
+set cursorline                " highlight the current line
+set showcmd                   " show partial commands
+set noshowmode                " statusline already shows mode
+set scrolloff=4               " keep 4 lines of context around cursor
+set laststatus=2              " always show the statusline
+set signcolumn=no             " no empty gutter — keep it clean
+
+" ── Minimal statusline ────────────────────────────────────────
+set statusline=\ %f\ %m%r\ %=\ %y\ \ %l:%c\ \ %p%%\ 
+
+" ── Editing feel ──────────────────────────────────────────────
+set expandtab                 " spaces, not tabs
+set tabstop=4 shiftwidth=4 softtabstop=4
+set autoindent smartindent    " keep/auto indent
+set backspace=indent,eol,start" make backspace behave normally
+set showmatch                 " flash matching bracket
+set wrap linebreak            " soft-wrap on word boundaries
+set mouse=a                   " mouse works (select, scroll, click)
+set encoding=utf-8
+set hidden                    " switch buffers without saving
+
+" ── Search ────────────────────────────────────────────────────
+set incsearch hlsearch        " live + highlighted search
+set ignorecase smartcase      " case-insensitive unless you type a capital
+
+" ── Completion / command UX ───────────────────────────────────
+set wildmenu                  " visual command-line completion
+set wildmode=longest:full,full
+" (system clipboard is handled below via wl-copy — this is a -clipboard vim build)
+
+" ── No clutter on disk (quick edits) ──────────────────────────
+set noswapfile nobackup nowritebackup
+set undofile                  " but keep persistent undo
+silent! call mkdir($HOME . '/.vim/undo', 'p')
+set undodir=~/.vim/undo
+
+" ── Friendly, safe keymaps (Space = leader) ───────────────────
+let mapleader = ' '
+nnoremap <silent> <leader>w :w<CR>          " space-w  save
+nnoremap <silent> <leader>q :q<CR>          " space-q  quit
+nnoremap <silent> <leader>x :x<CR>          " space-x  save & quit
+nnoremap <silent> <leader><Space> :nohlsearch<CR>  " clear search highlight
+nnoremap Y y$                               " Y yanks to end of line (consistent)
+
+" ── Home/End jump to first/last line of the file (Yash's request) ──
+" Normal + visual mode: <Home> → top of file (gg), <End> → bottom (G).
+" Insert mode keeps default start/end-of-line so typing isn't disrupted.
+nnoremap <Home> gg
+nnoremap <End> G
+vnoremap <Home> gg
+vnoremap <End> G
+
+" ── Submit fast: Ctrl+S = save & quit (hands the message back to omp) ──
+" (ZZ does the same natively; Ctrl+S is the familiar 'done' gesture.)
+nnoremap <silent> <C-s> :x<CR>
+inoremap <silent> <C-s> <Esc>:x<CR>
+vnoremap <silent> <C-s> <Esc>:x<CR>
+
+" ── System clipboard via wl-copy/wl-paste (this is a -clipboard vim) ──
+" Every yank (y, yy, Y, visual y) is mirrored to the Wayland clipboard,
+" so visual-mode copy works. Deletes are ignored (only real yanks copy).
+if executable('wl-copy')
+  augroup WlClipboard
+    autocmd!
+    autocmd TextYankPost * if v:event.operator ==# 'y' | call system('wl-copy --trim-newline', getreg(v:event.regname)) | endif
+  augroup END
+endif
+" <leader>p — paste from the system clipboard (Wayland), inline after cursor
+if executable('wl-paste')
+  nnoremap <silent> <leader>p :let @"=system('wl-paste --no-newline')<CR>p
+  vnoremap <silent> <leader>p :<C-u>let @"=system('wl-paste --no-newline')<CR>gvp
+endif
+
+" ── Terminal hygiene: no escape-code leak on exit (omp Ctrl+E) ──
+" This vim is launched by omp's editor mode inside tmux+kitty. vim's
+" terminal-capability probes (Primary DA / cursor-pos) can have their
+" replies arrive AFTER vim exits, dumping a random string like
+" ^[[>0;10502;1c into omp's input. Silence the probes so exit is clean.
+set t_RV=                     " no Primary Device Attributes version query
+set t_u7=                     " no cursor-position probe (ambiguous-width test)
+set t_RB= t_RF=               " no bg/fg colour queries (OSC 11/10)
+set ttyfast                   " assume a fast terminal; skip redraw guards
+
+" ── '/' slash menu — quick markdown insert (plugin-free) ──
+" At line-start in insert mode, '/' shows a one-key menu and inserts the chosen
+" markdown snippet with the cursor pre-placed. Anywhere else '/' is a literal
+" slash (URLs/prose unaffected); normal-mode '/' search is untouched.
+" Keys: 1/2/3 heading · - bullet · [ todo · n numbered · q quote ·
+"       b bold · i italic · c code · l link · h hr · f fence · t table
+function! MdSnip(ch) abort
+  return get({
+    \ '1':"# ", '2':"## ", '3':"### ",
+    \ '-':"- ", '[':"- [ ] ", 'n':"1. ", 'q':"> ",
+    \ 'b':"****\<Left>\<Left>", 'i':"__\<Left>", 'c':"``\<Left>",
+    \ 'l':"[](url)\<Left>\<Left>\<Left>\<Left>\<Left>\<Left>",
+    \ 'h':"---\<CR>", 'f':"```\<CR>\<CR>```\<Up>",
+    \ 't':"|  |  |\<CR>|---|---|\<CR>|  |  |\<Up>\<Up>\<Home>\<Right>",
+    \ }, a:ch, '')
+endfunction
+function! MdSlash() abort
+  if strpart(getline('.'), 0, col('.') - 1) !~# '^\s*$'
+    return '/'
+  endif
+  redraw
+  echohl Question
+  echo '/md  1 2 3 head  - bullet  [ todo  n num  q quote  b bold  i ital  c code  l link  h hr  f fence  t table'
+  echohl None
+  let l:c = getchar()
+  echo ''
+  " special keys (arrows, <BS>, etc.) return a string → cancel silently
+  if type(l:c) != v:t_number
+    return ''
+  endif
+  let l:ch = nr2char(l:c)
+  let l:keys = MdSnip(l:ch)
+  if !empty(l:keys)
+    call feedkeys(l:keys, 'n')
+  elseif l:c >= 0x20 && l:c != 0x7f
+    call feedkeys('/' . l:ch, 'n')
+  endif
+  return ''
+endfunction
+inoremap <silent> / <C-r>=MdSlash()<CR>

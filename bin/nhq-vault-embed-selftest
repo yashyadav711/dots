@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# nhq-vault-embed-selftest — plumbing coverage via the deterministic backend
+# (no Ollama needed). Covers: index, query ranking, status, determinism, score fmt.
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+EMBED="$BIN/nhq-vault-embed"
+
+TMP="$(mktemp -d /tmp/vembed-selftest.XXXX)"
+trap 'rm -rf "$TMP"' EXIT
+
+mkdir -p "$TMP/vault/Notes"
+cat > "$TMP/vault/Notes/alpha.md" <<'EOF'
+# Alpha note about cryptography
+This note discusses cryptography and encryption keys.
+Cryptography uses ciphers and keys to protect secrets.
+EOF
+cat > "$TMP/vault/Notes/beta.md" <<'EOF'
+# Beta note about cooking
+Cooking pasta requires boiling water and salt.
+Italian cuisine favors tomatoes and olive oil.
+EOF
+
+export NHQ_VAULT="$TMP/vault"
+export NHQ_EMBED_BACKEND="deterministic"
+
+pass=0; fail=0
+ck() { # $1=label $2=expected $3=actual
+  if [[ "$2" == "$3" ]]; then pass=$((pass+1)); printf '  ✓ %s\n' "$1"
+  else fail=$((fail+1)); printf '  ✗ %s → expected [%s] got [%s]\n' "$1" "$2" "$3"; fi
+}
+# prints 0 if $1 contains $2, else 1
+has() { grep -q "$2" <<<"$1" && echo 0 || echo 1; }
+
+echo "nhq-vault-embed-selftest"
+
+# --- index ---
+OUT="$("$EMBED" index 2>&1)"; rc=$?
+ck "index exit 0"        0 "$rc"
+ck "index reports chunks" 0 "$(has "$OUT" "indexed")"
+ck "index reports dim"   0 "$(has "$OUT" "dim=")"
+
+# --- status ---
+SOUT="$("$EMBED" status --oneline 2>&1)"; rc=$?
+ck "status --oneline exit 0" 0 "$rc"
+ck "status shows chunks"      0 "$(has "$SOUT" "chunks")"
+
+# --- query ranking: cryptography query must rank alpha above beta ---
+QOUT="$("$EMBED" query "cryptography encryption keys" --k 2 2>&1)"; rc=$?
+ck "query exit 0" 0 "$rc"
+ALPHA_LINE=$(grep -n "alpha.md" <<<"$QOUT" | head -1 | cut -d: -f1)
+BETA_LINE=$(grep -n "beta.md"  <<<"$QOUT" | head -1 | cut -d: -f1)
+if [[ -n "$ALPHA_LINE" && -n "$BETA_LINE" && "$ALPHA_LINE" -lt "$BETA_LINE" ]]; then
+  pass=$((pass+1)); printf '  ✓ query ranks crypto-relevant alpha above beta\n'
+else
+  fail=$((fail+1)); printf '  ✗ query ranking (alpha=%s beta=%s)\n' "$ALPHA_LINE" "$BETA_LINE"
+fi
+
+# --- score format: a signed float leads the result line ---
+ck "score line format" 0 "$(grep -qE '^  [+-][0-9]\.[0-9]{3}  ' <<<"$QOUT" && echo 0 || echo 1)"
+
+# --- determinism: identical query => identical output ---
+Q1="$("$EMBED" query "cryptography" --k 1 2>&1)"
+Q2="$("$EMBED" query "cryptography" --k 1 2>&1)"
+ck "query is deterministic" "$Q1" "$Q2"
+
+# --- excludes honored: a file under .obsidian must NOT be indexed ---
+mkdir -p "$TMP/vault/.obsidian/plugins"
+echo "# hidden plugin config should be excluded" > "$TMP/vault/.obsidian/plugins/x.md"
+"$EMBED" index >/dev/null 2>&1
+QH="$("$EMBED" query "hidden plugin config" --k 5 2>&1)"
+ck ".obsidian excluded" 1 "$(has "$QH" "plugins/x.md")"
+
+echo "──────────────────────────────────────────"
+printf "  %s passed · %s failed\n" "$pass" "$fail"
+[[ "$fail" -eq 0 ]]

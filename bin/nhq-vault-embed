@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""nhq-vault-embed — local semantic-embedding fallback for the nHQ vault.
+
+Second-brain query order: graph (graphify) -> embeddings -> full-read.
+This tool is the embeddings layer. It chunks every markdown note in the vault,
+embeds each chunk with a local model (Ollama nomic-embed-text by default), and
+stores vectors in a SQLite DB so a query finds the most relevant chunks by cosine
+similarity WITHOUT a full read.
+
+graphify's graph is structural (AST/semantic nodes) and does not consume vectors,
+so this is a STANDALONE fallback store, not a graphify plugin.
+
+Backend seam:
+  NHQ_EMBED_BACKEND=ollama       (default) hit the Ollama /api/embed HTTP endpoint.
+  NHQ_EMBED_BACKEND=deterministic pure-stdlib hashing-trick vectors (plumbing tests;
+                                 no model needed; shared tokens => higher cosine).
+
+Usage:
+  nhq-vault-embed index [--vault P] [--batch N] [--backend B] [--model M] [--ollama U]
+  nhq-vault-embed query "<text>" [--vault P] [--k N]
+  nhq-vault-embed status [--vault P] [--oneline]
+  nhq-vault-embed --help
+
+Env: NHQ_VAULT, NHQ_EMBED_MODEL, OLLAMA_URL, NHQ_EMBED_BACKEND.
+"""
+import os
+import re
+import sys
+import math
+import json
+import struct
+import sqlite3
+import hashlib
+import argparse
+import urllib.request
+from pathlib import Path
+from datetime import datetime
+
+DEFAULT_VAULT = "/home/yash/Github/product-manager/Yash's Folder/Obsidian/nHQ"
+DEFAULT_MODEL = os.environ.get("NHQ_EMBED_MODEL", "nomic-embed-text")
+DEFAULT_OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+DEFAULT_BACKEND = os.environ.get("NHQ_EMBED_BACKEND", "ollama")
+EXCLUDE_DIRS = {".obsidian", "graphify-out", "_Read", ".trash", ".git"}
+MAX_CHUNK_CHARS = 2000
+DET_DIM = 256
+
+_HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
+
+
+def vault_path(args_vault):
+    return Path(args_vault or os.environ.get("NHQ_VAULT", DEFAULT_VAULT))
+
+
+def db_path(vault):
+    return vault / "graphify-out" / "embeddings.db"
+
+
+# ---------------- chunking ----------------
+def _split_section(heading, lines):
+    body = "\n".join(lines).strip()
+    if not body:
+        return
+    if len(body) <= MAX_CHUNK_CHARS:
+        yield (heading, body)
+    else:
+        for para in re.split(r"\n\s*\n", body):
+            para = para.strip()
+            if para:
+                yield (heading, para)
+
+
+def chunk_markdown(text):
+    """Yield (heading_context, chunk_text). Splits on headings, then paragraphs."""
+    cur_heading = ""
+    section = []
+    for line in text.splitlines():
+        m = _HEADING.match(line)
+        if m:
+            for h, b in _split_section(cur_heading, section):
+                yield (h, b)
+            section = []
+            cur_heading = m.group(2).strip() or cur_heading
+        else:
+            section.append(line)
+    for h, b in _split_section(cur_heading, section):
+        yield (h, b)
+
+
+def iter_vault_files(vault):
+    for p in sorted(vault.rglob("*.md")):
+        if any(part in EXCLUDE_DIRS for part in p.relative_to(vault).parts):
+            continue
+        yield p
+
+
+# ---------------- embeddings ----------------
+def tokenize(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def deterministic_vector(text, dim=DET_DIM):
+    """Hashing-trick L2-normalized vector: shared tokens => higher cosine."""
+    vec = [0.0] * dim
+    for tok in tokenize(text):
+        h = hashlib.md5(tok.encode()).digest()
+        idx = int.from_bytes(h[:2], "little") % dim
+        sign = 1.0 if (h[2] & 1) == 0 else -1.0
+        vec[idx] += sign
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+def ollama_embed(texts, model, base_url):
+    data = json.dumps({"model": model, "input": texts}).encode()
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/api/embed", data=data,
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        body = json.loads(resp.read())
+    return body["embeddings"]
+
+
+def embed_texts(texts, backend, model, base_url):
+    if not texts:
+        return []
+    if backend == "deterministic":
+        return [deterministic_vector(t) for t in texts]
+    try:
+        return ollama_embed(texts, model, base_url)
+    except Exception as e:
+        print(f"Error: Ollama embed failed ({e}). Is 'ollama serve' running and "
+              f"'{model}' pulled? (set NHQ_EMBED_BACKEND=deterministic for plumbing "
+              f"tests.)", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------- storage ----------------
+def open_db(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS chunks(
+            id INTEGER PRIMARY KEY, path TEXT, heading TEXT,
+            chunk_index INTEGER, text TEXT, mtime REAL);
+        CREATE TABLE IF NOT EXISTS vectors(chunk_id INTEGER PRIMARY KEY, vector BLOB);
+        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, mtime REAL, chunk_count INTEGER);
+    """)
+    return conn
+
+
+def pack_vec(vec):
+    return struct.pack(f"{len(vec)}f", *vec)
+
+
+def unpack_vec(blob):
+    return struct.unpack(f"{len(blob)//4}f", blob)
+
+
+def set_meta(conn, key, value):
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, str(value)))
+
+
+# ---------------- commands ----------------
+def cmd_index(args):
+    vault = vault_path(args.vault)
+    if not vault.exists():
+        print(f"Error: vault not found: {vault}", file=sys.stderr)
+        sys.exit(1)
+    conn = open_db(db_path(vault))
+    rebuild = getattr(args, "rebuild", False)
+    if rebuild:
+        conn.executescript("DELETE FROM chunks; DELETE FROM vectors; DELETE FROM files;")
+    files = list(iter_vault_files(vault))
+    next_id = (conn.execute("SELECT COALESCE(MAX(id),0) FROM chunks").fetchone()[0]) + 1
+    now_paths = set()
+    to_embed = []  # (chunk_id, text) for new/changed chunks only
+    pending_files = []  # (path, mtime, chunk_count) - marked done only AFTER embed
+    conn.execute("BEGIN")
+    try:
+        for f in files:
+            rel = str(f.relative_to(vault))
+            now_paths.add(rel)
+            mtime = f.stat().st_mtime
+            stored = conn.execute("SELECT mtime FROM files WHERE path=?", (rel,)).fetchone()
+            if stored and not rebuild and stored[0] == mtime:
+                continue  # unchanged -> reuse existing vectors
+            conn.execute("DELETE FROM vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE path=?)", (rel,))
+            conn.execute("DELETE FROM chunks WHERE path=?", (rel,))
+            text = f.read_text(encoding="utf-8", errors="replace")
+            cnt = 0
+            for ci, (heading, body) in enumerate(chunk_markdown(text)):
+                conn.execute(
+                    "INSERT INTO chunks(id,path,heading,chunk_index,text,mtime) VALUES(?,?,?,?,?,?)",
+                    (next_id, rel, heading, ci, body[:MAX_CHUNK_CHARS * 4], mtime))
+                to_embed.append((next_id, body))
+                next_id += 1
+                cnt += 1
+            pending_files.append((rel, mtime, cnt))
+        for (rel,) in conn.execute("SELECT path FROM files").fetchall():
+            if rel not in now_paths:
+                conn.execute("DELETE FROM vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE path=?)", (rel,))
+                conn.execute("DELETE FROM chunks WHERE path=?", (rel,))
+                conn.execute("DELETE FROM files WHERE path=?", (rel,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    new = len(to_embed)
+    set_meta(conn, "model", args.model)
+    set_meta(conn, "backend", args.backend)
+    if new == 0:
+        set_meta(conn, "chunk_count", total)
+        set_meta(conn, "last_indexed", datetime.now().isoformat(timespec="seconds"))
+        conn.commit()
+        conn.close()
+        print(f"up to date - {total} chunks across {len(files)} files (0 new/changed)")
+        return
+    dim = 0
+    done = 0
+    print(f"indexing {new} new/changed chunks ({total} total across {len(files)} files)", file=sys.stderr, flush=True)
+    for i in range(0, new, args.batch):
+        br = to_embed[i:i + args.batch]
+        vecs = embed_texts([t for _, t in br], args.backend, args.model, args.ollama)
+        if vecs:
+            dim = len(vecs[0])
+        for (cid_, _), vec in zip(br, vecs):
+            conn.execute("INSERT OR REPLACE INTO vectors(chunk_id,vector) VALUES(?,?)", (cid_, pack_vec(vec)))
+        conn.commit()
+        done += len(br)
+        if done == new or done % 500 < len(br):
+            print(f"  [embed] {done}/{new} chunks (dim={dim})", file=sys.stderr, flush=True)
+    # mark (re)embedded files done ONLY now that their vectors are committed
+    for rel, mtime, cnt in pending_files:
+        conn.execute("INSERT OR REPLACE INTO files(path,mtime,chunk_count) VALUES(?,?,?)", (rel, mtime, cnt))
+    set_meta(conn, "dim", dim)
+    set_meta(conn, "chunk_count", total)
+    set_meta(conn, "last_indexed", datetime.now().isoformat(timespec="seconds"))
+    conn.commit()
+    conn.close()
+    print(f"indexed {new} new/changed chunks ({total} total) across {len(files)} files -> {db_path(vault)}")
+    print(f"backend={args.backend} model={args.model} dim={dim}")
+
+
+def cmd_query(args):
+    vault = vault_path(args.vault)
+    db = db_path(vault)
+    if not db.exists():
+        print(f"Error: no index yet. Run: nhq-vault-embed index", file=sys.stderr)
+        sys.exit(1)
+    conn = open_db(db)
+    qv = embed_texts([args.text], args.backend, args.model, args.ollama)[0]
+    rows = conn.execute(
+        "SELECT v.vector, c.path, c.heading, c.text "
+        "FROM vectors v JOIN chunks c ON c.id = v.chunk_id").fetchall()
+    scored = []
+    for blob, path, heading, text in rows:
+        vec = unpack_vec(blob)
+        score = sum(a * b for a, b in zip(qv, vec))
+        scored.append((score, path, heading, text))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    conn.close()
+    print(f"query: {args.text!r}  (k={args.k}, {len(scored)} chunks)")
+    for score, path, heading, text in scored[:args.k]:
+        snippet = text.replace("\n", " ")[:100]
+        print(f"  {score:+.3f}  {path}  ::  {heading or '(top)'}")
+        print(f"         {snippet}")
+
+
+def cmd_status(args):
+    vault = vault_path(args.vault)
+    db = db_path(vault)
+    if not db.exists():
+        line = "embeddings: not indexed (db missing)"
+        if args.oneline:
+            print(line)
+            return
+        print(line)
+        print("run: nhq-vault-embed index")
+        return
+    conn = open_db(db)
+    meta = dict(conn.execute("SELECT key,value FROM meta").fetchall())
+    count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    conn.close()
+    size = db.stat().st_size
+    line = (f"{count} chunks · dim={meta.get('dim','?')} · backend={meta.get('backend','?')} "
+            f"· model={meta.get('model','?')} · {size//1024}KB · indexed {meta.get('last_indexed','?')}")
+    if args.oneline:
+        print(line)
+        return
+    print(f"nhq-vault-embed status · {vault}")
+    print(f"  {line}")
+    print(f"  db: {db}")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="nhq-vault-embed",
+        description="Local semantic-embedding fallback for the nHQ vault.")
+    sp = p.add_subparsers(dest="command", required=True)
+
+    def common(sx):
+        sx.add_argument("--vault")
+        sx.add_argument("--backend", default=DEFAULT_BACKEND)
+        sx.add_argument("--model", default=DEFAULT_MODEL)
+        sx.add_argument("--ollama", default=DEFAULT_OLLAMA)
+
+    pi = sp.add_parser("index", help="chunk + embed all vault markdown into the SQLite store")
+    pi.add_argument("--batch", type=int, default=32)
+    pi.add_argument("--rebuild", action="store_true", help="force full re-embed of everything")
+    common(pi)
+    pi.set_defaults(func=cmd_index)
+
+    pq = sp.add_parser("query", help="cosine search for text")
+    pq.add_argument("text")
+    pq.add_argument("--k", type=int, default=5)
+    common(pq)
+    pq.set_defaults(func=cmd_query)
+
+    ps = sp.add_parser("status", help="show index state")
+    ps.add_argument("--vault")
+    ps.add_argument("--oneline", action="store_true")
+    ps.set_defaults(func=cmd_status)
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

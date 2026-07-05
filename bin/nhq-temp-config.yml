@@ -1,0 +1,15 @@
+# nhq-temp overlay — routes the omp session to agy Gemini 3.1 Pro High
+#   and routes web search to firecrawl.
+modelRoles:
+  default: agy/gemini-3.1-pro-high
+  slow: agy/gemini-3.1-pro-high
+  plan: agy/gemini-3.1-pro-high
+  task: agy/gemini-3.1-pro-high
+  designer: agy/gemini-3.1-pro-high
+  advisor: agy/gemini-3.1-pro-high
+  smol: agy/gemini-3.1-pro-high
+  commit: agy/gemini-3.1-pro-high
+  title: agy/gemini-3.1-pro-high
+  vision: agy/gemini-3.1-pro-high
+providers:
+  webSearch: firecrawl

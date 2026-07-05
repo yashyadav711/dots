@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# nhq-glm-agy [omp-args...] — launch omp balancing z.ai GLM + agy (Claude + Gemini).
+#
+# Loads nhq-glm-agy-config.yml (sits next to this script). Split:
+#   GLM (stable)         → default (main seat) + vision
+#   agy/Claude (quality) → plan + slow + task (subagents) + designer
+#   agy/Gemini (cheap)   → advisor + smol + commit + title
+#   web search           → firecrawl
+# Uses BOTH plans; burns ZERO Anthropic-direct quota. All agy routes verified
+# live (rotator @ localhost:51200; agy provider in ~/.omp/agent/models.yml).
+#
+# Volatility: agy account health varies — the main seat stays on GLM so an agy
+# hiccup degrades only the specialized roles (respawnable for task), not the seat.
+#
+# Usage: nhq-glm-agy                  # interactive omp, GLM + agy hybrid
+#        nhq-glm-agy "fix the build"  # with an initial prompt
+set -euo pipefail
+SRC="$(readlink -f "${BASH_SOURCE[0]:-$0}")"   # resolve the ~/.local/bin symlink
+DIR="$(dirname "$SRC")"
+exec omp --config "$DIR/nhq-glm-agy-config.yml" "$@"

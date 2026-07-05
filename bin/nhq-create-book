@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+import sys
+import os
+import json
+import subprocess
+from pathlib import Path
+from string import Template
+
+def run_agy(prompt, model="Gemini 3.1 Pro (High)", stream=False):
+    cmd = ["agy", "--model", model, "-p", prompt]
+    if not stream:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"\n❌ Error from agy: {res.stderr}")
+            return ""
+        return res.stdout.strip()
+    else:
+        # Stream output in real time
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        content = []
+        for line in process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            content.append(line)
+        process.wait()
+        return "".join(content)
+
+def get_vault_books_dir():
+    # NHQ Vault path based on context
+    p = Path.home() / "Github" / "product-manager" / "Yash's Folder" / "Obsidian" / "nHQ" / "Books"
+    if not p.exists():
+        p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: nhq-create-book \"<book topic or prompt>\"")
+        sys.exit(1)
+    
+    topic = sys.argv[1]
+    # Defaulting to Gemini 3.1 Pro (High) - huge context, great for books
+    model = "Gemini 3.1 Pro (High)"
+    
+    print(f"\n📚 Generating book structure for: {topic}...")
+    
+    structure_prompt = f"""Write a comprehensive structure, omitting introduction and conclusion sections (forward, author's note, summary), for a book. Only provide up to one level of depth for nested sections. Make clear titles and descriptions that have no overlap with other sections. It is very important that you use the following subject to write the book.
+
+<subject>{topic}</subject>
+
+Write ONLY valid JSON in the exact following format, with no markdown code blocks or extra text:
+{{
+  "Title of Chapter 1": "Description of chapter 1",
+  "Title of Chapter 2": {{
+     "Title of section 2.1": "Description of section 2.1",
+     "Title of section 2.2": "Description of section 2.2"
+  }}
+}}"""
+
+    structure_json_str = run_agy(structure_prompt, model)
+    
+    if structure_json_str.startswith("```json"):
+        structure_json_str = structure_json_str[7:]
+    if structure_json_str.startswith("```"):
+        structure_json_str = structure_json_str[3:]
+    if structure_json_str.endswith("```"):
+        structure_json_str = structure_json_str[:-3]
+        
+    try:
+        structure = json.loads(structure_json_str.strip())
+    except json.JSONDecodeError as e:
+        print(f"\n❌ Failed to parse JSON structure from model:\n{structure_json_str}")
+        sys.exit(1)
+        
+    # Prepare book file
+    safe_title = topic[:30].replace(" ", "_").replace("/", "_").replace("\\", "_")
+    book_file = get_vault_books_dir() / f"{safe_title}.md"
+    
+    with open(book_file, "w") as f:
+        f.write(f"# Book: {topic}\n\n")
+        f.write("---\n*Generated via nhq-create-book (agy / {model})*\n---\n\n")
+        
+    print(f"\n✅ Structure generated! Saving to: {book_file}")
+    
+    def generate_section(section_title, section_desc, heading_level):
+        print(f"\n\n✍️  Writing: {section_title}...")
+        prompt = f"""You are an expert writer. Generate a long, comprehensive, structured chapter for the section provided. 
+Only output the content in markdown. Do NOT output a concluding summary unless explicitly asked.
+
+<section_title>{section_title}</section_title>
+<section_description>{section_desc}</section_description>
+"""
+        with open(book_file, "a") as f:
+            f.write(f"\n{'#' * heading_level} {section_title}\n\n")
+        
+        # We append to the file directly by capturing the stream output
+        # For simplicity, we run non-streaming agy, print it, and write it to the file.
+        content = run_agy(prompt, model, stream=False)
+        print(f"✅ Finished: {section_title} ({len(content.split())} words)")
+        
+        with open(book_file, "a") as f:
+            f.write(f"{content}\n\n")
+
+    # Traverse JSON structure
+    for key, value in structure.items():
+        if isinstance(value, str):
+            # It's a top-level chapter with no sub-sections
+            generate_section(key, value, 2)
+        elif isinstance(value, dict):
+            # It's a chapter with sub-sections
+            print(f"\n\n📖 Chapter: {key}")
+            with open(book_file, "a") as f:
+                f.write(f"\n## {key}\n\n")
+            for sub_key, sub_value in value.items():
+                generate_section(sub_key, sub_value, 3)
+                
+    print(f"\n🎉 Book finished! Saved to: {book_file}")
+
+if __name__ == "__main__":
+    main()

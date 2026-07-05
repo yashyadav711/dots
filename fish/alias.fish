@@ -1,3 +1,6 @@
+# Open omp slash-command definitions for editing
+alias commands="nvim ~/.omp/agent/commands/"
+
 # Navigate quickly to temporary work directory
 alias tmp="cd ~/Documents/tmp"
 

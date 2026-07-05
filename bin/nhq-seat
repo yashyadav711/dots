@@ -17,9 +17,9 @@ CX="$(printf '%s\n' "$U" | awk '/Openai Codex/{f=1; next} /^[A-Za-z].* —|^Zai|
 CL="${CL:-0}"; CX="${CX:-0}"
 
 echo "main-seat usage (max of 5h/weekly):"
-echo "  Anthropic (nhq-omp-claude): ${CL}%"
+echo "  Anthropic (nhq): ${CL}%"
 echo "  Codex     (nhq-omp-codex):  ${CX}%"
 echo "threshold: ${THRESHOLD}%"
-if   (( CL < THRESHOLD )); then echo "REC: STAY on Anthropic (nhq-omp-claude)"
+if   (( CL < THRESHOLD )); then echo "REC: STAY on Anthropic (nhq)"
 elif (( CX < THRESHOLD )); then echo "REC: SWAP to Codex (nhq-omp-codex) — Anthropic >= ${THRESHOLD}%"
 else echo "REC: both seats >= ${THRESHOLD}% — pick the lower, or pause heavy work"; fi

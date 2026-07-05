@@ -1,26 +1,27 @@
-# nhq-glm overlay — routes EVERY omp model role to z.ai (GLM) + web search off Anthropic.
+# nhq-glm overlay — routes the omp session OFF Anthropic entirely:
+#   main/reasoning roles → z.ai GLM · advisor → agy (local rotator) ·
+#   web search → firecrawl. Zero Anthropic Claude quota in any session.
 #
-# Loaded by the nhq-glm launcher via `omp --config <this-file>`. Overrides all
-# 10 modelRoles so a session burns ZERO Anthropic Claude quota (default,
-# subagents/task, plan, slow, designer, advisor, smol, commit, title, vision —
-# all go to z.ai). agy is a separate CLI, not an omp provider, so it is not
-# routable here; use agy directly when its rotator accounts are healthy.
+# advisor uses the agy provider (pi-antigravity-rotator @ localhost:51200,
+# defined in ~/.omp/agent/models.yml, OpenAI-compatible; models auto-discovered
+# from GET /v1/models) → routed as `agy/<model>`. gemini-3.5-flash-medium:
+# same price as the cheapest flash but better judgment for advisory calls, and
+# it draws ZERO z.ai/GLM quota (off BOTH plans). NB: the rotator's CLAUDE
+# accounts are currently exhausted (re-login pending); its Gemini accounts serve.
+# (The agy CLI ≠ the agy rotator-proxy; only the proxy is routable here.)
 #
-# providers.webSearch is moved off Anthropic too — web_search is a server-side
-# tool billed through the Claude API account, so `anthropic` would still draw
-# on the failing account. Routed to firecrawl (FIRECRAWL_API_KEY is in env).
+# providers.webSearch → firecrawl (web_search is server-side, billed through the
+# Claude API account; FIRECRAWL_API_KEY is in env).
 #
-# Model choices (all confirmed live via `omp models`):
-#   glm-5.2   — flagship, 1M context → all text/reasoning roles
-#   glm-4.6v  — vision-capable GLM → the vision role
-# Coding-plan usage is not bound by the z.ai balance-API concurrency table.
+# Models: glm-5.2 (flagship, 1M ctx) → main roles · glm-4.6v → vision ·
+# agy/gemini-3.5-flash-medium → advisor.
 modelRoles:
   default: zai/glm-5.2:high
   slow: zai/glm-5.2:high
   plan: zai/glm-5.2:high
   task: zai/glm-5.2
   designer: zai/glm-5.2
-  advisor: zai/glm-5.2
+  advisor: agy/gemini-3.5-flash-medium
   smol: zai/glm-5.2
   commit: zai/glm-5.2
   title: zai/glm-5.2

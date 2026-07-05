@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""nhq-prep — check and update the graphify spine for a target workspace.
+
+graphify v0.8.44 CLI provides local, keyless structural knowledge. This command
+checks if the graphify-out/ folder is stale relative to the target's source files,
+and rebuilds it if necessary. If the target is 'vault', it also refreshes the Home doc-index.
+
+Usage: nhq-prep <target> [--dry-run]
+       nhq-prep --help
+"""
+import sys
+import subprocess
+import shutil
+from pathlib import Path
+
+TARGETS = {
+    "director": Path.home() / "Github/nhq-agentic-os",
+    "envy": Path.home() / "Github/envy",
+    "heydaddy": Path.home() / "Github/heydaddy",
+    "mirror": Path.home() / "Github/mirror",
+    "vault": Path("/home/yash/Github/product-manager/Yash's Folder/Obsidian/nHQ")
+}
+
+def print_help():
+    print("nhq-prep: check and update the graphify spine for a workspace.")
+    print("Usage: nhq-prep <target> [--dry-run]")
+    print(f"Targets:")
+    for name, path in TARGETS.items():
+        print(f"  {name.ljust(10)} -> {path}")
+    print("\nFlags:")
+    print("  --dry-run  Report staleness, do NOT rebuild.")
+    print("  --help     Show this message.")
+
+def main():
+    args = sys.argv[1:]
+    
+    if not args or "--help" in args or "-h" in args:
+        print_help()
+        sys.exit(0)
+        
+    dry_run = "--dry-run" in args
+    targets_args = [arg for arg in args if not arg.startswith("--")]
+    
+    if not targets_args:
+        print_help()
+        sys.exit(1)
+        
+    target = targets_args[0]
+    
+    if target not in TARGETS:
+        print(f"Error: Unknown target '{target}'. Valid targets: {', '.join(TARGETS.keys())}", file=sys.stderr)
+        sys.exit(1)
+        
+    target_path = TARGETS[target]
+    
+    if not target_path.exists():
+        print(f"Error: Target path does not exist: {target_path}", file=sys.stderr)
+        sys.exit(1)
+        
+    graphify_bin = shutil.which("graphify")
+    if not graphify_bin:
+        # fallback check for ~/.local/bin/graphify just in case it's not in PATH
+        local_bin = Path.home() / ".local/bin/graphify"
+        if local_bin.exists():
+            graphify_bin = str(local_bin)
+        else:
+            print("Error: 'graphify' binary not found in PATH or ~/.local/bin/.", file=sys.stderr)
+            print("Hint: Install graphify (e.g. from ~/.local/bin/graphify).", file=sys.stderr)
+            sys.exit(1)
+
+    # 1. check staleness
+    # check-update returns non-zero if stale
+    # suppress stdout/stderr to be quiet
+    res = subprocess.run(
+        [graphify_bin, "check-update", str(target_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    
+    is_stale = (res.returncode != 0)
+    note = "checked graphify spine"
+
+    if is_stale:
+        if dry_run:
+            status_text = "stale=yes (dry-run, not refreshed)"
+        else:
+            if target == "vault":
+                # markdown vault graph rebuild needs 'graphify extract' (finicky without an LLM
+                # backend; not keyless-cheap). Do NOT auto-rebuild on session-start — the Home
+                # doc-index refresh below is the reliable, keyless freshness the user sees.
+                # Graph rebuild stays manual: graphify extract "<vault>"
+                status_text = "stale=yes (vault graph rebuild is manual: graphify extract)"
+            else:
+                # code repo: update (keyless code AST), then merge into the global graph
+                subprocess.run(
+                    [graphify_bin, "update", str(target_path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                graph_json = target_path / "graphify-out" / "graph.json"
+                update_res = subprocess.run(
+                    [graphify_bin, "global", "add", str(graph_json)],
+                    capture_output=True,
+                    text=True,
+                )
+                status_text = "stale=yes refreshed" if update_res.returncode == 0 else "stale=yes refresh-failed"
+                if update_res.returncode != 0:
+                    note = f"refresh failed: {(update_res.stderr or update_res.stdout).strip().replace('\n', ' ')}"
+    else:
+        status_text = "stale=no"
+        
+    # 3. If target == vault, run nhq-vault-home-index
+    if target == "vault" and not dry_run:
+        nhq_vault_home_index = shutil.which("nhq-vault-home-index")
+        if not nhq_vault_home_index:
+            local_vault_index = Path.home() / ".local/bin/nhq-vault-home-index"
+            if local_vault_index.exists():
+                nhq_vault_home_index = str(local_vault_index)
+                
+        if nhq_vault_home_index:
+            subprocess.run([nhq_vault_home_index], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            note += " + refreshed vault home index"
+        else:
+            note += " (nhq-vault-home-index not found)"
+
+    # 4. vault embeddings-index status (read-only; keyless; runs in dry-run too)
+    if target == "vault":
+        embed_bin = shutil.which("nhq-vault-embed")
+        if embed_bin:
+            e = subprocess.run([embed_bin, "status", "--oneline"],
+                               capture_output=True, text=True)
+            if e.returncode == 0 and e.stdout.strip():
+                note += f" · embed: {e.stdout.strip()}"
+
+    print(f"nhq-prep: {target} · {status_text} · {note}")
+
+if __name__ == "__main__":
+    main()

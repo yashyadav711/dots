@@ -50,6 +50,10 @@ set -x TERM kitty
 # Antigravity CLI — route through rotator proxy
 set -gx AGY_ENDPOINT http://localhost:51200
 
+# omp: disable the desktop-notification subsystem (+ its OSC 99 capability probe
+# that leaked as raw text on vim/editor exit inside tmux). We use nhq-notify instead.
+set -gx PI_NOTIFICATIONS off
+
 # Terminal capabilities
 set TERM "xterm-256color"
 
@@ -228,8 +232,8 @@ alias setupproject='bash -c "$(curl -fsSL https://raw.githubusercontent.com/yash
 
 # jump into HeyDaddy on omp
 alias heydaddy='cd ~/Github/heydaddy && omp --continue'
-# launch Envy in its office (~/Github/envy) on omp — always, regardless of invocation dir
-alias envy='cd ~/Github/envy && omp --continue'
+# launch Envy in its office (~/Github/envy) on omp — bare=new session, --continue=last, --resume=picker
+alias envy='cd ~/Github/envy && omp'
 # jump into Mirror on omp
 alias mirror='cd ~/Github/mirror && omp --continue'
 # jump into Director (nhq-agentic-os) on omp
@@ -269,6 +273,7 @@ alias gemini='agy'
 
 # NHQ startup greeting — fastfetch + git status of all three repos
 function fish_greeting
+    return  # NHQ greeting paused 2026-07-02 (Yash) — delete this line to restore fastfetch + repo status
     fastfetch
     echo ""
 
@@ -317,3 +322,38 @@ end
 # >>> grok installer >>>
 fish_add_path $HOME/.grok/bin
 # <<< grok installer <<<
+
+# ─── NHQ agy fallback launchers (free Opus 4.6 via pi-antigravity-rotator) ───
+# omp with Director seat + plan/slow on free agy Opus, smol on fast Gemini — zero native-Claude quota.
+#   <folder>-agy        = fresh session in that folder
+#   <folder>-agy-resume = continue the last session in that folder
+#   omp-agy / omp-agy-resume = generic, runs in the CURRENT directory (any other folder you use)
+# NOTE: named `omp-agy` (not `agy`) so it never shadows the `agy` Antigravity CLI binary.
+function _agy --description 'omp on free agy Opus; $argv[1]=dir, rest passed to omp'
+    builtin cd $argv[1]
+    and omp --model agy/claude-opus-4-6-thinking --plan agy/claude-opus-4-6-thinking --slow agy/claude-opus-4-6-thinking --smol agy/gemini-3.5-flash-high $argv[2..-1]
+end
+
+function omp-agy        --description 'omp free Opus — current dir';         _agy . $argv; end
+function omp-agy-resume --description 'omp free Opus — current dir, resume'; _agy . --continue $argv; end
+
+function nhq-agy            --description 'Director (nhq-agentic-os) — free Opus';         _agy ~/Github/nhq-agentic-os $argv; end
+function nhq-agy-resume     --description 'Director (nhq-agentic-os) — free Opus, resume'; _agy ~/Github/nhq-agentic-os --continue $argv; end
+function heydaddy-agy        --description 'HeyDaddy — free Opus';         _agy ~/Github/heydaddy $argv; end
+function heydaddy-agy-resume --description 'HeyDaddy — free Opus, resume'; _agy ~/Github/heydaddy --continue $argv; end
+function mirror-agy        --description 'Mirror — free Opus';         _agy ~/Github/mirror $argv; end
+function mirror-agy-resume --description 'Mirror — free Opus, resume'; _agy ~/Github/mirror --continue $argv; end
+function envy-agy        --description 'Envy — free Opus';         _agy ~/Github/envy $argv; end
+function envy-agy-resume --description 'Envy — free Opus, resume'; _agy ~/Github/envy --continue $argv; end
+function heydaddy-design-agy        --description 'HeyDaddy-Design — free Opus';         _agy ~/Github/heydaddy-design $argv; end
+function heydaddy-design-agy-resume --description 'HeyDaddy-Design — free Opus, resume'; _agy ~/Github/heydaddy-design --continue $argv; end
+function mirror-design-agy        --description 'Mirror-Design — free Opus';         _agy ~/Github/mirror-design $argv; end
+function mirror-design-agy-resume --description 'Mirror-Design — free Opus, resume'; _agy ~/Github/mirror-design --continue $argv; end
+function nhq-features-agy        --description 'NHQ-Features — free Opus';         _agy ~/Github/nhq-features $argv; end
+function nhq-features-agy-resume --description 'NHQ-Features — free Opus, resume'; _agy ~/Github/nhq-features --continue $argv; end
+
+# omp-private — ephemeral session: omp's transcript is NOT saved to disk (--no-session).
+# The real "nothing on disk" launcher; pair with the /private or /extra-private posture inside.
+function omp-private --description 'omp ephemeral — no session transcript saved to disk'
+    omp --no-session $argv
+end

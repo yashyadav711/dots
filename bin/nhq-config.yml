@@ -1,4 +1,4 @@
-# nhq-omp-claude overlay — main seat = Anthropic Opus (quality-first), workers = cheap agy pool.
+# nhq overlay — main seat = Anthropic Opus (quality-first), workers = cheap agy pool.
 # Loaded via `omp --config <this-file>` (per-key merge over ~/.omp/agent/config.yml).
 # Seat: anthropic/claude-opus-4-8. Strong-code worker (task/designer): agy/claude-sonnet-4-6.
 # Plan/slow reasoning: agy/claude-opus-4-6-thinking. Cheap roles: agy/gemini-3.5-flash-medium.

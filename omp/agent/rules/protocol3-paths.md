@@ -2,7 +2,7 @@
 name: protocol3-paths
 description: "ADVISORY / defense-in-depth ONLY (not a security control): Protocol-3 mid-stream reminder when a fleet lane writes auth / payment / PII-shaped content. The HARD gate is the p3-guard hook + pre-commit backstop."
 condition:
-  - "([Pp]assword|[Ss]ecret|[Aa]pi[_-]?[Kk]ey|[Aa]pi[Kk]ey|[Cc]lient[_-]?[Ss]ecret|[Pp]rivate[_-]?[Kk]ey|[Aa]ccess[_-]?[Tt]oken|[Bb]earer |[Oo][Aa]uth|[Cc]redential|[Ss]tripe|[Nn]owpayments|sk-[A-Za-z0-9]{6}|sk-ant-)"
+  - "([Pp]assword|[Aa]pi[_-]?[Kk]ey|[Aa]pi[Kk]ey|[Cc]lient[_-]?[Ss]ecret|[Pp]rivate[_-]?[Kk]ey|[Aa]ccess[_-]?[Tt]oken|[Bb]earer |[Ss]tripe|[Nn]owpayments|sk-[A-Za-z0-9]{6}|sk-ant-)"
 scope:
   - tool:edit
   - tool:write

@@ -1,5 +1,5 @@
 # nhq-omp-codex overlay — main seat = Codex GPT-5.x (quality-first), workers = cheap agy pool.
-# Same worker routing as nhq-omp-claude; only the seat (default+vision) differs.
+# Same worker routing as nhq; only the seat (default+vision) differs.
 # Use when Anthropic 5h/weekly is near limit and Codex is the one with headroom.
 modelRoles:
   default: openai-codex/gpt-5.5

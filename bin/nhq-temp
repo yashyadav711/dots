@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# nhq-temp [omp-args...] — launch an isolated local temp session using agy Gemini.
+#
+# Creates and changes directory into the repo's local temp/ folder,
+# then runs omp with the agy Gemini 3.1 Pro High overlay.
+set -euo pipefail
+SRC="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+DIR="$(dirname "$SRC")"
+
+TEMP_DIR="/home/yash/Github/nhq-agentic-os/temp"
+mkdir -p "$TEMP_DIR"
+
+cd "$TEMP_DIR"
+exec omp --config "$DIR/nhq-temp-config.yml" "$@"

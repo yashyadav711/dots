@@ -35,9 +35,13 @@ fi
 
 echo "==> [2/4] Symlink configs"
 link fish/config.fish                 "$HOME/.config/fish/config.fish"
+link fish/alias.fish                  "$HOME/.config/fish/conf.d/alias.fish"
 for f in "$DOTS"/fish/functions/*.fish; do [ -e "$f" ] && link "fish/functions/$(basename "$f")" "$HOME/.config/fish/functions/$(basename "$f")"; done
 for f in "$DOTS"/hypr/*;               do [ -e "$f" ] && link "hypr/$(basename "$f")"             "$HOME/.config/hypr/$(basename "$f")"; done
 link kitty/kitty.conf                 "$HOME/.config/kitty/kitty.conf"
+link vim/vimrc                        "$HOME/.vimrc"
+link nvim                             "$HOME/.config/nvim"   # AstroNvim (full IDE); vim/vi stay minimal
+link rofi/spotlight.rasi                "$HOME/.config/rofi/spotlight.rasi"
 
 echo "==> [3/4] tmux (Oh My Tmux base + custom override)"
 [ -d "$HOME/.tmux" ] || git clone --single-branch https://github.com/gpakosz/.tmux.git "$HOME/.tmux"
@@ -51,7 +55,7 @@ link bin/agy-usage      "$HOME/.local/bin/agy-usage"
 # NOTE: nhq-lib.sh, fleet-registry.json, p3-paths.json, routing-policy.json are NOT
 # linked — the scripts resolve them as siblings in dots/bin via `readlink -f`, so
 # they must stay beside the binaries.
-for cmd in nhq-agent-name nhq-await nhq-blocked nhq-cost nhq-done nhq-fleet \
+for cmd in nhq nhq-agent-name nhq-await nhq-blocked nhq-cost nhq-done nhq-fleet \
            nhq-fleet-selftest nhq-kill nhq-meta nhq-notify nhq-reap nhq-spawn \
            nhq-status nhq-tell nhq-warden \
            nhq-audit nhq-audit-verify nhq-ctx nhq-econ nhq-handoff nhq-p3-guard \
