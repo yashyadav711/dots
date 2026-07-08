@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# nhq-lane — conflict-safe parallel "upgrade lanes" for omp/Director sessions.
+#
+# During an omp self-improvement (omp-upgrade) sweep you want to run several
+# Director sessions against the nhq-agentic-os config repo AT ONCE without them
+# clobbering each other's files. Each "lane" is its own git worktree + branch,
+# so parallel sessions are fully isolated on disk and in git.
+#
+# A thin, reversible git-worktree wrapper — no frameworks. Everything it does is
+# `git worktree add/remove` + branch create/merge; nothing destructive runs
+# without a guard. It is invoked from fish, but THIS shebang (bash) governs the
+# script's own syntax.
+#
+# Layout (all siblings under ~/Github):
+#   REPO_ROOT             ~/Github/nhq-agentic-os     the config repo (resolved,
+#                                                     never assumed from cwd)
+#   lane worktree         ~/Github/nhq-upg-<name>     on branch  upg/<name>
+#   integration worktree  ~/Github/nhq-upg-main       on branch  upg/main
+#
+# Commands:
+#   nhq-lane <name> [base]   create (or attach) lane <name> off <base>
+#                            (default: current HEAD of REPO_ROOT), seed the
+#                            per-lane handoff note, cd into it and `exec omp`.
+#   nhq-lane --list | -l     list active upgrade lanes: branch · short-SHA · path
+#   nhq-lane --done <name>   merge upg/<name> into the upg/main integration
+#                            branch (--no-edit); on success remove the lane
+#                            worktree. On conflict: STOP, name the files, leave
+#                            everything in place for manual resolution.
+#   nhq-lane --help | -h     this usage.
+#
+# Test seams (env overrides, default to real behaviour):
+#   NHQ_LANE_REPO   REPO_ROOT override        (default ~/Github/nhq-agentic-os)
+#   NHQ_LANE_EXEC   what to exec after cd     (default: omp)
+
+set -euo pipefail
+
+REPO_ROOT="${NHQ_LANE_REPO:-$HOME/Github/nhq-agentic-os}"
+WT_PREFIX="$HOME/Github/nhq-upg-"     # lane dirs: <prefix><name>
+INT_NAME="main"                       # integration lane -> upg/main, nhq-upg-main
+INT_BRANCH="upg/main"
+INT_DIR="${WT_PREFIX}${INT_NAME}"
+LAUNCH="${NHQ_LANE_EXEC:-omp}"        # exec target after cd (overridable for tests)
+
+die()  { printf 'nhq-lane: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*"; }
+
+# Every REPO_ROOT git call targets the repo explicitly, so cwd is irrelevant.
+git_root() { git -C "$REPO_ROOT" "$@"; }
+
+usage() {
+  cat <<'EOF'
+nhq-lane — conflict-safe parallel upgrade lanes (git worktree + branch per lane)
+
+  nhq-lane <name> [base]   create/attach lane <name> off <base>
+                           (default: current HEAD of ~/Github/nhq-agentic-os),
+                           seed ai/session-handoff-<name>.md, then cd + exec omp
+  nhq-lane --list | -l     list active lanes: branch · short-SHA · path
+  nhq-lane --done <name>   merge upg/<name> -> upg/main (--no-edit), then remove
+                           the lane worktree; on conflict, stop and name files
+  nhq-lane --help | -h     show this help
+
+Layout:
+  lane worktree   ~/Github/nhq-upg-<name>   on branch  upg/<name>
+  integration     ~/Github/nhq-upg-main     on branch  upg/main
+EOF
+}
+
+# Guard the <name> arg: it becomes a branch (upg/<name>) and a dir (nhq-upg-<name>).
+valid_name() {
+  local n="$1"
+  [[ "$n" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid lane name '$n' (use letters, digits, . _ -)"
+  [[ "$n" == "$INT_NAME" ]] && die "'$INT_NAME' is reserved for the upg/main integration lane"
+  return 0
+}
+
+lane_branch() { printf 'upg/%s' "$1"; }
+lane_dir()    { printf '%s%s' "$WT_PREFIX" "$1"; }
+
+branch_exists() { git_root show-ref --verify --quiet "refs/heads/$1"; }
+
+# Is <dir> a registered worktree of REPO_ROOT?
+worktree_registered() {
+  local target="$1" line
+  while IFS= read -r line; do
+    [[ "$line" == "worktree $target" ]] && return 0
+  done < <(git_root worktree list --porcelain)
+  return 1
+}
+
+# Drop the per-lane handoff note into a fresh worktree and mark it git-ignored.
+# The file is IGNORED on purpose: (1) its name (session-handoff-*.md) trips the
+# repo's P3 commit guard on the `session*.*` glob, so it must never be staged;
+# (2) keeping it out of git leaves each lane's real upgrade diff clean; (3) an
+# ignored file does not block `git worktree remove`, so --done stays clean.
+seed_lane() {
+  local name="$1" dir="$2" base_ref="$3" rel="ai/session-handoff-$1.md" excl
+  mkdir -p "$dir/ai"
+  cat > "$dir/$rel" <<EOF
+# Upgrade Lane — $name
+
+This is omp-upgrade lane **$name** — branch \`$(lane_branch "$name")\`, worktree
+\`$dir\`. One of several parallel self-improvement lanes on nhq-agentic-os.
+
+## File-partition convention (READ FIRST)
+- Each lane edits ONLY its own owned rule files. Do NOT touch files another lane owns.
+- **CLAUDE.md is lead-only** — never edit it inside a lane; the lead session integrates it.
+- Commit your work on this branch. When the lane is done, run:
+      nhq-lane --done $name
+  to merge it into the \`$INT_BRANCH\` integration branch.
+
+_Created $(date +%F) · base $(git_root rev-parse --short "$base_ref" 2>/dev/null || echo "$base_ref") · this note is git-ignored scaffolding._
+EOF
+  # Mark ignored via the worktree's info/exclude (shared common dir; one exact line).
+  excl="$(git -C "$dir" rev-parse --git-path info/exclude)"
+  mkdir -p "$(dirname "$excl")"
+  grep -qxF "$rel" "$excl" 2>/dev/null || printf '%s\n' "$rel" >> "$excl"
+}
+
+# cd into the lane and hand off to omp (or the test override). Uses exec: this
+# process becomes the session.
+enter_lane() {
+  local dir="$1"
+  [[ -d "$dir" ]] || die "lane dir '$dir' is missing (try: git -C '$REPO_ROOT' worktree prune)"
+  cd "$dir"
+  exec "$LAUNCH"
+}
+
+cmd_create() {
+  local name="$1" base="${2:-}"
+  valid_name "$name"
+  local branch dir; branch="$(lane_branch "$name")"; dir="$(lane_dir "$name")"
+
+  if worktree_registered "$dir"; then
+    note "→ attaching to existing lane '$name' ($branch)"
+    enter_lane "$dir"
+  elif branch_exists "$branch"; then
+    # Branch survives after --done removes its worktree; re-materialise on disk.
+    note "→ re-materialising lane '$name' from existing branch $branch"
+    git_root worktree add "$dir" "$branch" >/dev/null
+    seed_lane "$name" "$dir" "$branch"
+    enter_lane "$dir"
+  else
+    local base_ref; base_ref="${base:-$(git_root rev-parse HEAD)}"
+    git_root rev-parse --verify --quiet "$base_ref^{commit}" >/dev/null \
+      || die "base '$base_ref' is not a valid commit-ish in $REPO_ROOT"
+    note "→ creating lane '$name' ($branch) off $(git_root rev-parse --short "$base_ref")"
+    git_root worktree add -b "$branch" "$dir" "$base_ref" >/dev/null
+    seed_lane "$name" "$dir" "$base_ref"
+    enter_lane "$dir"
+  fi
+}
+
+cmd_list() {
+  local out
+  out="$(git_root worktree list --porcelain | awk '
+    /^worktree /   { path=substr($0,10) }
+    /^HEAD /       { sha=substr($0,6) }
+    /^branch /     { br=substr($0,8) }
+    /^detached$/   { br="" }
+    /^$/           { emit() }
+    END            { emit() }
+    function emit(   name,b,isupg) {
+      if (path=="") return
+      name=path; sub(/.*\//,"",name)
+      isupg = (br ~ /^refs\/heads\/upg\//) || (name ~ /^nhq-upg-/)
+      if (isupg) {
+        b=br; sub(/^refs\/heads\//,"",b); if (b=="") b="(detached)"
+        printf "%-16s %-9s %s\n", b, substr(sha,1,8), path
+      }
+      path=""; sha=""; br=""
+    }')"
+  if [[ -z "$out" ]]; then
+    note "no active upgrade lanes."
+    return 0
+  fi
+  printf '%-16s %-9s %s\n' "BRANCH" "SHA" "PATH"
+  printf '%s\n' "$out"
+}
+
+cmd_done() {
+  local name="$1"
+  [[ -n "$name" ]] || die "usage: nhq-lane --done <name>"
+  valid_name "$name"
+  local branch dir; branch="$(lane_branch "$name")"; dir="$(lane_dir "$name")"
+  branch_exists "$branch" || die "no lane branch '$branch' to finish"
+
+  # Lazily create the upg/main integration worktree off REPO_ROOT's HEAD (the base).
+  if ! worktree_registered "$INT_DIR"; then
+    if branch_exists "$INT_BRANCH"; then
+      note "→ attaching integration worktree for $INT_BRANCH"
+      git_root worktree add "$INT_DIR" "$INT_BRANCH" >/dev/null
+    else
+      local base_ref; base_ref="$(git_root rev-parse HEAD)"
+      note "→ creating integration branch $INT_BRANCH off $(git_root rev-parse --short "$base_ref")"
+      git_root worktree add -b "$INT_BRANCH" "$INT_DIR" "$base_ref" >/dev/null
+    fi
+  fi
+
+  note "→ merging $branch into $INT_BRANCH (--no-edit)"
+  local merge_out
+  if merge_out="$(git -C "$INT_DIR" merge --no-edit "$branch" 2>&1)"; then
+    printf '%s\n' "$merge_out"
+    # Merge landed — remove the lane worktree WITHOUT --force so any real
+    # uncommitted work in the lane is protected (only the ignored seed is gone).
+    if git_root worktree remove "$dir" 2>/dev/null; then
+      note "✅ $branch merged into $INT_BRANCH; lane worktree removed (branch $branch retained)."
+    else
+      note "✅ $branch merged into $INT_BRANCH, but '$dir' has uncommitted/untracked work — left in place."
+      note "   Save what you need, then: git -C '$REPO_ROOT' worktree remove --force '$dir'"
+    fi
+  else
+    local conflicts
+    conflicts="$(git -C "$INT_DIR" diff --name-only --diff-filter=U 2>/dev/null || true)"
+    if [[ -n "$conflicts" ]]; then
+      note "⛔ MERGE CONFLICT integrating $branch into $INT_BRANCH — nothing removed, everything left in place."
+      note "   Conflicting files (resolve in $INT_DIR):"
+      printf '     %s\n' $conflicts
+      note "   Then:  git -C '$INT_DIR' add <files> && git -C '$INT_DIR' commit --no-edit"
+      note "   Or back out:  git -C '$INT_DIR' merge --abort"
+    else
+      note "⛔ merge failed (not a conflict) — nothing removed:"
+      printf '%s\n' "$merge_out"
+    fi
+    exit 1
+  fi
+}
+
+main() {
+  local arg="${1:-}"
+  case "$arg" in
+    ""|-h|--help) usage ;;
+    -l|--list)    cmd_list ;;
+    --done)       shift; cmd_done "${1:-}" ;;
+    -*)           die "unknown option '$arg' (try --help)" ;;
+    *)            cmd_create "$@" ;;
+  esac
+}
+
+main "$@"
