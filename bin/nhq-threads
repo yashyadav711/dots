@@ -46,6 +46,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -281,7 +282,7 @@ def _who(t: dict) -> str:
 
 def _action(t: dict) -> str:
     if t.get("next"):
-        return _truncate(t["next"], 40)
+        return t["next"].strip()
     return ACTION_BY_STATUS.get(t["emoji"], "—")
 
 
@@ -389,6 +390,26 @@ def _pad(text: str, width: int) -> str:
     return text + " " * max(0, width - n)
 
 
+def _ansi_layout() -> tuple[int, int, int]:
+    """Return (terminal_cols, thread_name_width, thread_action_width) for ANSI mode.
+
+    The old fixed widths (46/30) chopped rows even in wide tmux panes. Use the
+    real terminal width when available; fall back to 120 columns when piped or
+    detached. Keep conservative mins so narrow panes still render sanely.
+    """
+    cols = shutil.get_terminal_size((120, 24)).columns
+    budget = max(52, cols - 23)  # row overhead outside name/action columns
+    action_w = max(22, min(72, int(budget * 0.35)))
+    name_w = max(28, budget - action_w)
+    return cols, name_w, action_w
+
+
+def _issue_title_width() -> int:
+    cols = shutil.get_terminal_size((120, 24)).columns
+    # room for indent + issue number + a healthy label tail
+    return max(32, min(120, cols - 34))
+
+
 def _ansi_cat_banner(cat: str) -> str:
     theme = CAT_THEME.get(cat)
     if theme is None:
@@ -400,17 +421,17 @@ def _ansi_cat_banner(cat: str) -> str:
             f"\033[38;2;{r};{g};{b}m  {bar} {label}{_ANSI_RESET}")
 
 
-def _ansi_row(t: dict, grouped: bool = False) -> str:
+def _ansi_row(t: dict, grouped: bool = False, *, name_w: int, action_w: int) -> str:
     tid = _color(_pad(t["id"], 5), "#F2B705", "ansi", bold=True)
-    name = _truncate(t["name"], 46)
+    name = _truncate(t["name"], name_w)
     who = _who(t)
     who_str = _color(_WHO_NAME.get(who, who), WHO_COLOR.get(who, "#BDB8AC"), "ansi")
-    action = _ANSI_DIM + _truncate(_action(t), 30) + _ANSI_RESET
+    action = _ANSI_DIM + _truncate(_action(t), action_w) + _ANSI_RESET
     if grouped:
         # emoji lives in the status sub-header; drop it here → shorter row, deeper indent.
-        return f"     {tid} {_pad(name, 46)} {action} · {who_str}"
+        return f"     {tid} {_pad(name, name_w)} {action} · {who_str}"
     emo = t["emoji"] or " "
-    return f"   {tid} {emo}  {_pad(name, 46)} {action} · {who_str}"
+    return f"   {tid} {emo}  {_pad(name, name_w)} {action} · {who_str}"
 
 
 def _status_subgroups(items: list[dict]) -> list[tuple[str, str, list[dict]]]:
@@ -433,6 +454,11 @@ def _ansi_status_subheader(emo: str, label: str, n: int) -> str:
 
 
 def render_ansi(shown: list[dict]) -> str:
+    cols, _name_w0, _action_w0 = _ansi_layout()
+    budget = max(52, cols - 23)
+    longest_name = max((len(t["name"].strip()) for t in shown), default=28) + 2
+    name_w = min(max(28, longest_name), max(28, int(budget * 0.55)))
+    action_w = max(22, budget - name_w)
     lines = [_color(_ANSI_BOLD + _header_line(shown) + _ANSI_RESET, "#ECE7DA", "ansi")]
     lines.append("")
     for c, items in _group(shown):
@@ -440,7 +466,7 @@ def render_ansi(shown: list[dict]) -> str:
         for emo, label, group in _status_subgroups(items):
             lines.append(_ansi_status_subheader(emo, label, len(group)))
             for t in group:
-                lines.append(_ansi_row(t, grouped=True))
+                lines.append(_ansi_row(t, grouped=True, name_w=name_w, action_w=action_w))
         lines.append("")
     return "\n".join(lines)
 
@@ -808,6 +834,7 @@ def render_issues_ansi(grouped) -> str:
     total = sum(len(i) for _, _, i in grouped if isinstance(i, list))
     head = _color(_ANSI_BOLD + f"🐛 OPEN ISSUES · {total} open" + _ANSI_RESET,
                   "#ECE7DA", "ansi")
+    title_w = _issue_title_width()
     lines = [head, ""]
     for proj, repo, iss in grouped:
         theme = CAT_THEME.get(proj.upper())
@@ -821,10 +848,10 @@ def render_issues_ansi(grouped) -> str:
             for it in iss:
                 num = _color(_pad(f"#{it.get('number', '')}", 5),
                              "#F2B705", "ansi", bold=True)
-                title = _truncate(it.get("title", ""), 52)
+                title = _truncate(it.get("title", ""), title_w)
                 labels = _issue_labels(it)
                 lab = _ANSI_DIM + (f"[{labels}]" if labels else "") + _ANSI_RESET
-                lines.append(f"     {num} {_pad(title, 52)} {lab}")
+                lines.append(f"     {num} {_pad(title, title_w)} {lab}")
         lines.append("")
     return "\n".join(lines)
 

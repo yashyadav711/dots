@@ -84,6 +84,7 @@ galculator
 garcon
 git
 github-cli
+github-desktop
 glances
 glow
 gnome-text-editor
@@ -123,6 +124,7 @@ kde-cli-tools
 kitty
 kvantum
 kvantum-qt5
+lazygit
 less
 lib32-mesa
 lib32-opencl-mesa
@@ -230,6 +232,7 @@ sudo
 syncthing
 sysfsutils
 texinfo
+termdown
 thunar
 thunar-archive-plugin
 thunar-media-tags-plugin

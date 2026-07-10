@@ -38,6 +38,7 @@ link fish/config.fish                 "$HOME/.config/fish/config.fish"
 link fish/alias.fish                  "$HOME/.config/fish/conf.d/alias.fish"
 for f in "$DOTS"/fish/functions/*.fish; do [ -e "$f" ] && link "fish/functions/$(basename "$f")" "$HOME/.config/fish/functions/$(basename "$f")"; done
 for f in "$DOTS"/hypr/*;               do [ -e "$f" ] && link "hypr/$(basename "$f")"             "$HOME/.config/hypr/$(basename "$f")"; done
+link gtk-3.0/settings.ini               "$HOME/.config/gtk-3.0/settings.ini"
 link kitty/kitty.conf                 "$HOME/.config/kitty/kitty.conf"
 link vim/vimrc                        "$HOME/.vimrc"
 link nvim                             "$HOME/.config/nvim"   # AstroNvim (full IDE); vim/vi stay minimal

@@ -286,6 +286,7 @@ alias ip="ip -color"            # Colored IP output
 alias iso="cat /etc/dev-rel | awk -F '=' '/ISO/ {print $2}'"
 alias isoo="cat /etc/dev-rel"
 alias merge="xrdb -merge ~/.Xresources"
+alias stopwatch="~/.local/bin/stopwatch"  # Terminal stopwatch (lap/quit keys)
 
 # Process monitoring, sorting, reboot/shutdown
 alias psa="ps auxf"
