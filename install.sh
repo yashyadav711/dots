@@ -80,9 +80,9 @@ cat <<'NOTE'
   • Secrets — recreate, NOT in this public repo:
         ~/.config/fish/private.fish   (API keys; auto-sourced by config.fish)
   • BT brain (PRIVATE repo):
-        git clone git@github.com:yashyadav711/home-bt ~/Github/home-bt
-        ln -s ~/Github/home-bt/CLAUDE.md ~/CLAUDE.md
-        mkdir -p ~/.claude && ln -s ~/Github/home-bt/store ~/.claude/bt
+        git clone git@github.com:yashyadav711/envy ~/Github/envy
+        ln -s ~/Github/envy/CLAUDE.md ~/CLAUDE.md
+        mkdir -p ~/.claude && ln -sfn ~/Github/envy/store ~/.claude/envy
   • AppImages (~/Applications/): see packages/appimage.txt — download each and chmod +x.
         Desktop entries live in dots/appimage/ — link: ln -sfn $DOTS/appimage/kun.desktop ~/.local/share/applications/kun.desktop
   • Log out / reboot to apply Hyprland + shell changes.
