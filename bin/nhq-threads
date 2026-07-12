@@ -90,7 +90,7 @@ STATUS_KEYS = sorted(STATUS, key=len, reverse=True)
 
 # Recognised category headers (bare ALL-CAPS lines inside the tree).  WORK is a
 # parent group with no direct threads; its children are the real buckets.
-CATEGORIES = {"WORK", "HEYDADDY", "MIRROR", "FIRSTSTONE", "JULIAN", "OPS", "OFF-WORK"}
+CATEGORIES = {"WORK", "HEYDADDY", "HEYDADDY-ENGINE", "MIRROR", "FIRSTSTONE", "JULIAN", "OPS", "OFF-WORK"}
 
 # Who is on the hook, derived from the status emoji (everything else -> Director).
 WHO_BY_STATUS = {"🔴": "Yash", "⏳": "Julian/ext", "✅": "Yash"}
@@ -476,6 +476,7 @@ def render_ansi(shown: list[dict]) -> str:
 # Map of --category shorthand flags to canonical category names.
 _CAT_FLAGS = {
     "heydaddy": "HEYDADDY",
+    "engine": "HEYDADDY-ENGINE",
     "mirror": "MIRROR",
     "ops": "OPS",
     "julian": "JULIAN",
