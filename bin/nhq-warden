@@ -308,14 +308,13 @@ def check_all() -> None:
     if z >= ZOMBIE_WARN:
         _zombie_consecutive += 1
         if _zombie_consecutive >= 2:
-            # Desktop-nag only on a genuinely NEW problem: a FOREIGN (non-omp) zombie,
-            # or the FIRST time we cross the threshold. A growing/stable ALL-OMP set is
-            # the same diagnosed-benign condition (omp not reaping its own children —
-            # see envy store/LOG.md 2026-06-26) — keep DETECTING (log) but don't re-nag
-            # the desktop as omp leaks each new worker. Foreign leaks always alert.
             grew = not (zpids <= _zombie_alerted)
-            first_cross = (len(_zombie_alerted) == 0)
-            new_leak = (foreign and grew) or first_cross or (z >= ZOMBIE_RUNAWAY and grew)
+            # Desktop-nag ONLY for genuinely actionable problems: a FOREIGN (non-omp)
+            # zombie leak, or a runaway PID-table risk (>= ZOMBIE_RUNAWAY). A benign
+            # all-omp set (omp not reaping its own xdg-open/tokio/python children —
+            # diagnosed harmless) is LOGGED but NEVER nags the desktop, even on first
+            # cross or as it grows. "If it's harmless, it shouldn't notify."
+            new_leak = (foreign and (grew or len(_zombie_alerted) == 0)) or (z >= ZOMBIE_RUNAWAY and grew)
             runaway = (not foreign) and z >= ZOMBIE_RUNAWAY
             body = (f"{z} zombie processes detected (sustained {_zombie_consecutive} checks)"
                     + (" — ⚠ RUNAWAY all-omp leak (omp not reaping; PID-table risk)" if runaway
