@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""nhq-okf — script-first Open Knowledge Format (OKF v0.1) generator + validator.
+
+Turns a repo into an OKF *knowledge layer* bundle (`<repo>/okf/`): a curated,
+agent-readable set of markdown concepts with YAML frontmatter that describe what
+the repo IS and KNOWS, each `resource:`-pointing at the live code/doc (thin, no
+duplication — the anti-staleness steal from the OKF spec). Deterministic: code
+does the scaffold, an agent can enrich bodies later.
+
+Layers per repo (graphify-parallel, driven by the same nhq-prep pipeline):
+  - graphify-out/graph.json  -> STRUCTURAL code graph (how code is wired)
+  - okf/                     -> DECLARATIVE knowledge (what it does / why)
+
+Bundle shape (OKF v0.1 conformant):
+  okf/
+  ├── index.md                 (root; okf_version: "0.1")
+  ├── components/index.md      + one concept per top-level src/ module
+  ├── references/index.md      + one concept per curated doc (spec/reference)
+  ├── playbooks/index.md       + one concept per runbook/playbook/go-live doc
+  └── decisions/index.md       + one concept per decision/audit doc
+
+Usage:
+  nhq-okf build <repo>       generate/refresh <repo>/okf/
+  nhq-okf validate <repo>    OKF v0.1 conformance (3 rules)
+  nhq-okf --help
+
+Conformance (v0.1): every non-reserved .md has parseable YAML frontmatter with a
+non-empty `type`; reserved files (index.md, log.md) are exempt.
+"""
+import os
+import re
+import sys
+import ast
+import argparse
+from pathlib import Path
+from datetime import datetime, timezone
+
+OKF_VERSION = "0.1"
+SRC_DIRS = ("src", "backend", "app", "lib")           # where code modules live
+SKIP_MODULE = {"__pycache__", "mirror.egg-info", "__init__.py", "node_modules",
+               ".egg-info", "tests", "test"}
+# doc classification by filename keyword -> (subdir, type)
+DOC_RULES = [
+    (r"runbook|go-?live|provision|playbook|quickstart", ("playbooks", "Playbook")),
+    (r"decision|audit|isolation|pending|adr", ("decisions", "Decision")),
+    (r"spec|stack|prefs|context|product|blueprint|changelog|readme|backlog|status|progress|plan|resume|gaps|verification|notes", ("references", "Reference")),
+]
+
+
+def now_iso():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def slug(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def titleize(name):
+    return re.sub(r"[-_]+", " ", name).strip().title()
+
+
+def first_docstring(pyfile):
+    try:
+        mod = ast.parse(pyfile.read_text(encoding="utf-8", errors="replace"))
+        d = ast.get_docstring(mod)
+        if d:
+            return " ".join(d.strip().splitlines()[0:1]).strip()
+    except Exception:
+        pass
+    return None
+
+
+def module_description(mod_dir: Path):
+    """Best-effort one-liner for a src module dir."""
+    init = mod_dir / "__init__.py"
+    if init.exists():
+        d = first_docstring(init)
+        if d:
+            return d
+    # fall back to first .py file with a docstring
+    for py in sorted(mod_dir.glob("*.py")):
+        d = first_docstring(py)
+        if d:
+            return d
+    return f"{titleize(mod_dir.name)} module."
+
+
+def doc_summary(md: Path):
+    """First heading or first non-empty prose line of a markdown doc."""
+    fm = False
+    for line in md.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if s == "---":
+            fm = not fm
+            continue
+        if fm or not s:
+            continue
+        s = re.sub(r"^#+\s*", "", s)
+        s = re.sub(r"[*_`>]", "", s).strip()
+        if s:
+            return s[:160]
+    return f"{titleize(md.stem)} document."
+
+
+def fm_block(fields: dict) -> str:
+    lines = ["---"]
+    for k, v in fields.items():
+        if v is None:
+            continue
+        if isinstance(v, list):
+            lines.append(f"{k}: [{', '.join(v)}]")
+        else:
+            lines.append(f"{k}: {v}")
+    lines.append("---")
+    return "\n".join(lines)
+
+
+def write_concept(path: Path, fields: dict, body: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(fm_block(fields) + "\n\n" + body.rstrip() + "\n", encoding="utf-8")
+
+
+def write_index(path: Path, heading: str, entries, root=False):
+    """entries: list of (title, rel_url, desc)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out = []
+    if root:
+        out += ["---", f'okf_version: "{OKF_VERSION}"', "---", ""]
+    out.append(f"# {heading}")
+    out.append("")
+    for title, url, desc in entries:
+        d = f" - {desc}" if desc else ""
+        out.append(f"* [{title}]({url}){d}")
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def find_src_root(repo: Path):
+    for d in SRC_DIRS:
+        if (repo / d).is_dir():
+            return repo / d
+    return None
+
+
+def cmd_build(repo: Path):
+    okf = repo / "okf"
+    okf.mkdir(exist_ok=True)
+    ts = now_iso()
+    section_index = {"components": [], "references": [], "playbooks": [], "decisions": []}
+
+    # ---- 1. code modules -> components/ ----
+    src = find_src_root(repo)
+    comp_count = 0
+    if src:
+        for mod in sorted(src.iterdir()):
+            if not mod.is_dir() or mod.name in SKIP_MODULE or mod.name.startswith("."):
+                continue
+            desc = module_description(mod)
+            title = titleize(mod.name)
+            rel_resource = str(mod.relative_to(repo))
+            cpath = okf / "components" / f"{slug(mod.name)}.md"
+            body = (f"# Overview\n\n{desc}\n\n"
+                    f"See the live code at `{rel_resource}/` "
+                    f"([resource]({os.path.relpath(mod, cpath.parent)})).\n")
+            write_concept(cpath, {
+                "type": "Component", "title": title, "description": desc,
+                "resource": rel_resource, "tags": [slug(mod.name), "code"],
+                "timestamp": ts,
+            }, body)
+            section_index["components"].append((title, f"{slug(mod.name)}.md", desc))
+            comp_count += 1
+
+    # ---- 2. curated docs -> references/ playbooks/ decisions/ ----
+    doc_dirs = [repo, repo / "ai", repo / "docs"]
+    seen = set()
+    doc_count = 0
+    for dd in doc_dirs:
+        if not dd.is_dir():
+            continue
+        for md in sorted(dd.glob("*.md")):
+            if md.resolve() in seen or "okf" in md.parts:
+                continue
+            seen.add(md.resolve())
+            name = md.stem
+            low = name.lower()
+            subdir, ctype = "references", "Reference"
+            for pat, (sd, ct) in DOC_RULES:
+                if re.search(pat, low):
+                    subdir, ctype = sd, ct
+                    break
+            desc = doc_summary(md)
+            title = titleize(name)
+            rel_resource = str(md.relative_to(repo))
+            cpath = okf / subdir / f"{slug(name)}.md"
+            body = (f"# Summary\n\n{desc}\n\n"
+                    f"Full document: `{rel_resource}` "
+                    f"([resource]({os.path.relpath(md, cpath.parent)})).\n")
+            write_concept(cpath, {
+                "type": ctype, "title": title, "description": desc,
+                "resource": rel_resource, "tags": [subdir, "doc"],
+                "timestamp": ts,
+            }, body)
+            section_index[subdir].append((title, f"{slug(name)}.md", desc))
+            doc_count += 1
+
+    # ---- 3. per-folder index.md ----
+    headings = {"components": "Components (code modules)",
+                "references": "References & specs",
+                "playbooks": "Playbooks & runbooks",
+                "decisions": "Decisions & audits"}
+    root_entries = []
+    for sub, entries in section_index.items():
+        if not entries:
+            continue
+        entries.sort()
+        write_index(okf / sub / "index.md", headings[sub], entries)
+        root_entries.append((headings[sub], f"{sub}/", f"{len(entries)} concepts"))
+
+    # ---- 4. root index + log ----
+    write_index(okf / "index.md", f"{titleize(repo.name)} — Knowledge Bundle",
+                root_entries, root=True)
+    log = okf / "log.md"
+    if not log.exists():
+        log.write_text(f"# Bundle Update Log\n\n## {ts[:10]}\n"
+                       f"* **Initialization**: Generated OKF bundle via nhq-okf.\n",
+                       encoding="utf-8")
+    print(f"nhq-okf build: {repo.name} -> {comp_count} components + {doc_count} docs "
+          f"across {len(root_entries)} sections -> {okf}")
+    return 0
+
+
+def cmd_validate(repo: Path):
+    okf = repo / "okf"
+    if not okf.is_dir():
+        print(f"nhq-okf validate: no okf/ bundle in {repo}", file=sys.stderr)
+        return 1
+    fails = []
+    n = 0
+    for md in okf.rglob("*.md"):
+        if md.name in ("index.md", "log.md"):
+            continue
+        n += 1
+        txt = md.read_text(encoding="utf-8", errors="replace")
+        m = re.match(r"^---\s*\n(.*?)\n---\s*\n", txt, re.DOTALL)
+        if not m:
+            fails.append(f"{md.relative_to(repo)}: no frontmatter")
+            continue
+        if not re.search(r"^type:\s*\S+", m.group(1), re.MULTILINE):
+            fails.append(f"{md.relative_to(repo)}: missing/empty type")
+    if fails:
+        print(f"nhq-okf validate: FAIL ({len(fails)}/{n})")
+        for f in fails:
+            print(f"  - {f}")
+        return 1
+    print(f"nhq-okf validate: PASS — {n} concepts conform to OKF v{OKF_VERSION}")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="nhq-okf", description="OKF v0.1 generator + validator.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("build", help="generate/refresh <repo>/okf/")
+    b.add_argument("repo")
+    v = sub.add_parser("validate", help="OKF v0.1 conformance check")
+    v.add_argument("repo")
+    args = p.parse_args()
+    repo = Path(args.repo).expanduser().resolve()
+    if not repo.is_dir():
+        print(f"nhq-okf: not a directory: {repo}", file=sys.stderr)
+        return 2
+    return cmd_build(repo) if args.cmd == "build" else cmd_validate(repo)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
