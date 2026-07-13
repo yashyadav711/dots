@@ -103,19 +103,52 @@ p3_staged_files() {
   } | awk 'NF && !seen[$0]++'
 }
 
+# p3_scope — enforcement scope for the repo under P3_GIT_ARGS (Yash 2026-07-13):
+# P3 commits are gated on ONLY three targets; everything else is Director-autonomous.
+#   whole → block ANY commit  (firststone — Julian's repo; Director must not commit)
+#   p3    → block P3-path commits, PROD branch (main/master) ONLY  (heydaddy, mirror)
+#   none  → no gate            (nhq-agentic-os, envy, builder, dots, vault, dev branches…)
+p3_scope() {
+  local origin base branch
+  origin="$(git "${P3_GIT_ARGS[@]}" remote get-url origin 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  base="$(basename "$(git "${P3_GIT_ARGS[@]}" rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  branch="$(git "${P3_GIT_ARGS[@]}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  if [[ "$origin" == *firststone* || "$origin" == *firststone* || "$base" == firststone || "$base" == firststone ]]; then
+    echo whole; return
+  fi
+  if [[ "$origin" == *yashyadav711/heydaddy* || "$base" == heydaddy || "$origin" == *yashyadav711/mirror* || "$base" == mirror ]]; then
+    if [[ "$branch" == main || "$branch" == master ]]; then echo p3; else echo none; fi
+    return
+  fi
+  echo none
+}
+
 # p3_evaluate <mode>  (mode = pretooluse | precommit)
 # sets P3_MATCHED + P3_VERDICT; returns 0 allow / 1 deny. Reads P3_GIT_ARGS.
 P3_MATCHED=""; P3_VERDICT=""
 p3_evaluate() {
   local mode="${1:-pretooluse}" f
-  if ! p3_load_globs; then
-    # A security gate must not commit blind. Fail CLOSED if the policy file is missing.
-    P3_VERDICT="DENY(no-policy-file)"; P3_MATCHED=""; return 1
-  fi
   # H3: the git context must resolve to a real repo. If -C / GIT_DIR points nowhere
   # (misdirection), we can't read the true staged set → fail CLOSED.
   if ! git "${P3_GIT_ARGS[@]}" rev-parse --git-dir >/dev/null 2>&1; then
     P3_VERDICT="DENY(unresolvable-repo)"; P3_MATCHED=""; return 1
+  fi
+  # TARGET SCOPE (Yash 2026-07-13): gate only firststone(whole) + heydaddy/mirror-prod(p3);
+  # everything else is Director-autonomous — allow immediately, no path check.
+  local scope; scope="$(p3_scope)"
+  if [[ "$scope" == none ]]; then
+    P3_VERDICT="ALLOW(out-of-scope)"; P3_MATCHED=""; return 0
+  fi
+  if [[ "$scope" == whole ]]; then
+    local staged; staged="$(p3_staged_files)"
+    if [[ -z "$staged" ]]; then P3_VERDICT="ALLOW(no-changes)"; P3_MATCHED=""; return 0; fi
+    P3_MATCHED="$(printf '%s' "$staged" | head -20)"
+    P3_VERDICT="DENY(firststone-whole-repo)"; p3_audit deny; return 1
+  fi
+  # scope == p3 (heydaddy/mirror prod) → path-glob gate below.
+  if ! p3_load_globs; then
+    # A security gate must not commit blind. Fail CLOSED if the policy file is missing.
+    P3_VERDICT="DENY(no-policy-file)"; P3_MATCHED=""; return 1
   fi
   local matched=""
   while IFS= read -r f; do
@@ -183,6 +216,7 @@ p3_deny_reason() {
     DENY\(director-no-token\)) echo "this commit stages protected path(s) [$m]; Director self-approves by prefixing the commit inline: 'VFRAME_P3_OK=1 git commit --no-verify …' (the --no-verify clears the hard pre-commit hook; the approval is logged to audit.jsonl)." ;;
     DENY\(precommit-no-selfapprove\)) echo "this commit stages protected path(s) [$m]; the pre-commit gate never trusts inline env — no self-approve here. A legitimate Director p3 commit is approved at the PreToolUse layer (harness env); to bypass the hook deliberately use 'git commit --no-verify' as a conscious human override." ;;
     DENY\(unresolvable-repo\)) echo "the git target (-C / GIT_DIR) does not resolve to a real repository — refusing to evaluate a misdirected commit." ;;
+    DENY\(firststone-whole-repo\)) echo "firststone is Julian's repo — Director/NHQ agents do not commit to it (whole-repo Protocol-3 block). Hand any firststone change to Julian." ;;
     DENY\(no-policy-file\)) echo "p3-paths.json policy file not found at $(p3_paths_file) — refusing to commit blind. Restore the policy file." ;;
     *) echo "protected-path commit denied." ;;
   esac
