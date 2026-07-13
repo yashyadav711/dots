@@ -295,7 +295,7 @@ eq "warden logged ORPHAN alert" "$(grep -c 'ALERT \[orphan:'"$SOR" "$WLOG" 2>/de
 
 echo "── P3-c: nhq-blocked → .blocked + inbox + nhq-await BLOCKED ─────────────"
 BINB="$TMP/inbox-blocked.md"
-"$BIN/nhq-meta" init fleet-mirror agent mirror agent_name Mirror repo "$HOME/Github/mirror" \
+"$BIN/nhq-meta" init fleet-mirror agent mirror agent_name Mirror repo "$HOME/Github/Work/mirror" \
   task "wire vertex" last_state RUNNING >/dev/null 2>&1
 env -u TMUX NHQ_INBOX="$BINB" NHQ_NOTIFY=/bin/true NHQ_STATE_DIR="$NHQ_STATE_DIR" \
   "$BIN/nhq-blocked" mirror "Need the GCP service-account JSON." >/dev/null 2>&1
@@ -334,8 +334,8 @@ echo "── P4-a: dangerous-command guard (widened patterns, sourceable) ──
 source "$BIN/../claude/hooks/dangerous-command-guard.sh"
 gb() { if [[ -n "$(check_dangerous "$1")" ]]; then ok "BLOCK: $1"; else no "should BLOCK but ALLOWED: $1"; fi; }
 ga() { if [[ -n "$(check_dangerous "$1")" ]]; then no "should ALLOW but BLOCKED: $1"; else ok "ALLOW: $1"; fi; }
-gb "rm -rf ~/Github/heydaddy"
-gb "rm -rf /home/yash/Github/mirror"
+gb "rm -rf ~/Github/Work/heydaddy"
+gb "rm -rf /home/yash/Github/Work/mirror"
 gb "railway up"
 gb "railway deploy --service api"
 gb "railway down"
@@ -346,7 +346,7 @@ gb "wipefs -a /dev/sda"
 gb "dd if=x.img of=/dev/sda bs=4M"
 gb "git push --force-with-lease origin main"
 gb "rm -rf /"
-ga "rm -rf ~/Github/heydaddy/build"
+ga "rm -rf ~/Github/Work/heydaddy/build"
 ga "rm -f ~/.nhq-fleet/done/x"
 ga "git push origin main"
 ga "railway logs"
@@ -486,7 +486,7 @@ o="$(printf '%s' "$c1json" | env -u NHQ_APPROVE_CMD NHQ_NOTIFY="$C1NS" DISPLAY=:
 grep -q '"deny"' <<<"$o" && ok "NEW-B: PATH-hijacked fake rofi rejected → DENY" || no "NEW-B: fake rofi AUTO-APPROVED (PATH hijack)"
 
 echo "── SEC-C2: eval / interpreter -c wrapper bypass blocked ────────────────"
-gb 'eval "rm -rf ~/Github/heydaddy"'
+gb 'eval "rm -rf ~/Github/Work/heydaddy"'
 gb 'bash -c "railway up"'
 gb "sh -c 'supabase db reset'"
 PYEVAL='python3 -c "import os; os.system(SQwipefs -a /dev/sdaSQ)"'; PYEVAL="${PYEVAL//SQ/\'}"
@@ -496,7 +496,7 @@ ga 'echo "; railway up"'
 ga 'bash -c "echo hello"'
 
 echo "── SEC-M1/M2: traversal + inline-env-prefix bypasses blocked ───────────"
-gb "rm -rf /tmp/../home/yash/Github/heydaddy"
+gb "rm -rf /tmp/../home/yash/Github/Work/heydaddy"
 gb "RAILWAY_TOKEN=abc railway up"
 gb "A=1 sudo wipefs -a /dev/sda"
 gb "TOKEN=x dd if=z of=/dev/sda"

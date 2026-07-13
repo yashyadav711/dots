@@ -235,17 +235,17 @@ function copy; cat $argv | nhq-clip; end
 alias setupproject='bash -c "$(curl -fsSL https://raw.githubusercontent.com/yashyadav711/vframe-installer/main/setup-vframe.sh)"'
 
 # jump into HeyDaddy on omp
-alias heydaddy='cd ~/Github/heydaddy && omp --continue'
+alias heydaddy='cd ~/Github/Work/heydaddy && omp --continue'
 # launch Envy in its office (~/Github/envy) on omp — bare=new session, --continue=last, --resume=picker
 alias envy='cd ~/Github/envy && omp'
 # jump into Mirror on omp
-alias mirror='cd ~/Github/mirror && omp --continue'
+alias mirror='cd ~/Github/Work/mirror && omp --continue'
 # jump into Director (nhq-agentic-os) on omp
 alias director='cd ~/Github/nhq-agentic-os && omp --continue'
 # jump into HeyDaddy-Design on omp
-alias heydaddy-design='cd ~/Github/heydaddy-design && omp --continue'
+alias heydaddy-design='cd ~/Github/Work/heydaddy-design && omp --continue'
 # jump into Mirror-Design on omp
-alias mirror-design='cd ~/Github/mirror-design && omp --continue'
+alias mirror-design='cd ~/Github/Work/mirror-design && omp --continue'
 # jump into NHQ-Features on omp
 alias nhq-features='cd ~/Github/nhq-features && omp --continue'
 # typing /exit (slash-command muscle memory) expands to exit
@@ -290,7 +290,7 @@ function fish_greeting
 
     echo "$cb  ╭─── NetrunnersHQ ─────────────────────────────────────╮$cn"
 
-    for entry in "HeyDaddy |/home/yash/Github/heydaddy" "Mirror   |/home/yash/Github/mirror" "Director |/home/yash/Github/nhq-agentic-os"
+    for entry in "HeyDaddy |/home/yash/Github/Work/heydaddy" "Mirror   |/home/yash/Github/Work/mirror" "Director |/home/yash/Github/nhq-agentic-os"
         set -l parts (string split "|" $entry)
         set -l label $parts[1]
         set -l path $parts[2]
@@ -343,16 +343,16 @@ function omp-agy-resume --description 'omp free Opus — current dir, resume'; _
 
 function nhq-agy            --description 'Director (nhq-agentic-os) — free Opus';         _agy ~/Github/nhq-agentic-os $argv; end
 function nhq-agy-resume     --description 'Director (nhq-agentic-os) — free Opus, resume'; _agy ~/Github/nhq-agentic-os --continue $argv; end
-function heydaddy-agy        --description 'HeyDaddy — free Opus';         _agy ~/Github/heydaddy $argv; end
-function heydaddy-agy-resume --description 'HeyDaddy — free Opus, resume'; _agy ~/Github/heydaddy --continue $argv; end
-function mirror-agy        --description 'Mirror — free Opus';         _agy ~/Github/mirror $argv; end
-function mirror-agy-resume --description 'Mirror — free Opus, resume'; _agy ~/Github/mirror --continue $argv; end
+function heydaddy-agy        --description 'HeyDaddy — free Opus';         _agy ~/Github/Work/heydaddy $argv; end
+function heydaddy-agy-resume --description 'HeyDaddy — free Opus, resume'; _agy ~/Github/Work/heydaddy --continue $argv; end
+function mirror-agy        --description 'Mirror — free Opus';         _agy ~/Github/Work/mirror $argv; end
+function mirror-agy-resume --description 'Mirror — free Opus, resume'; _agy ~/Github/Work/mirror --continue $argv; end
 function envy-agy        --description 'Envy — free Opus';         _agy ~/Github/envy $argv; end
 function envy-agy-resume --description 'Envy — free Opus, resume'; _agy ~/Github/envy --continue $argv; end
-function heydaddy-design-agy        --description 'HeyDaddy-Design — free Opus';         _agy ~/Github/heydaddy-design $argv; end
-function heydaddy-design-agy-resume --description 'HeyDaddy-Design — free Opus, resume'; _agy ~/Github/heydaddy-design --continue $argv; end
-function mirror-design-agy        --description 'Mirror-Design — free Opus';         _agy ~/Github/mirror-design $argv; end
-function mirror-design-agy-resume --description 'Mirror-Design — free Opus, resume'; _agy ~/Github/mirror-design --continue $argv; end
+function heydaddy-design-agy        --description 'HeyDaddy-Design — free Opus';         _agy ~/Github/Work/heydaddy-design $argv; end
+function heydaddy-design-agy-resume --description 'HeyDaddy-Design — free Opus, resume'; _agy ~/Github/Work/heydaddy-design --continue $argv; end
+function mirror-design-agy        --description 'Mirror-Design — free Opus';         _agy ~/Github/Work/mirror-design $argv; end
+function mirror-design-agy-resume --description 'Mirror-Design — free Opus, resume'; _agy ~/Github/Work/mirror-design --continue $argv; end
 function nhq-features-agy        --description 'NHQ-Features — free Opus';         _agy ~/Github/nhq-features $argv; end
 function nhq-features-agy-resume --description 'NHQ-Features — free Opus, resume'; _agy ~/Github/nhq-features --continue $argv; end
 

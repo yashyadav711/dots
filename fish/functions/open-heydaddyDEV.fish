@@ -1,5 +1,5 @@
 function open-heydaddyDEV
-    set -l HD /home/yash/Github/heydaddy
+    set -l HD /home/yash/Github/Work/heydaddy
     set -l BLOG /tmp/hd-backend-local.log
     set -l FLOG /tmp/hd-frontend-local.log
 
