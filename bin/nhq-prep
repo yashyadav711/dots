@@ -19,8 +19,8 @@ TARGETS = {
     "heydaddy": Path.home() / "Github/heydaddy",
     "mirror": Path.home() / "Github/mirror",
     "builder": Path.home() / "Github/builder",
-    "nhq-service": Path.home() / "Github/nhq-service",
-    "nhq-app": Path.home() / "Github/nhq-app",
+    "nhq-service": Path.home() / "Github/nHQ/nhq-service",
+    "nhq-app": Path.home() / "Github/nHQ/nhq-app",
     "vault": Path("/home/yash/Github/product-manager/Yash's Folder/Obsidian/nHQ")
 }
 

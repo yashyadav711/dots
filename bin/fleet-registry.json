@@ -7,6 +7,6 @@
     "director": { "name": "Director", "repo": "Github/nhq-agentic-os", "model": "Claude Opus 4.8",              "stall_min": 20, "aliases": [] },
     "heydaddy-design": { "name": "HeyDaddy Design", "repo": "Github/heydaddy-design", "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": ["hd-design"] },
     "mirror-design":   { "name": "Mirror Design",   "repo": "Github/mirror-design",   "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": ["md-design"] },
-    "nhq-features":    { "name": "NHQ Features",    "repo": "Github/nhq-features",    "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": ["features"] }
+    "nhq-features":    { "name": "NHQ Features",    "repo": "Github/nHQ/nhq-features",    "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": ["features"] }
   }
 }
