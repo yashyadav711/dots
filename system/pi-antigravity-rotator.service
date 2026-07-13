@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Github/pi-antigravity-rotator
+WorkingDirectory=%h/Github/nHQ/pi-antigravity-rotator
 ExecStart=/usr/bin/npm start
 Restart=on-failure
 RestartSec=5

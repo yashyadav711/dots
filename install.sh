@@ -43,6 +43,9 @@ link kitty/kitty.conf                 "$HOME/.config/kitty/kitty.conf"
 link vim/vimrc                        "$HOME/.vimrc"
 link nvim                             "$HOME/.config/nvim"   # AstroNvim (full IDE); vim/vi stay minimal
 link rofi/spotlight.rasi                "$HOME/.config/rofi/spotlight.rasi"
+link yazi/theme.toml                    "$HOME/.config/yazi/theme.toml"
+link yazi/yazi.toml                     "$HOME/.config/yazi/yazi.toml"
+link yazi/package.toml                  "$HOME/.config/yazi/package.toml"  # then run: ya pkg install  (restores flavors)
 
 echo "==> [3/4] tmux (Oh My Tmux base + custom override)"
 [ -d "$HOME/.tmux" ] || git clone --single-branch https://github.com/gpakosz/.tmux.git "$HOME/.tmux"
