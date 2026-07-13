@@ -18,6 +18,9 @@ TARGETS = {
     "envy": Path.home() / "Github/envy",
     "heydaddy": Path.home() / "Github/heydaddy",
     "mirror": Path.home() / "Github/mirror",
+    "builder": Path.home() / "Github/builder",
+    "nhq-service": Path.home() / "Github/nhq-service",
+    "nhq-app": Path.home() / "Github/nhq-app",
     "vault": Path("/home/yash/Github/product-manager/Yash's Folder/Obsidian/nHQ")
 }
 
@@ -77,7 +80,10 @@ def main():
         stderr=subprocess.DEVNULL
     )
     
-    is_stale = (res.returncode != 0)
+    # missing graph.json = definitively stale (check-update can falsely report fresh
+    # when no graphify-out/ exists yet, e.g. a newly-added target)
+    graph_missing = not (target_path / "graphify-out" / "graph.json").exists()
+    is_stale = (res.returncode != 0) or graph_missing
     note = "checked graphify spine"
 
     if is_stale:
