@@ -115,9 +115,15 @@ def fm_block(fields: dict) -> str:
     return "\n".join(lines)
 
 
-def write_concept(path: Path, fields: dict, body: str):
+def write_concept(path: Path, fields: dict, body: str, force=False):
+    """Create a concept. Existing concepts are PRESERVED (their enriched body +
+    frontmatter are kept) unless force=True — so re-running the generator never
+    clobbers human/agent enrichment. Returns True if written."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not force:
+        return False
     path.write_text(fm_block(fields) + "\n\n" + body.rstrip() + "\n", encoding="utf-8")
+    return True
 
 
 def write_index(path: Path, heading: str, entries, root=False):
@@ -141,7 +147,7 @@ def find_src_root(repo: Path):
     return None
 
 
-def cmd_build(repo: Path):
+def cmd_build(repo: Path, force=False):
     okf = repo / "okf"
     okf.mkdir(exist_ok=True)
     ts = now_iso()
@@ -150,6 +156,7 @@ def cmd_build(repo: Path):
     # ---- 1. code modules -> components/ ----
     src = find_src_root(repo)
     comp_count = 0
+    created = 0
     if src:
         for mod in sorted(src.iterdir()):
             if not mod.is_dir() or mod.name in SKIP_MODULE or mod.name.startswith("."):
@@ -161,11 +168,12 @@ def cmd_build(repo: Path):
             body = (f"# Overview\n\n{desc}\n\n"
                     f"See the live code at `{rel_resource}/` "
                     f"([resource]({os.path.relpath(mod, cpath.parent)})).\n")
-            write_concept(cpath, {
+            if write_concept(cpath, {
                 "type": "Component", "title": title, "description": desc,
                 "resource": rel_resource, "tags": [slug(mod.name), "code"],
                 "timestamp": ts,
-            }, body)
+            }, body, force=force):
+                created += 1
             section_index["components"].append((title, f"{slug(mod.name)}.md", desc))
             comp_count += 1
 
@@ -194,11 +202,12 @@ def cmd_build(repo: Path):
             body = (f"# Summary\n\n{desc}\n\n"
                     f"Full document: `{rel_resource}` "
                     f"([resource]({os.path.relpath(md, cpath.parent)})).\n")
-            write_concept(cpath, {
+            if write_concept(cpath, {
                 "type": ctype, "title": title, "description": desc,
                 "resource": rel_resource, "tags": [subdir, "doc"],
                 "timestamp": ts,
-            }, body)
+            }, body, force=force):
+                created += 1
             section_index[subdir].append((title, f"{slug(name)}.md", desc))
             doc_count += 1
 
@@ -223,8 +232,10 @@ def cmd_build(repo: Path):
         log.write_text(f"# Bundle Update Log\n\n## {ts[:10]}\n"
                        f"* **Initialization**: Generated OKF bundle via nhq-okf.\n",
                        encoding="utf-8")
-    print(f"nhq-okf build: {repo.name} -> {comp_count} components + {doc_count} docs "
-          f"across {len(root_entries)} sections -> {okf}")
+    total = comp_count + doc_count
+    print(f"nhq-okf build: {repo.name} -> {total} concepts "
+          f"({comp_count} components + {doc_count} docs), {created} new / "
+          f"{total - created} preserved, {len(root_entries)} sections -> {okf}")
     return 0
 
 
@@ -255,19 +266,91 @@ def cmd_validate(repo: Path):
     return 0
 
 
+def _parse_fm(md: Path):
+    txt = md.read_text(encoding="utf-8", errors="replace")
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n", txt, re.DOTALL)
+    if not m:
+        return {}
+    fm = {}
+    for line in m.group(1).splitlines():
+        mm = re.match(r"^(\w+):\s*(.*)$", line)
+        if mm:
+            fm[mm.group(1)] = mm.group(2).strip()
+    return fm
+
+
+def cmd_fuse(repo: Path, cap=60):
+    """Fuse the okf/ knowledge layer into graphify's code graph: inject one node
+    per concept and a `documents` edge from each concept to the code nodes under
+    its `resource:` path. Deterministic; re-run after every `graphify update`
+    (nhq-prep does this). Writes back graphify-out/graph.json."""
+    import json
+    okf = repo / "okf"
+    graph = repo / "graphify-out" / "graph.json"
+    if not okf.is_dir() or not graph.exists():
+        print(f"nhq-okf fuse: skip ({repo.name}: need both okf/ and graphify-out/graph.json)")
+        return 0
+    g = json.loads(graph.read_text(encoding="utf-8"))
+    nodes = g.setdefault("nodes", [])
+    links = g.setdefault("links", [])
+    existing = {n.get("id") for n in nodes}
+    # drop any prior okf-origin nodes/edges so re-fuse is idempotent
+    nodes[:] = [n for n in nodes if n.get("_origin") != "okf"]
+    links[:] = [l for l in links if l.get("_origin") != "okf"]
+    existing = {n.get("id") for n in nodes}
+    code_files = [(n.get("source_file", ""), n["id"]) for n in nodes if n.get("id")]
+    add_n = add_e = 0
+    for md in sorted(okf.rglob("*.md")):
+        if md.name in ("index.md", "log.md"):
+            continue
+        fm = _parse_fm(md)
+        rel = str(md.relative_to(repo))
+        cid = "okf_" + slug(str(md.relative_to(okf)).removesuffix(".md"))
+        if cid not in existing:
+            nodes.append({"id": cid, "label": fm.get("title", md.stem),
+                          "file_type": "knowledge", "_origin": "okf",
+                          "source_file": rel, "community": -1,
+                          "concept_type": fm.get("type", "Concept")})
+            existing.add(cid)
+            add_n += 1
+        res = fm.get("resource", "").strip()
+        if not res or res.endswith(".md"):
+            continue  # doc concepts point at docs, not code nodes
+        hit = 0
+        for sf, nid in code_files:
+            if sf == res or sf.startswith(res.rstrip("/") + "/"):
+                links.append({"source": cid, "target": nid, "relation": "documents",
+                              "_origin": "okf", "weight": 1.0})
+                add_e += 1
+                hit += 1
+                if hit >= cap:
+                    break
+    graph.write_text(json.dumps(g), encoding="utf-8")
+    print(f"nhq-okf fuse: {repo.name} -> +{add_n} concept nodes, +{add_e} documents-edges into graph.json")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(prog="nhq-okf", description="OKF v0.1 generator + validator.")
     sub = p.add_subparsers(dest="cmd", required=True)
-    b = sub.add_parser("build", help="generate/refresh <repo>/okf/")
+    b = sub.add_parser("build", help="generate/refresh <repo>/okf/ (preserves bodies)")
     b.add_argument("repo")
+    b.add_argument("--force", action="store_true",
+                   help="overwrite existing concept bodies (default: preserve)")
     v = sub.add_parser("validate", help="OKF v0.1 conformance check")
     v.add_argument("repo")
+    fu = sub.add_parser("fuse", help="fuse okf/ concepts into graphify-out/graph.json")
+    fu.add_argument("repo")
     args = p.parse_args()
     repo = Path(args.repo).expanduser().resolve()
     if not repo.is_dir():
         print(f"nhq-okf: not a directory: {repo}", file=sys.stderr)
         return 2
-    return cmd_build(repo) if args.cmd == "build" else cmd_validate(repo)
+    if args.cmd == "build":
+        return cmd_build(repo, force=getattr(args, "force", False))
+    if args.cmd == "fuse":
+        return cmd_fuse(repo)
+    return cmd_validate(repo)
 
 
 if __name__ == "__main__":

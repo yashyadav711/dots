@@ -150,6 +150,12 @@ def main():
                                capture_output=True, text=True)
             first = (v.stdout or "").strip().splitlines()[0] if v.stdout.strip() else "okf: ?"
             note += f" · {first.replace('nhq-okf validate: ', 'okf ')}"
+            # fuse okf/ concepts into the freshly-built graphify graph
+            fz = subprocess.run([okf_bin, "fuse", str(target_path)],
+                                capture_output=True, text=True)
+            fzl = (fz.stdout or "").strip().splitlines()[-1] if fz.stdout.strip() else ""
+            if "->" in fzl:
+                note += " · fused" + fzl.split("->", 1)[1]
         else:
             note += " (nhq-okf not found)"
 
