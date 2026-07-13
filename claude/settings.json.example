@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "setsid bash /home/yash/Github/envy/auto-sync.sh >/dev/null 2>&1 </dev/null &"
+            "command": "setsid bash /home/yash/Github/nHQ/envy/auto-sync.sh >/dev/null 2>&1 </dev/null &"
           },
           {
             "type": "command",

@@ -130,7 +130,7 @@ eq "session fleet-director-x-y"     "$(nhq_session_agent fleet-director-x-y)"   
 
 echo "── P1-b: nhq-meta CRUD round-trip ──────────────────────────────────────"
 SM="fleet-selftest-meta"
-"$BIN/nhq-meta" init "$SM" agent envy agent_name Envy repo "$HOME/Github/envy" \
+"$BIN/nhq-meta" init "$SM" agent envy agent_name Envy repo "$HOME/Github/nHQ/envy" \
   task "Add retry cap to the upload queue" model "Claude Sonnet 4.6 (Thinking)" \
   spawn_epoch 1750284000 base_commit abc1234 last_state RUNNING >/dev/null 2>&1
 eq "meta get task"        "$("$BIN/nhq-meta" get "$SM" task)"        "Add retry cap to the upload queue"
@@ -154,7 +154,7 @@ echo "── P1-c: spawn .meta + NHQ_AGENT contract (tmux-gated) ─────
 if command -v tmux >/dev/null 2>&1; then
   SS="fleet-selftest-spawnmeta"
   # (1) spawn-shaped .meta write
-  "$BIN/nhq-meta" init "$SS" agent envy agent_name Envy repo "$HOME/Github/envy" \
+  "$BIN/nhq-meta" init "$SS" agent envy agent_name Envy repo "$HOME/Github/nHQ/envy" \
     model "Claude Sonnet 4.6 (Thinking)" spawn_epoch 1 base_commit deadbeef last_state RUNNING >/dev/null 2>&1
   eq "spawn .meta agent==envy" "$("$BIN/nhq-meta" get "$SS" agent)" "envy"
   # (2) tmux -e NHQ_AGENT export (the exact flag nhq-spawn uses on launch)
@@ -180,7 +180,7 @@ CJ="$NHQ_STATE_DIR/known-session.jsonl"
   echo '{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":300,"output_tokens":30}}}'
 } > "$CJ"
 SC="fleet-selftest-cost"
-"$BIN/nhq-meta" init "$SC" repo "$HOME/Github/envy" model "Claude Sonnet 4.6 (Thinking)" spawn_epoch 1 >/dev/null 2>&1
+"$BIN/nhq-meta" init "$SC" repo "$HOME/Github/nHQ/envy" model "Claude Sonnet 4.6 (Thinking)" spawn_epoch 1 >/dev/null 2>&1
 "$BIN/nhq-meta" set "$SC" jsonl "$CJ" >/dev/null 2>&1   # cache so cost uses our fixture
 "$BIN/nhq-cost" "$SC" >/dev/null 2>&1
 eq "cost tokens_in == 600"  "$("$BIN/nhq-meta" get "$SC" tokens_in)"  "600"
@@ -240,7 +240,7 @@ echo "── P2-d: nhq-done logs one ledger row + flips .meta DONE ────�
 LED="$TMP/task-ledger.md"; printf '# NHQ Task Ledger\n\n## Ledger (newest first)\n' > "$LED"
 DJ="$NHQ_STATE_DIR/done-known.jsonl"
 echo '{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":200}}}' > "$DJ"
-"$BIN/nhq-meta" init fleet-envy agent envy agent_name Envy repo "$HOME/Github/envy" \
+"$BIN/nhq-meta" init fleet-envy agent envy agent_name Envy repo "$HOME/Github/nHQ/envy" \
   task "P2 OBSERVE build" model "Claude Opus 4.8" spawn_epoch "$(( $(date +%s) - 300 ))" last_state RUNNING >/dev/null 2>&1
 "$BIN/nhq-meta" set fleet-envy jsonl "$DJ" >/dev/null 2>&1
 # TMUX unset → nhq-done resolves the fallback session fleet-envy; hermetic overrides.

@@ -16,7 +16,7 @@ from pathlib import Path
 
 TARGETS = {
     "director": Path.home() / "Github/nhq-agentic-os",
-    "envy": Path.home() / "Github/envy",
+    "envy": Path.home() / "Github/nHQ/envy",
     "heydaddy": Path.home() / "Github/Work/heydaddy",
     "mirror": Path.home() / "Github/Work/mirror",
     "builder": Path.home() / "Github/Work/builder",

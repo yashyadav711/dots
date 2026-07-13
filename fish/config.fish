@@ -236,8 +236,8 @@ alias setupproject='bash -c "$(curl -fsSL https://raw.githubusercontent.com/yash
 
 # jump into HeyDaddy on omp
 alias heydaddy='cd ~/Github/Work/heydaddy && omp --continue'
-# launch Envy in its office (~/Github/envy) on omp — bare=new session, --continue=last, --resume=picker
-alias envy='cd ~/Github/envy && omp'
+# launch Envy in its office (~/Github/nHQ/envy) on omp — bare=new session, --continue=last, --resume=picker
+alias envy='cd ~/Github/nHQ/envy && omp'
 # jump into Mirror on omp
 alias mirror='cd ~/Github/Work/mirror && omp --continue'
 # jump into Director (nhq-agentic-os) on omp
@@ -347,8 +347,8 @@ function heydaddy-agy        --description 'HeyDaddy — free Opus';         _ag
 function heydaddy-agy-resume --description 'HeyDaddy — free Opus, resume'; _agy ~/Github/Work/heydaddy --continue $argv; end
 function mirror-agy        --description 'Mirror — free Opus';         _agy ~/Github/Work/mirror $argv; end
 function mirror-agy-resume --description 'Mirror — free Opus, resume'; _agy ~/Github/Work/mirror --continue $argv; end
-function envy-agy        --description 'Envy — free Opus';         _agy ~/Github/envy $argv; end
-function envy-agy-resume --description 'Envy — free Opus, resume'; _agy ~/Github/envy --continue $argv; end
+function envy-agy        --description 'Envy — free Opus';         _agy ~/Github/nHQ/envy $argv; end
+function envy-agy-resume --description 'Envy — free Opus, resume'; _agy ~/Github/nHQ/envy --continue $argv; end
 function heydaddy-design-agy        --description 'HeyDaddy-Design — free Opus';         _agy ~/Github/Work/heydaddy-design $argv; end
 function heydaddy-design-agy-resume --description 'HeyDaddy-Design — free Opus, resume'; _agy ~/Github/Work/heydaddy-design --continue $argv; end
 function mirror-design-agy        --description 'Mirror-Design — free Opus';         _agy ~/Github/Work/mirror-design $argv; end
