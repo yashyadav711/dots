@@ -20,7 +20,7 @@ import sys, os, json, hashlib, time
 from pathlib import Path
 
 VAULT = Path(os.environ.get("NHQ_VAULT",
-    "/home/yash/Github/product-manager/Yash's Folder/Obsidian/nHQ"))
+    "/home/yash/Obsidian/nHQ"))
 SNAP = Path(os.environ.get("NHQ_VAULT_SNAPSHOT",
     str(Path.home() / ".config/nhq/vault-snapshot.json")))
 SKIP_DIRS = {".obsidian", ".git", ".trash", ".stfolder", "_covers"}

@@ -13,9 +13,10 @@ can never be stale, needs no file-watcher daemon, and catches EVERY write source
 Usage: nhq-vault-home-index            # install/refresh the live block + print a summary
 """
 import datetime
+import os
 from pathlib import Path
 
-VAULT = Path("/home/yash/Github/product-manager/Yash's Folder/Obsidian/nHQ")
+VAULT = Path(os.environ.get("NHQ_VAULT", "/home/yash/Obsidian/nHQ"))
 HOME = VAULT / "Home.md"
 RECENT_N = 40
 EXCLUDE_TOP = {".obsidian", "_Read"}

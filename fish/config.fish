@@ -6,6 +6,10 @@ source /usr/share/cachyos-fish-config/cachyos-config.fish
 # Official docs: https://fishshell.com/docs/current/index.html
 ###
 
+# nHQ Obsidian vault — single source of truth for vault path (moved out of Github 2026-07-13).
+# Set BEFORE the interactive-exit guard so non-interactive shells + child scripts inherit it.
+set -gx NHQ_VAULT /home/yash/Obsidian/nHQ
+
 # Exit early if shell is not interactive
 if not status --is-interactive
   exit

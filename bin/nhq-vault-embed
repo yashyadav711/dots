@@ -36,7 +36,7 @@ import urllib.request
 from pathlib import Path
 from datetime import datetime
 
-DEFAULT_VAULT = "/home/yash/Github/product-manager/Yash's Folder/Obsidian/nHQ"
+DEFAULT_VAULT = "/home/yash/Obsidian/nHQ"
 DEFAULT_MODEL = os.environ.get("NHQ_EMBED_MODEL", "nomic-embed-text")
 DEFAULT_OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_BACKEND = os.environ.get("NHQ_EMBED_BACKEND", "ollama")

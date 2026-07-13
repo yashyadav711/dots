@@ -19,7 +19,7 @@ import sys, os, re
 from pathlib import Path
 
 VAULT = Path(os.environ.get("NHQ_VAULT",
-    "/home/yash/Github/product-manager/Yash's Folder/Obsidian/nHQ"))
+    "/home/yash/Obsidian/nHQ"))
 SKIP = {".obsidian", ".git", ".trash", ".stfolder"}
 CO = re.compile(r'<!--co:(?P<id>\S+)\s+(?P<meta>[^\n]*)\n(?P<body>.*?)-->', re.DOTALL)
 

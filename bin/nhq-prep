@@ -9,6 +9,7 @@ Usage: nhq-prep <target> [--dry-run]
        nhq-prep --help
 """
 import sys
+import os
 import subprocess
 import shutil
 from pathlib import Path
@@ -21,7 +22,7 @@ TARGETS = {
     "builder": Path.home() / "Github/builder",
     "nhq-service": Path.home() / "Github/nHQ/nhq-service",
     "nhq-app": Path.home() / "Github/nHQ/nhq-app",
-    "vault": Path("/home/yash/Github/product-manager/Yash's Folder/Obsidian/nHQ")
+    "vault": Path(os.environ.get("NHQ_VAULT", "/home/yash/Obsidian/nHQ"))
 }
 
 def print_help():

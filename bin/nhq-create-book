@@ -27,7 +27,7 @@ def run_agy(prompt, model="Gemini 3.1 Pro (High)", stream=False):
 
 def get_vault_books_dir():
     # NHQ Vault path based on context
-    p = Path.home() / "Github" / "product-manager" / "Yash's Folder" / "Obsidian" / "nHQ" / "Books"
+    p = Path(os.environ.get("NHQ_VAULT", "/home/yash/Obsidian/nHQ")) / "Books"
     if not p.exists():
         p.mkdir(parents=True, exist_ok=True)
     return p
