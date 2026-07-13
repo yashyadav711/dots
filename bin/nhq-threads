@@ -66,7 +66,7 @@ PROJECT_REPOS = {
 
 # Vault file the --vault-sync writes (Obsidian picks it up).  Module constant
 # so it is trivial to repoint; the sync fails soft if the dir is absent.
-VAULT_FILE = ("/home/yash/Github/product-manager/Yash's Folder/"
+VAULT_FILE = ("/home/yash/"
               "Obsidian/nHQ/Threads and Issues.md")
 
 # Status emoji -> (short label, header-bucket).  header-bucket is the key used
