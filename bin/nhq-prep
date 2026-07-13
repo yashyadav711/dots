@@ -20,8 +20,8 @@ TARGETS = {
     "heydaddy": Path.home() / "Github/Work/heydaddy",
     "mirror": Path.home() / "Github/Work/mirror",
     "builder": Path.home() / "Github/Work/builder",
-    "nhq-service": Path.home() / "Github/nHQ/nhq-service",
-    "nhq-app": Path.home() / "Github/nHQ/nhq-app",
+    "nhq-service": Path.home() / "Github/nHQ/nhq-app-stack/nhq-service",
+    "nhq-app": Path.home() / "Github/nHQ/nhq-app-stack/nhq-app",
     "vault": Path(os.environ.get("NHQ_VAULT", "/home/yash/Obsidian/nHQ"))
 }
 
