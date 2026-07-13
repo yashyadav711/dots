@@ -142,6 +142,11 @@ def main():
     # 5. OKF knowledge-layer bundle (code repos only; graphify-parallel).
     #    graphify-out/ = structural code graph; okf/ = declarative knowledge layer.
     if target != "vault" and not dry_run:
+        # 5a. project ai/decisions.jsonl -> docs/decisions/ ADRs (repo-local script, if present)
+        sync_dec = target_path / "scripts" / "sync-decisions.py"
+        if sync_dec.exists():
+            subprocess.run([sys.executable, str(sync_dec), str(target_path)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         okf_bin = shutil.which("nhq-okf") or str(Path.home() / ".local/bin/nhq-okf")
         if Path(okf_bin).exists():
             subprocess.run([okf_bin, "build", str(target_path)],

@@ -46,6 +46,25 @@ DOC_RULES = [
     (r"spec|stack|prefs|context|product|blueprint|changelog|readme|backlog|status|progress|plan|resume|gaps|verification|notes", ("references", "Reference")),
 ]
 
+# docs/<category>/ dirs map straight to a concept type (path-based, authoritative)
+DOC_DIR_CATEGORY = {
+    "playbooks": ("playbooks", "Playbook"),
+    "decisions": ("decisions", "Decision"),
+    "references": ("references", "Reference"),
+    "reference": ("references", "Reference"),
+    "specs": ("specs", "Spec"),
+    "rules": ("rules", "Rule"),
+}
+# ephemeral / live-state files that must NEVER become concepts (graph noise)
+EXCLUDE_NAMES = {
+    "open-threads.md", "session-handoff.md", "daily-log.md", "usage-log.md",
+    "ops-log.md", "yash-voice.md", "app-inbox.md", "envy-inbox.md",
+    "fleet-inbox.md", "week-plan.md", "task-ledger.md", "agy-task-log.md",
+}
+# directory parts whose whole subtree is excluded (archives, live/ephemeral state)
+EXCLUDE_DIR_PARTS = {"_archive", "state", "sessions", "yash-voice-archive",
+                     "node_modules", ".git"}
+
 
 def now_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -151,20 +170,27 @@ def cmd_build(repo: Path, force=False):
     okf = repo / "okf"
     okf.mkdir(exist_ok=True)
     ts = now_iso()
-    section_index = {"components": [], "references": [], "playbooks": [], "decisions": []}
+    section_index = {"components": [], "references": [], "playbooks": [],
+                     "decisions": [], "specs": [], "rules": []}
 
-    # ---- 1. code modules -> components/ ----
-    src = find_src_root(repo)
+    # ---- 1. code modules -> components/ (main src root + control-center/src) ----
     comp_count = 0
     created = 0
-    if src:
+    src_roots = []
+    main_src = find_src_root(repo)
+    if main_src:
+        src_roots.append((main_src, "", ""))
+    cc_src = repo / "control-center" / "src"
+    if cc_src.is_dir():
+        src_roots.append((cc_src, "cc-", "Control-Center "))
+    for src, sprefix, tprefix in src_roots:
         for mod in sorted(src.iterdir()):
             if not mod.is_dir() or mod.name in SKIP_MODULE or mod.name.startswith("."):
                 continue
             desc = module_description(mod)
-            title = titleize(mod.name)
+            title = tprefix + titleize(mod.name)
             rel_resource = str(mod.relative_to(repo))
-            cpath = okf / "components" / f"{slug(mod.name)}.md"
+            cpath = okf / "components" / f"{sprefix}{slug(mod.name)}.md"
             body = (f"# Overview\n\n{desc}\n\n"
                     f"See the live code at `{rel_resource}/` "
                     f"([resource]({os.path.relpath(mod, cpath.parent)})).\n")
@@ -174,27 +200,52 @@ def cmd_build(repo: Path, force=False):
                 "timestamp": ts,
             }, body, force=force):
                 created += 1
-            section_index["components"].append((title, f"{slug(mod.name)}.md", desc))
+            section_index["components"].append((title, f"{sprefix}{slug(mod.name)}.md", desc))
             comp_count += 1
 
-    # ---- 2. curated docs -> references/ playbooks/ decisions/ ----
-    doc_dirs = [repo, repo / "ai", repo / "docs"]
+    # ---- 2. curated docs -> references/ playbooks/ decisions/ specs/ rules/ ----
+    # docs/<category>/ classifies by PATH; repo-root + ai/ by keyword; ephemeral skipped.
+    doc_sources = [
+        (repo, False, None),
+        (repo / "ai", False, None),
+        (repo / "docs", True, "path"),
+        (repo / ".claude" / "rules", False, ("rules", "Rule")),
+        (repo / ".claude" / "reference", False, ("references", "Reference")),
+    ]
     seen = set()
     doc_count = 0
-    for dd in doc_dirs:
+    for dd, recursive, forced in doc_sources:
         if not dd.is_dir():
             continue
-        for md in sorted(dd.glob("*.md")):
-            if md.resolve() in seen or "okf" in md.parts:
+        md_iter = dd.rglob("*.md") if recursive else dd.glob("*.md")
+        for md in sorted(md_iter):
+            parts = md.relative_to(repo).parts
+            if md.resolve() in seen or "okf" in parts or "_archive" in parts:
+                continue
+            if any(p in EXCLUDE_DIR_PARTS for p in parts) or md.name in EXCLUDE_NAMES:
                 continue
             seen.add(md.resolve())
             name = md.stem
             low = name.lower()
-            subdir, ctype = "references", "Reference"
-            for pat, (sd, ct) in DOC_RULES:
-                if re.search(pat, low):
-                    subdir, ctype = sd, ct
-                    break
+            if forced == "path":
+                cat = next((DOC_DIR_CATEGORY[p] for p in md.relative_to(dd).parts
+                            if p in DOC_DIR_CATEGORY), None)
+                if cat:
+                    subdir, ctype = cat
+                else:
+                    subdir, ctype = "references", "Reference"
+                    for pat, (sd, ct) in DOC_RULES:
+                        if re.search(pat, low):
+                            subdir, ctype = sd, ct
+                            break
+            elif forced:
+                subdir, ctype = forced
+            else:
+                subdir, ctype = "references", "Reference"
+                for pat, (sd, ct) in DOC_RULES:
+                    if re.search(pat, low):
+                        subdir, ctype = sd, ct
+                        break
             desc = doc_summary(md)
             title = titleize(name)
             rel_resource = str(md.relative_to(repo))
@@ -215,7 +266,9 @@ def cmd_build(repo: Path, force=False):
     headings = {"components": "Components (code modules)",
                 "references": "References & specs",
                 "playbooks": "Playbooks & runbooks",
-                "decisions": "Decisions & audits"}
+                "decisions": "Decisions & audits",
+                "specs": "Specs & build briefs",
+                "rules": "Rules & behavior"}
     root_entries = []
     for sub, entries in section_index.items():
         if not entries:
