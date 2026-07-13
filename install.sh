@@ -63,6 +63,7 @@ for cmd in nhq nhq-agent-name nhq-await nhq-blocked nhq-cost nhq-done nhq-fleet 
            nhq-fleet-selftest nhq-kill nhq-meta nhq-notify nhq-reap nhq-spawn \
            nhq-status nhq-tell nhq-warden \
            nhq-audit nhq-audit-verify nhq-ctx nhq-econ nhq-handoff nhq-p3-guard \
+           nhq-prep nhq-okf \
            mcp-write-guard; do
   link "bin/$cmd" "$HOME/.local/bin/$cmd"
 done
