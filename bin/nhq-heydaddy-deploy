@@ -1,25 +1,34 @@
 #!/usr/bin/env bash
 # nhq-heydaddy-deploy — one dispatcher, four faces (symlinked):
 #   nhq-heydaddy-dev-fe-deploy    → dev  · heydaddy-web (frontend)  · from-source
-#   nhq-heydaddy-dev-be-deploy    → dev  · heydaddy     (backend)   · from-source
+#   nhq-heydaddy-dev-be-deploy    → dev  · heydaddy     (backend)   · TARBALL (railway up)
 #   nhq-heydaddy-prod-fe-deploy   → prod · heydaddy-web (frontend)  · from-source
 #   nhq-heydaddy-prod-be-deploy   → prod · heydaddy     (backend)   · TARBALL (deploy.sh)
 #
 # Two deploy methods, because the services aren't wired the same:
-#   • GitHub-CONNECTED services (dev-fe, dev-be, prod-fe) → `railway redeploy
+#   • GitHub-CONNECTED services (dev-fe, prod-fe) → `railway redeploy
 #     --from-source` pulls + redeploys the latest committed tip of the branch
 #     Railway tracks. No local upload, no source-connection change.
-#   • The PROD BACKEND (heydaddy) has NO GitHub source — it deploys via TARBALL
-#     upload of the working tree, using the repo's own scripts/deploy.sh (which
-#     polls to SUCCESS + health-checks api.heydaddy.app). So prod-be links to
-#     prod, runs deploy.sh server, then RESTORES your prior link.
-#     (Found the hard way 2026-07-01: a main push auto-deploys prod-fe but NOT
-#      prod-be, leaving prod half-shipped — this path closes that gap.)
+#   • NEITHER backend service has a GitHub source (verified via `railway
+#     status --json`: both dev's and prod's `heydaddy` deployments carry
+#     `commitHash: null` / `branch: null` in their meta, unlike the frontend
+#     deployments which correctly show the pushed commit). `redeploy
+#     --from-source` against a sourceless service just re-runs whatever was
+#     last uploaded — it reports SUCCESS but silently serves STALE code no
+#     matter what's on the git branch (root-caused 2026-07-16: dev's `heydaddy`
+#     kept a pre-`voice/preview-lines` route/openapi.json live through several
+#     `to-dev` promotions because this script called `redeploy --from-source`
+#     on it). Both backends now deploy via TARBALL (`railway up`, uploads the
+#     working tree): prod-be uses the repo's own scripts/deploy.sh (prod URLs,
+#     migration-guarded, link-restoring); dev-be uses the lean path below
+#     (dev's `MIGRATION_AUTO=true` applies pending migrations on container
+#     boot, so no separate migration step is needed there).
+#     (prod-be tarball fix: 2026-07-01. dev-be tarball fix: 2026-07-16.)
 #
 # Flags:  --dry-run   print what it would run, don't run it
 #         -y|--yes    skip the prod typed-confirmation (for scripted use)
 #
-# Made by Director for Yash — 2026-06-30 (prod-be tarball fix 2026-07-01).
+# Made by Director for Yash — 2026-06-30 (prod-be tarball fix 2026-07-01, dev-be tarball fix 2026-07-16).
 set -euo pipefail
 
 PROJECT_ID="0a52cb6e-d0da-49d2-b608-ea1fa6b4c68f"   # heydaddy
@@ -42,7 +51,7 @@ done
 METHOD="from-source"
 case "$self" in
   *-dev-fe-*)  ENV_NAME="dev";        SERVICE_ID="$FE_SERVICE"; LABEL="DEV · frontend (heydaddy-web)" ;;
-  *-dev-be-*)  ENV_NAME="dev";        SERVICE_ID="$BE_SERVICE"; LABEL="DEV · backend (heydaddy)" ;;
+  *-dev-be-*)  ENV_NAME="dev";        SERVICE_ID="$BE_SERVICE"; LABEL="DEV · backend (heydaddy)"; METHOD="tarball" ;;
   *-prod-fe-*) ENV_NAME="production"; SERVICE_ID="$FE_SERVICE"; LABEL="PROD · frontend (heydaddy-web)" ;;
   *-prod-be-*) ENV_NAME="production"; SERVICE_ID="$BE_SERVICE"; LABEL="PROD · backend (heydaddy)"; METHOD="tarball" ;;
   *)
@@ -56,7 +65,7 @@ is_prod=0; [[ "$ENV_NAME" == "production" ]] && is_prod=1
 echo "──────────────────────────────────────────────"
 echo "  HeyDaddy deploy → $LABEL"
 if [[ "$METHOD" == "tarball" ]]; then
-  echo "  method: TARBALL via scripts/deploy.sh (prod backend has no GitHub source)"
+  echo "  method: TARBALL via railway up (this backend has no GitHub source — see header)"
 else
   echo "  method: railway redeploy --from-source (latest committed branch tip)"
 fi
@@ -73,11 +82,65 @@ if [[ "$is_prod" == 1 && "$assume_yes" == 0 && "$dry_run" == 0 ]]; then
   fi
 fi
 
-# ── TARBALL path (prod backend) ──────────────────────────────────────────────
+# ── TARBALL path — dev-be (lean, below) / prod-be (deploy.sh) ────────────────
 if [[ "$METHOD" == "tarball" ]]; then
   if [[ ! -d "$HEYDADDY_DIR" ]]; then
     echo "ERROR: HEYDADDY_DIR not found: $HEYDADDY_DIR" >&2; exit 1
   fi
+
+  # ── DEV backend — no deploy.sh reuse: that script hard-codes PROD URLs
+  # (api.heydaddy.app / www.heydaddy.app) for its health check, so it can't
+  # safely target dev. Plain `railway up` (tarball of the working tree)
+  # against the already-resolved dev/heydaddy service, polled to SUCCESS the
+  # same way deploy.sh does, then health-checked against the dev URL.
+  # MIGRATION_AUTO=true on dev applies any pending migration on container
+  # boot, so — unlike prod — no separate migration step runs here.
+  if [[ "$is_prod" == 0 ]]; then
+    DEV_HEALTH="https://heydaddy-dev.up.railway.app/health"
+    if [[ "$dry_run" == 1 ]]; then
+      echo "DRY RUN — would run:"
+      echo "  railway link --project $PROJECT_ID --environment dev --service heydaddy"
+      echo "  railway up --service $SERVICE_ID --detach   (uploads $HEYDADDY_DIR)"
+      echo "  poll 'railway deployment list' to SUCCESS, then curl $DEV_HEALTH"
+      exit 0
+    fi
+    echo "  linking dev/heydaddy backend…"
+    railway link --project "$PROJECT_ID" --environment dev --service heydaddy >/dev/null 2>&1
+    _top_line() { railway deployment list --service "$SERVICE_ID" 2>/dev/null \
+      | grep -E "\| (BUILDING|DEPLOYING|SUCCESS|FAILED|CRASHED|INITIALIZING|REMOVED) \|" | head -1; }
+    top_id()     { _top_line | grep -oE "^[[:space:]]*[0-9a-f]{8}" | tr -d ' '; }
+    top_status() { _top_line | grep -oE "BUILDING|DEPLOYING|SUCCESS|FAILED|CRASHED|INITIALIZING|REMOVED" | head -1; }
+    prev="$(top_id)"
+    echo "  uploading working tree + deploying (railway up, not a git push)…"
+    ( cd "$HEYDADDY_DIR" && railway up --service "$SERVICE_ID" --detach )
+    echo "  polling for the new deployment to reach SUCCESS…"
+    id="" st=""
+    for ((i = 1; i <= 45; i++)); do
+      id="$(top_id)"; st="$(top_status)"
+      echo "    [$(date +%H:%M:%S)] ${id:-?} ${st:-?}"
+      [[ "$st" == "SUCCESS" && -n "$id" && "$id" != "$prev" ]] && break
+      [[ "$st" == "FAILED" || "$st" == "CRASHED" ]] && { echo "  ✗ deploy $st ($id)"; exit 1; }
+      sleep 20
+    done
+    [[ "$st" == "SUCCESS" && -n "$id" && "$id" != "$prev" ]] \
+      || { echo "  ✗ timed out after 900s waiting for the new deployment"; exit 1; }
+    echo "  health-checking $DEV_HEALTH …"
+    code="ERR"
+    for i in 1 2 3 4 5 6 7 8; do
+      code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$DEV_HEALTH" || echo ERR)"
+      [[ "$code" == "200" ]] && break
+      [[ $i -lt 8 ]] && sleep 6
+    done
+    if [[ "$code" == "200" ]]; then
+      echo "  ✓ dev backend live + healthy ($id)"
+      exit 0
+    else
+      echo "  ✗ deployed ($id) but /health returned $code, not 200 — check: railway logs --environment dev --service heydaddy"
+      exit 1
+    fi
+  fi
+
+  # ── PROD backend — deploy.sh (prod URLs, migration-guarded, link-restoring) ─
   if [[ ! -f "$HEYDADDY_DIR/scripts/deploy.sh" ]]; then
     echo "ERROR: scripts/deploy.sh missing in $HEYDADDY_DIR" >&2; exit 1
   fi
@@ -97,21 +160,29 @@ if [[ "$METHOD" == "tarball" ]]; then
   if [[ "$dry_run" == 1 ]]; then
     echo "DRY RUN — would:"
     echo "  1. railway link --project $PROJECT_ID --environment production --service heydaddy"
-    echo "  2. (cd $HEYDADDY_DIR && bash scripts/deploy.sh server --skip-local --migrations-ok)"
-    echo "  3. railway link back → $prior_env / $prior_svc"
+    echo "  2. apply pending prod migrations (backend.migrate upgrade) — ABORT if any fail"
+    echo "  3. (cd $HEYDADDY_DIR && bash scripts/deploy.sh server --skip-local --migrations-ok)"
+    echo "  4. railway link back → $prior_env / $prior_svc"
     exit 0
   fi
 
   trap restore_link EXIT
   echo "  linking prod/heydaddy backend…"
   railway link --project "$PROJECT_ID" --environment production --service heydaddy >/dev/null 2>&1
+  echo "  applying pending prod migrations (backend.migrate upgrade) — the guard that was missing…"
+  PROD_DB="$(railway variables --service heydaddy --environment production --kv 2>/dev/null | grep '^DATABASE_URL=' | head -1 | sed 's/^DATABASE_URL=//')"
+  if [[ -z "$PROD_DB" ]]; then
+    echo "  ✗ REFUSING: could not read prod DATABASE_URL — can't confirm migrations, not shipping code."; exit 1
+  fi
+  ( cd "$HEYDADDY_DIR" && DATABASE_URL="$PROD_DB" .venv/bin/python -m backend.migrate upgrade ) \
+    || { echo "  ✗ prod migration apply FAILED — aborting (code NOT shipped, so no missing-migration 500)."; exit 1; }
   echo "  running deploy.sh server (polls to SUCCESS + health-checks prod)…"
   ( cd "$HEYDADDY_DIR" && bash scripts/deploy.sh server --skip-local --migrations-ok )
   # restore_link fires on EXIT
   exit 0
 fi
 
-# ── FROM-SOURCE path (dev-fe, dev-be, prod-fe) ───────────────────────────────
+# ── FROM-SOURCE path (dev-fe, prod-fe) ────────────────────────────────────────
 cmd=(railway redeploy --from-source
      --project "$PROJECT_ID"
      --environment "$ENV_NAME"
