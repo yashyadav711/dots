@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "description": "Protocol-3 (P3) protected path globs. A git commit that stages ANY file matching these is the irreversible/sensitive class: it is DENIED unless an approval token is present (D4: Director may inline-self-approve with VFRAME_P3_OK=1; fleet/relay agents are HARD-blocked, no self-approve). Globs are matched against the repo-relative staged path with bash extglob/globstar semantics (** = any depth).",
+  "version": 2,
+  "description": "Protocol-3 (P3) protected path globs. A git commit that stages ANY file matching these is the irreversible/sensitive class: it is DENIED unless an approval token is present (D4: Director may inline-self-approve with VFRAME_P3_OK=1; fleet/relay agents are HARD-blocked, no self-approve). Globs are matched against the repo-relative staged path with bash extglob/globstar semantics (** = any depth). v2 (2026-07-19): added top-level `exclusions` \u2014 a staged path matching ANY exclusion glob is NEVER P3 (docs/prose/archives are not the risk surface; code is). Exclusions are evaluated BEFORE category globs by nhq-p3-guard p3_match_file.",
   "categories": {
     "auth": [
       "**/auth/**",
@@ -53,7 +53,28 @@
       ".claude/settings.local.json",
       "**/claude/hooks/**",
       "**/.claude/hooks/**",
-      "ai/p3-paths.json"
+      "ai/p3-paths.json",
+      "**/bin/p3-paths.json",
+      "**/bin/nhq-p3-guard",
+      "**/bin/nhq-jcode-pretool",
+      "**/bin/dangerous-command-guard*",
+      "**/.nhq/pre-tool-guard"
     ]
-  }
+  },
+  "exclusions": [
+    "**/*.md",
+    "**/*.txt",
+    "**/*.rst",
+    "**/docs/**",
+    "**/ai/archive/**",
+    "**/ai/completed/**",
+    "**/.claude/skills/**",
+    "**/test-plans/**",
+    "**/test-reports/**",
+    "**/tests/**",
+    "**/test/**",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/e2e/**"
+  ]
 }

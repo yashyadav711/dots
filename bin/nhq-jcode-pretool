@@ -100,16 +100,31 @@ case "${TOOL_RAW,,}" in
 esac
 
 # ── 5. Repo-local guard: nearest .nhq/pre-tool-guard walking up from cwd ──
+# Worktree coverage: a linked worktree (e.g. ~/Github/heydaddy-wt-*) lives
+# OUTSIDE the main repo dir, so the cwd walk-up misses the repo's .nhq/ guard.
+# Resolve the main repo toplevel via git-common-dir and run its guard too —
+# the worktree pushes to the same origin, so the same backstop must apply.
+run_local_guard() {
+  local g="$1"
+  [[ -x "$g" ]] || return 0
+  printf '%s' "$INPUT" | JCODE_HOOK_TOOL_NAME="$TOOL_RAW" JCODE_HOOK_CWD="$CWD" "$g"
+  [[ $? -eq 2 ]] && exit 2
+  return 1   # guard existed and allowed → caller stops searching
+}
+found_guard=0
 dir="$CWD"
 while [[ -n "$dir" && "$dir" != "/" ]]; do
-  local_guard="$dir/.nhq/pre-tool-guard"
-  if [[ -x "$local_guard" ]]; then
-    printf '%s' "$INPUT" | JCODE_HOOK_TOOL_NAME="$TOOL_RAW" JCODE_HOOK_CWD="$CWD" "$local_guard"
-    rc=$?
-    [[ $rc -eq 2 ]] && exit 2
-    break
+  if [[ -x "$dir/.nhq/pre-tool-guard" ]]; then
+    run_local_guard "$dir/.nhq/pre-tool-guard"; found_guard=1; break
   fi
   dir="${dir%/*}"
 done
+if [[ $found_guard -eq 0 ]]; then
+  common="$(git -C "$CWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  if [[ -n "$common" ]]; then
+    main_top="$(dirname "$common")"           # <repo>/.git → <repo>
+    run_local_guard "$main_top/.nhq/pre-tool-guard"
+  fi
+fi
 
 exit 0

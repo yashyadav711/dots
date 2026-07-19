@@ -34,5 +34,6 @@ Structure guidance for spawned swarm agents:
   instead of fanning out directly.
 - NHQ conventions still apply to workers: verify-then-claim (agent-says-done
   ≠ done), one writer per repo tree, report blockers instead of pushing/merging
-  (Protocol-3 — pushes and merges to main are Yash's keystroke and are blocked
-  by the pre_tool guard).
+  (Protocol-3 — pushes and merges to main are Yash's keystroke; fleet-tier
+  agents are hard-blocked from ALL git push/merge by the pre_tool guard, and
+  heydaddy/mirror additionally block push for every tier via .nhq backstops).

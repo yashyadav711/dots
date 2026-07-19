@@ -41,12 +41,15 @@ p3_paths_file() {
   printf '%s' "$HOME/Github/nhq-agentic-os/ai/p3-paths.json"
 }
 
-# Load globs into P3_GLOBS (array). Returns 1 if the paths file is missing/unparseable.
-P3_GLOBS=()
+# Load globs into P3_GLOBS (array) + P3_EXCLUDES (v2: paths that are NEVER P3 —
+# docs/prose/archives; evaluated before the category globs). Returns 1 if the
+# paths file is missing/unparseable.
+P3_GLOBS=(); P3_EXCLUDES=()
 p3_load_globs() {
   local pf; pf="$(p3_paths_file)"
   [[ -f "$pf" ]] || return 1
   mapfile -t P3_GLOBS < <(jq -r '.categories[][]?' "$pf" 2>/dev/null)
+  mapfile -t P3_EXCLUDES < <(jq -r '.exclusions[]?' "$pf" 2>/dev/null)
   [[ ${#P3_GLOBS[@]} -gt 0 ]]
 }
 
@@ -56,6 +59,24 @@ p3_load_globs() {
 p3_match_file() {
   local f="$1" g core
   shopt -s nocasematch
+  # v2 exclusions first: docs/prose/archives are never P3, regardless of name.
+  # EXCEPTION: never let an exclusion neutralize the policy/guard self-protection
+  # paths (security category) — those stay protected even if e.g. a *.md glob
+  # were ever added that could shadow them.
+  local excluded=1
+  for g in "${P3_EXCLUDES[@]}"; do
+    core="${g#\*\*/}"
+    # shellcheck disable=SC2053
+    if [[ "$f" == $g || "$f" == $core || "$f" == */$core ]]; then excluded=0; break; fi
+  done
+  if [[ $excluded -eq 0 ]]; then
+    for g in "**/bin/p3-paths.json" "**/bin/nhq-p3-guard" "**/bin/nhq-jcode-pretool" "**/.nhq/pre-tool-guard"; do
+      core="${g#\*\*/}"
+      # shellcheck disable=SC2053
+      if [[ "$f" == $g || "$f" == $core || "$f" == */$core ]]; then excluded=1; break; fi
+    done
+  fi
+  if [[ $excluded -eq 0 ]]; then shopt -u nocasematch; return 1; fi
   for g in "${P3_GLOBS[@]}"; do
     core="${g#\*\*/}"
     # shellcheck disable=SC2053
@@ -117,7 +138,10 @@ p3_scope() {
     echo whole; return
   fi
   if [[ "$origin" == *yashyadav711/heydaddy* || "$base" == heydaddy || "$origin" == *yashyadav711/mirror* || "$base" == mirror ]]; then
-    if [[ "$branch" == main || "$branch" == master ]]; then echo p3; else echo none; fi
+    # FAIL CLOSED on ambiguous HEAD: detached HEAD / unborn branch reports "HEAD"
+    # (or empty) — an agent could detach at main and commit ungated. Treat any
+    # non-feature-branch state of a scoped repo as prod.
+    if [[ "$branch" == main || "$branch" == master || "$branch" == HEAD || -z "$branch" ]]; then echo p3; else echo none; fi
     return
   fi
   echo none
