@@ -35,7 +35,7 @@ if [[ -z "$FILTER" ]]; then
   printf '  %s%s%s\n' "$RED" "$RULE" "$R"
 
   head_ "🚀  LAUNCHERS · jcode is the primary harness"
-  row "nhq"              "MAIN SEAT · jcode on claude-fable-5, auto thinking (anywhere)"
+  row "nhq"              "MAIN SEAT · jcode on claude-opus-4-8, auto thinking (anywhere)"
   row "envy"             "Envy · ~/Github/nHQ/envy · jcode on claude-opus-4-8"
   row "heydaddy"         "HeyDaddy · jcode"
   row "mirror"           "Mirror · jcode"
@@ -54,7 +54,7 @@ if [[ -z "$FILTER" ]]; then
   roww "nhq status · nhq threads"         "fleet state · open-threads tree"
 
   head_ "🔀  MODELS · inside a jcode session"
-  roww "/model <name>"                 "switch model (fable-5, opus-4-8, agy models…)"
+  roww "/model <name>"                 "switch model (opus-4-8, fable-5, agy models…)"
   roww "/effort · Alt+←/→"             "reasoning effort (auto/low/…/max)"
   roww "Ctrl+Tab / Shift+Tab"          "cycle models / favorites"
   note "agy pool = [providers.agy] · rotator models: claude-sonnet-4-6, gemini-3.5-flash-*, …"
@@ -130,7 +130,7 @@ done
 if [[ -z "$FILTER" ]]; then
   echo ""
   printf '  %s%s%s\n' "$DIM" "────────────────────────────────────────────────────────────────" "$R"
-  printf '   %stip:%s fable-5/opus-4-8 are the premium seats — route fleet workers to the %sagy%s pool (zero Anthropic burn).\n' "$OLIVE" "$DIM" "$GOLD" "$DIM"
+  printf '   %stip:%s opus-4-8/fable-5 are the premium seats — route fleet workers to the %sagy%s pool (zero Anthropic burn).\n' "$OLIVE" "$DIM" "$GOLD" "$DIM"
   printf '%s' "$R"
 fi
 echo ""
