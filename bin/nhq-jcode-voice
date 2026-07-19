@@ -46,6 +46,9 @@ def looks_like_noise(body: str) -> bool:
     # nhq-jfleet worker preamble (delegated task, not Yash's voice)
     if re.match(r"You are .{0,60}\(fleet agent ", body):
         return True
+    # Harness auto-poke / system nudges (not Yash's voice)
+    if re.match(r"You have \d+ incomplete todos", body):
+        return True
     return False
 
 

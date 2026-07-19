@@ -234,13 +234,13 @@ function copy; cat $argv | nhq-clip; end
 # VFrame project setup alias
 alias setupproject='bash -c "$(curl -fsSL https://raw.githubusercontent.com/yashyadav711/vframe-installer/main/setup-vframe.sh)"'
 
-# jump into HeyDaddy on omp
-alias heydaddy='cd ~/Github/Work/heydaddy && omp --continue'
-# launch Envy in its office (~/Github/nHQ/envy) on omp — bare=new session, --continue=last, --resume=picker
-alias envy='cd ~/Github/nHQ/envy && omp'
-# jump into Mirror on omp
-alias mirror='cd ~/Github/Work/mirror && omp --continue'
-# jump into Director (nhq-agentic-os) on omp
+# jump into HeyDaddy on jcode (flipped 2026-07-19, trial 4313253d passed; omp fallback: heydaddy-omp)
+alias heydaddy='cd ~/Github/Work/heydaddy && jcode'
+# launch Envy in its office (~/Github/nHQ/envy) on jcode (flipped 2026-07-19; omp fallback: envy-omp)
+alias envy='cd ~/Github/nHQ/envy && jcode'
+# jump into Mirror on jcode (flipped 2026-07-19, trial adc4663 passed; omp fallback: mirror-omp)
+alias mirror='cd ~/Github/Work/mirror && jcode'
+# jump into Director (nhq-agentic-os) — STAYS on omp until her rules rewrite + jcode trial (use director-j to try jcode)
 alias director='cd ~/Github/nhq-agentic-os && omp --continue'
 # jump into HeyDaddy-Design on omp
 alias heydaddy-design='cd ~/Github/Work/heydaddy-design && omp --continue'
@@ -249,8 +249,11 @@ alias mirror-design='cd ~/Github/Work/mirror-design && omp --continue'
 # jump into NHQ-Features on omp
 alias nhq-features='cd ~/Github/nhq-features && omp --continue'
 
-# ── jcode trial aliases (omp→jcode migration 2026-07-19) — omp aliases above stay untouched.
-# -j = same agent office, jcode harness. `--resume` opens the session picker; bare = new session.
+# ── jcode trial aliases (omp→jcode migration 2026-07-19) — primary envy/heydaddy/mirror now ON jcode.
+# -j = jcode variants (director-j is the Director trial); -omp = omp fallbacks for the flipped three.
+alias envy-omp='cd ~/Github/nHQ/envy && omp'
+alias heydaddy-omp='cd ~/Github/Work/heydaddy && omp --continue'
+alias mirror-omp='cd ~/Github/Work/mirror && omp --continue'
 alias envy-j='cd ~/Github/nHQ/envy && jcode'
 alias director-j='cd ~/Github/nhq-agentic-os && jcode'
 alias heydaddy-j='cd ~/Github/Work/heydaddy && jcode'

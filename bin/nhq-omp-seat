@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# nhq-omp-seat [omp-args...] — omp main seat on Anthropic Opus, workers on the cheap agy pool.
+#
+# Quality-first seat (anthropic/claude-opus-4-8); subagent/worker roles route to
+# agy-Gemini, strong-code to agy-Claude. Loads nhq-config.yml (next to
+# this script) as a per-key overlay over ~/.omp/agent/config.yml.
+#
+# Usage: nhq                  # interactive
+#        nhq "fix the build"  # with a prompt
+set -euo pipefail
+SRC="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+DIR="$(dirname "$SRC")"
+exec omp --config "$DIR/nhq-config.yml" "$@"
