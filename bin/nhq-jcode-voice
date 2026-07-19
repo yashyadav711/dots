@@ -49,6 +49,9 @@ def looks_like_noise(body: str) -> bool:
     # Harness auto-poke / system nudges (not Yash's voice)
     if re.match(r"You have \d+ incomplete todos", body):
         return True
+    # Terminal-output pastes (shell prompt chars / pairing screens), not voice
+    if re.search(r"\u276f\s*$", body) or re.match(r"\s*Pairing code:", body):
+        return True
     return False
 
 
