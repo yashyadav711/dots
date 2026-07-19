@@ -248,6 +248,16 @@ alias heydaddy-design='cd ~/Github/Work/heydaddy-design && omp --continue'
 alias mirror-design='cd ~/Github/Work/mirror-design && omp --continue'
 # jump into NHQ-Features on omp
 alias nhq-features='cd ~/Github/nhq-features && omp --continue'
+
+# ── jcode trial aliases (omp→jcode migration 2026-07-19) — omp aliases above stay untouched.
+# -j = same agent office, jcode harness. `--resume` opens the session picker; bare = new session.
+alias envy-j='cd ~/Github/nHQ/envy && jcode'
+alias director-j='cd ~/Github/nhq-agentic-os && jcode'
+alias heydaddy-j='cd ~/Github/Work/heydaddy && jcode'
+alias mirror-j='cd ~/Github/Work/mirror && jcode'
+alias heydaddy-design-j='cd ~/Github/Work/heydaddy-design && jcode'
+alias mirror-design-j='cd ~/Github/Work/mirror-design && jcode'
+alias nhq-features-j='cd ~/Github/nhq-features && jcode'
 # typing /exit (slash-command muscle memory) expands to exit
 abbr -a -- /exit exit
 
