@@ -1,18 +1,48 @@
 #!/usr/bin/env bash
-# nhq-help [filter] — list every nhq-* command with its one-line description.
+# nhq-help [filter] — the NHQ command wiki: seats, agents, fleet, and every nhq-* subcommand.
 #
 # Auto-discovers runnable nhq-* commands in ~/.local/bin (the PATH dir), reads
 # each script's line-2 header (`# nhq-x <args> — <desc>` or python
 # `"""nhq-x — <desc>`), and prints an aligned name — description table.
 # Excludes *-selftest helpers, *.bak* backups, nhq-lib.sh, and itself. No
-# registry to maintain — new aliases appear automatically.
+# registry to maintain — new subcommands appear automatically.
+# A static SEATS/AGENTS/FLEET header documents the jcode-era launch surface
+# (omp→jcode migration 2026-07-19).
 #
-# Usage: nhq-help            # list all
-#        nhq-help vault      # case-insensitive substring filter on the name
+# Usage: nhq-help            # header + all subcommands
+#        nhq-help vault      # filter subcommands (case-insensitive substring)
 set -euo pipefail
 
 BIN_DIR="$HOME/.local/bin"
 FILTER="${1:-}"
+
+# Static header only on the unfiltered view.
+if [[ -z "$FILTER" ]]; then
+  cat <<'HDR'
+
+━━ SEATS & AGENTS (jcode is the primary harness; omp = fallback) ━━━━━━━━━━━━
+
+  nhq                      jcode main seat — claude-fable-5, auto thinking (anywhere)
+  envy                     Envy office (~/Github/nHQ/envy) — jcode, claude-opus-4-8
+  heydaddy · mirror        product agents — jcode (their repos)
+  director                 Director — still omp --continue (until her rules rewrite)
+  director-j               Director on jcode (trial)
+  envy-omp · heydaddy-omp · mirror-omp   omp fallbacks for the flipped three
+  nhq omp-seat […]         legacy omp Opus seat launcher (was bare `nhq`)
+
+  jcode --resume           continue a previous session in the current dir (picker)
+  /resume  (in-TUI)        same, from inside a session
+
+━━ FLEET (jcode-native; old tmux path still available via nhq spawn) ━━━━━━━━
+
+  nhq jfleet spawn <agent> "task"    headless worker in the agent's repo
+  nhq jfleet status|result|tell|reap  real session state via the debug socket
+  nhq ask <agent> "q"                one-shot ask (jcode run, ~4s)
+  nhq seat                           main-seat usage advice (jcode-aware)
+
+━━ ALL SUBCOMMANDS (`nhq <name>` or `nhq-<name>`) ━━━━━━━━━━━━━━━━━━━━━━━━━━
+HDR
+fi
 
 printf '\nNHQ commands (%s):\n\n' "$BIN_DIR"
 
