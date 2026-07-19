@@ -237,7 +237,7 @@ alias setupproject='bash -c "$(curl -fsSL https://raw.githubusercontent.com/yash
 # jump into HeyDaddy on jcode (flipped 2026-07-19, trial 4313253d passed; omp fallback: heydaddy-omp)
 alias heydaddy='cd ~/Github/Work/heydaddy && jcode'
 # launch Envy in its office (~/Github/nHQ/envy) on jcode (flipped 2026-07-19; omp fallback: envy-omp)
-alias envy='cd ~/Github/nHQ/envy && jcode'
+alias envy='cd ~/Github/nHQ/envy && jcode -m claude-opus-4-8'
 # jump into Mirror on jcode (flipped 2026-07-19, trial adc4663 passed; omp fallback: mirror-omp)
 alias mirror='cd ~/Github/Work/mirror && jcode'
 # jump into Director (nhq-agentic-os) — STAYS on omp until her rules rewrite + jcode trial (use director-j to try jcode)

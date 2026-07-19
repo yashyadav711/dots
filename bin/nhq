@@ -7,7 +7,8 @@
 # dispatcher, not a rename. Discovery stays automatic: new nhq-<sub> scripts
 # appear as subcommands with zero registry.
 #
-#   nhq                    # overview: fleet status + this help
+#   nhq                    # launch the MAIN SEAT: jcode on claude-fable-5 (thinking auto)
+#   nhq status             # fleet overview
 #   nhq help [filter]      # list all subcommands (nhq-help)
 #   nhq status             # fleet state        (nhq-status)
 #   nhq spawn <agent> "…"  # spawn fleet agent  (nhq-spawn — omp/tmux path)
@@ -24,10 +25,9 @@ set -uo pipefail
 BIN_DIR="$HOME/.local/bin"
 
 if [[ $# -eq 0 ]]; then
-  # Overview: quick fleet state + pointer to help.
-  if [[ -x "$BIN_DIR/nhq-status" ]]; then "$BIN_DIR/nhq-status" || true; echo; fi
-  echo "usage: nhq <subcommand> [args…]   ·   nhq help = all subcommands"
-  exit 0
+  # Bare `nhq` = the main seat (successor of the old omp Opus seat launcher):
+  # jcode on Claude Fable 5, model default (auto) thinking/effort.
+  exec jcode -m claude-fable-5
 fi
 
 SUB="$1"; shift
