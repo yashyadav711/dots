@@ -1,25 +1,39 @@
 #!/usr/bin/env bash
-# nhq-seat — read omp usage and recommend the main seat (Anthropic vs Codex).
+# nhq-seat — read harness usage and recommend the main seat (Anthropic vs Codex).
 #
 # Quality-first manual swap (Approach B): if the current top seat's 5h OR weekly
 # is >= THRESHOLD%, recommend swapping to the other top seat. No daemon; advice only.
+# Harness: reads `jcode usage` when available (post omp→jcode migration 2026-07-19),
+# falls back to `omp usage`. Override with NHQ_SEAT_SOURCE=jcode|omp.
 #
 # Usage: nhq-seat
 set -euo pipefail
 THRESHOLD="${NHQ_SEAT_THRESHOLD:-70}"
-U="$(omp usage 2>/dev/null)"
+SOURCE="${NHQ_SEAT_SOURCE:-}"
+if [[ -z "$SOURCE" ]]; then
+  if command -v jcode >/dev/null 2>&1; then SOURCE=jcode; else SOURCE=omp; fi
+fi
 
-# Highest % seen in a provider's account block (5h or weekly, whichever is larger).
-CL="$(printf '%s\n' "$U" | awk '/Anthropic — 1 account/{f=1; next} /^[A-Za-z].* —|^Openai|^Zai|^Google/{f=0} f&&/% used/{print}' \
-  | grep -oE '[0-9]+(\.[0-9]+)?% used' | grep -oE '^[0-9]+' | sort -rn | head -1)"
-CX="$(printf '%s\n' "$U" | awk '/Openai Codex/{f=1; next} /^[A-Za-z].* —|^Zai|^Google|^Anthropic/{f=0} f&&/% used/{print}' \
-  | grep -oE '[0-9]+(\.[0-9]+)?% used' | grep -oE '^[0-9]+' | sort -rn | head -1)"
+if [[ "$SOURCE" == jcode ]]; then
+  U="$(timeout 60 jcode usage 2>/dev/null || true)"
+  # Block-scoped max % : Anthropic (Claude) block, OpenAI (ChatGPT) block.
+  CL="$(printf '%s\n' "$U" | awk '/^Anthropic \(Claude\)/{f=1; next} /^[A-Z][^ ]* /{if(f&&NR>1&&$0!~/^-/)f=0} f' \
+    | grep -oE '[0-9]+% ' | grep -oE '[0-9]+' | sort -rn | head -1 || true)"
+  CX="$(printf '%s\n' "$U" | awk '/^OpenAI \(ChatGPT\)/{f=1; next} /^[A-Z][^ ]* /{if(f&&$0!~/^-/)f=0} f' \
+    | grep -oE '[0-9]+% ' | grep -oE '[0-9]+' | sort -rn | head -1 || true)"
+else
+  U="$(omp usage 2>/dev/null)"
+  CL="$(printf '%s\n' "$U" | awk '/Anthropic — 1 account/{f=1; next} /^[A-Za-z].* —|^Openai|^Zai|^Google/{f=0} f&&/% used/{print}' \
+    | grep -oE '[0-9]+(\.[0-9]+)?% used' | grep -oE '^[0-9]+' | sort -rn | head -1)"
+  CX="$(printf '%s\n' "$U" | awk '/Openai Codex/{f=1; next} /^[A-Za-z].* —|^Zai|^Google|^Anthropic/{f=0} f&&/% used/{print}' \
+    | grep -oE '[0-9]+(\.[0-9]+)?% used' | grep -oE '^[0-9]+' | sort -rn | head -1)"
+fi
 CL="${CL:-0}"; CX="${CX:-0}"
 
-echo "main-seat usage (max of 5h/weekly):"
-echo "  Anthropic (nhq): ${CL}%"
-echo "  Codex     (nhq-omp-codex):  ${CX}%"
+echo "main-seat usage (max of 5h/weekly, source: $SOURCE):"
+echo "  Anthropic: ${CL}%"
+echo "  Codex:     ${CX}%"
 echo "threshold: ${THRESHOLD}%"
-if   (( CL < THRESHOLD )); then echo "REC: STAY on Anthropic (nhq)"
-elif (( CX < THRESHOLD )); then echo "REC: SWAP to Codex (nhq-omp-codex) — Anthropic >= ${THRESHOLD}%"
+if   (( CL < THRESHOLD )); then echo "REC: STAY on Anthropic"
+elif (( CX < THRESHOLD )); then echo "REC: SWAP to Codex — Anthropic >= ${THRESHOLD}%"
 else echo "REC: both seats >= ${THRESHOLD}% — pick the lower, or pause heavy work"; fi

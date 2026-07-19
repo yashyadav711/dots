@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# nhq-jfleet — jcode-native fleet kit: spawn / ask / tell / status / kill / reap.
+#
+# The jcode rebuild of nhq-spawn/nhq-tell/nhq-ask/nhq-status/nhq-reap: instead of
+# tmux pane-scraping ("is the spinner text visible?"), it drives jcode's shared
+# server over the DEBUG SOCKET (`jcode debug …`, requires display.debug_socket=true),
+# which gives REAL session state (status/is_processing), headless session creation,
+# async messaging with job status, DMs into live sessions, and clean destruction.
+#
+#   nhq-jfleet spawn  <agent> "<task>"   # headless session in the agent's repo + async task
+#   nhq-jfleet ask    <agent> "<q>" [--read]  # one-shot `jcode run` (no session persisted server-side state)
+#   nhq-jfleet tell   <session-or-agent> "<msg>"   # async DM/message into a live session
+#   nhq-jfleet status                     # all fleet sessions with REAL state
+#   nhq-jfleet result <session>           # last assistant response of a session
+#   nhq-jfleet kill   <session>           # destroy session + remove state files
+#   nhq-jfleet reap   [--idle-min N]      # destroy idle fleet sessions (default 20m)
+#
+# Session naming: jcode assigns friendly names; we track OURS in .meta files under
+# $NHQ_STATE_DIR keyed by "jfleet-<agent>-<slug>" mapping to the jcode session_id.
+# Registry (agent → repo/name/model) and .meta live in nhq-lib.sh — unchanged.
+# Guards: fleet sessions get NHQ_AGENT=<agent> so the pre_tool gate applies fleet tier.
+#         (jcode debug sessions inherit the SERVER's env; identity therefore ALSO
+#          rides in the task preamble + .meta. The tier block in nhq-jcode-pretool
+#          treats unset NHQ_AGENT as non-fleet — Director-tier — so for hard fleet
+#          isolation prefer `nhq-jfleet spawn`, which prefixes the task with the
+#          fleet contract, over raw debug messages.)
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+BIN="$(cd "$(dirname "$SELF")" && pwd)"
+# shellcheck source=/dev/null
+source "$BIN/nhq-lib.sh"
+
+JC="${NHQ_JCODE_BIN:-jcode}"
+
+jdbg() { timeout "${NHQ_JC_TIMEOUT:-30}" "$JC" debug --quiet "$@" 2>/dev/null; }
+
+usage() { sed -n '3,20p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2; }
+
+# session_id for one of our jfleet names (from .meta), or echo input unchanged
+# if it already looks like a jcode session id.
+resolve_sid() {
+  local key="$1" meta sid
+  [[ "$key" == session_* ]] && { printf '%s' "$key"; return 0; }
+  meta="$(nhq_meta "$key")"
+  if [[ -f "$meta" ]]; then
+    sid="$(jq -r '.jcode_session_id // empty' "$meta" 2>/dev/null)"
+    [[ -n "$sid" ]] && { printf '%s' "$sid"; return 0; }
+  fi
+  # fall back: sole live session whose name contains the key
+  jdbg sessions | jq -r --arg k "$key" '[.[]|select(.session_id|contains($k))][0].session_id // empty' 2>/dev/null
+}
+
+cmd_spawn() {
+  local agent="${1:-}" task="${2:-}"
+  [[ -z "$agent" || -z "$task" ]] && usage
+  local key repo name
+  key="$(nhq_agent_canon "$agent")"
+  [[ -z "$key" ]] && { echo "nhq-jfleet: unknown agent '$agent'" >&2; exit 1; }
+  repo="$(nhq_agent_repo "$key")"; name="$(nhq_agent_name "$key")"
+  [[ -d "$repo" ]] || { echo "nhq-jfleet: repo not found: $repo" >&2; exit 1; }
+
+  local created sid
+  created="$(jdbg "create_session:$repo")"
+  sid="$(printf '%s' "$created" | jq -r '.session_id // empty' 2>/dev/null)"
+  [[ -z "$sid" ]] && { echo "nhq-jfleet: create_session failed: $created" >&2; exit 1; }
+
+  local slug session
+  slug="$(printf '%s' "$task" | tr -cs 'a-zA-Z0-9' '-' | tr 'A-Z' 'a-z' | cut -c1-24 | sed 's/^-//;s/-$//')"
+  session="jfleet-${key}-${slug}"
+
+  nhq_ensure_state_dir
+  "$BIN/nhq-meta" init "$session" \
+    agent "$key" agent_name "$name" repo "$repo" task "$task" model jcode \
+    spawn_ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" spawn_epoch "$(date +%s)" \
+    base_branch "$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')" \
+    base_commit "$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo '')" \
+    last_state RUNNING >/dev/null 2>&1 || true
+  # record the jcode session id in .meta
+  local mf; mf="$(nhq_meta "$session")"
+  jq --arg sid "$sid" '. + {jcode_session_id:$sid, harness:"jcode"}' "$mf" > "$mf.tmp" 2>/dev/null && mv "$mf.tmp" "$mf"
+
+  # Fleet contract preamble (identity + report-back), then the task, async.
+  local preamble
+  preamble="You are ${name} (fleet agent '${key}', session ${session}) working under the NHQ Fleet Kit on a delegated task. FLEET RULES: never git push or git merge (Protocol-3 — blocked by the pre_tool guard anyway); commit your own work on the current branch; when the task is COMPLETE run: nhq-done ${key} \"<report ending in the ${key^^} STATUS RETURN block>\". Task follows: "
+  local job
+  job="$(jdbg -S "$sid" "message_async:${preamble}${task}")"
+  echo "spawned $session"
+  echo "  jcode session: $sid"
+  echo "  job: $(printf '%s' "$job" | jq -r '.job_id // "?"' 2>/dev/null)"
+  echo "  follow: nhq-jfleet status · nhq-jfleet result $session"
+}
+
+cmd_ask() {
+  local agent="${1:-}" q="${2:-}"; shift 2 || true
+  local tools=""
+  [[ "${1:-}" == "--read" ]] && tools=""
+  [[ -z "$agent" || -z "$q" ]] && usage
+  local key repo
+  key="$(nhq_agent_canon "$agent")"
+  [[ -z "$key" ]] && { echo "nhq-jfleet: unknown agent '$agent'" >&2; exit 1; }
+  repo="$(nhq_agent_repo "$key")"
+  echo "nhq-jfleet ask → $key (one-shot jcode run)…" >&2
+  ( cd "$repo" && timeout 150 "$JC" run --quiet "$q" 2>/dev/null ) || true
+}
+
+cmd_tell() {
+  local target="${1:-}" msg="${2:-}"
+  [[ -z "$target" || -z "$msg" ]] && usage
+  local sid; sid="$(resolve_sid "$target")"
+  [[ -z "$sid" ]] && { echo "nhq-jfleet: no session found for '$target'" >&2; exit 1; }
+  jdbg -S "$sid" "message_async:$msg" | jq -r '"queued job \(.job_id // "?")"' 2>/dev/null
+}
+
+cmd_status() {
+  # jfleet sessions (from .meta) with REAL per-session state from the server:
+  # `state` (exists ⇒ ALIVE) + latest job status (running ⇒ BUSY). Headless
+  # sessions do NOT appear in `sessions` (that lists client-attached ones),
+  # so we query per-SID.
+  printf '%-40s %-8s %-10s %s\n' "SESSION" "STATE" "JOB" "AGENT/TASK"
+  local mf session sid st job agent task
+  for mf in "$NHQ_STATE_DIR"/jfleet-*.meta; do
+    [[ -e "$mf" ]] || continue
+    session="$(basename "$mf" .meta)"
+    sid="$(jq -r '.jcode_session_id // empty' "$mf" 2>/dev/null)"
+    agent="$(jq -r '.agent // "?"' "$mf" 2>/dev/null)"
+    task="$(jq -r '(.task // "")[:40]' "$mf" 2>/dev/null)"
+    if jdbg -S "$sid" state >/dev/null 2>&1 && [[ -n "$(jdbg -S "$sid" state)" ]]; then
+      st=ALIVE
+    else
+      st=DEAD
+    fi
+    job="$(jdbg "jobs:session:$sid" | jq -r '.[0].status // "-"' 2>/dev/null)"
+    printf '%-40s %-8s %-10s %s: %s\n' "$session" "$st" "${job:--}" "$agent" "$task"
+  done
+}
+
+cmd_result() {
+  local target="${1:-}"; [[ -z "$target" ]] && usage
+  local sid; sid="$(resolve_sid "$target")"
+  [[ -z "$sid" ]] && { echo "nhq-jfleet: no session for '$target'" >&2; exit 1; }
+  jdbg -S "$sid" last_response
+}
+
+cmd_kill() {
+  local target="${1:-}"; [[ -z "$target" ]] && usage
+  local sid; sid="$(resolve_sid "$target")"
+  [[ -n "$sid" ]] && jdbg "destroy_session:$sid"
+  rm -f "$(nhq_meta "$target")" "$(nhq_marker "$target")" "$(nhq_activity "$target")" 2>/dev/null
+  echo "killed $target"
+}
+
+cmd_reap() {
+  local idle_min="${2:-20}" now epoch mf session sid job age
+  [[ "${1:-}" == "--idle-min" ]] && idle_min="${2:-20}"
+  now="$(date +%s)"
+  for mf in "$NHQ_STATE_DIR"/jfleet-*.meta; do
+    [[ -e "$mf" ]] || continue
+    session="$(basename "$mf" .meta)"
+    sid="$(jq -r '.jcode_session_id // empty' "$mf" 2>/dev/null)"
+    if [[ -z "$(jdbg -S "$sid" state)" ]]; then
+      echo "reap: $session (DEAD on server) — cleaning state"
+      rm -f "$mf" "$(nhq_marker "$session")" "$(nhq_activity "$session")"
+      continue
+    fi
+    job="$(jdbg "jobs:session:$sid" | jq -r '.[0].status // ""' 2>/dev/null)"
+    [[ "$job" == "running" ]] && continue   # never reap a RUNNING session
+    epoch="$(jq -r '.spawn_epoch // 0' "$mf" 2>/dev/null)"
+    age=$(( (now - epoch) / 60 ))
+    if (( age >= idle_min )); then
+      echo "reap: $session (idle ${age}m ≥ ${idle_min}m) — destroying"
+      jdbg "destroy_session:$sid" >/dev/null
+      rm -f "$mf" "$(nhq_marker "$session")" "$(nhq_activity "$session")"
+    fi
+  done
+}
+
+case "${1:-}" in
+  spawn)  shift; cmd_spawn "$@";;
+  ask)    shift; cmd_ask "$@";;
+  tell)   shift; cmd_tell "$@";;
+  status) shift; cmd_status "$@";;
+  result) shift; cmd_result "$@";;
+  kill)   shift; cmd_kill "$@";;
+  reap)   shift; cmd_reap "$@";;
+  *) usage;;
+esac

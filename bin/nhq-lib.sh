@@ -65,7 +65,8 @@ nhq_pane_has_claude() {
     next=""
     for cur in $queue; do
       comm=$(ps -o comm= -p "$cur" 2>/dev/null | tr -d ' ')
-      [[ "$comm" == "claude" || "$comm" == "node" ]] && return 0
+      # claude/node = Claude Code / omp harness; jcode* = jcode harness (2026-07-19)
+      [[ "$comm" == "claude" || "$comm" == "node" || "$comm" == jcode* ]] && return 0
       kids=$(ps -o pid= --ppid "$cur" 2>/dev/null)
       for k in $kids; do next="$next $k"; done
     done
@@ -81,8 +82,9 @@ nhq_session_state() {
   local pid; pid=$(tmux display-message -p -t "$s" '#{pane_pid}' 2>/dev/null || echo "")
   if ! nhq_pane_has_claude "$pid"; then echo "DEAD"; return 0; fi
   # claude is alive — busy or idle? Look for the live work indicator in the pane.
+  # 'esc to interrupt' + '(Ns ·' = Claude Code/omp; '(Esc to cancel)' = jcode TUI.
   local pane; pane=$(tmux capture-pane -p -t "$s" 2>/dev/null || echo "")
-  if printf '%s' "$pane" | grep -qE 'esc to interrupt|\([0-9]+m? ?[0-9]*s · '; then
+  if printf '%s' "$pane" | grep -qE 'esc to interrupt|Esc to cancel|\([0-9]+m? ?[0-9]*s · '; then
     echo "RUNNING"
   else
     echo "IDLE"

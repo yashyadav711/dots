@@ -98,10 +98,13 @@ def _proc_text(pid: int, name: str) -> str:
 
 
 def _is_omp_runtime(pid: int) -> bool:
-    """True if `pid` is the omp harness itself or its /tmp/omp-python-runner eval-runner
-    (the diagnosed-benign zombie parents — see envy store/LOG.md 2026-06-25). Anything
-    else parenting a zombie is treated as a real new leak."""
-    if _proc_text(pid, "comm").strip() == "omp":
+    """True if `pid` is a known-benign zombie parent: the omp harness / its
+    /tmp/omp-python-runner eval-runner (diagnosed 2026-06-25), or the jcode
+    harness (added 2026-07-19 for the omp→jcode migration — jcode spawns
+    detached observer hooks and terminal children the same way). Anything else
+    parenting a zombie is treated as a real new leak."""
+    comm = _proc_text(pid, "comm").strip()
+    if comm == "omp" or comm.startswith("jcode"):
         return True
     if "omp-python-runner" in _proc_text(pid, "cmdline").replace("\x00", " "):
         return True

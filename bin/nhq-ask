@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # nhq-ask <agent> "<question>" [--read] — ephemeral one-shot ask to a fleet agent.
 #
-# Runs the target agent in omp PRINT mode (`omp -p --no-session`): a one-shot process
-# that loads the agent's CLAUDE.md + .claude/rules, answers, and EXITS. It creates NO
-# persistent session and never attaches to / disturbs a live interactive session
-# (e.g. Yash's Director session in nhq-agentic-os). Spawn -> ask -> answer -> close,
-# all in a single throwaway process. If the agent already has a live session, that
-# session is untouched — this is a separate ephemeral instance, asked and gone.
+# Runs the target agent in one-shot PRINT mode: a throwaway process that loads the
+# agent's CLAUDE.md + rules, answers, and EXITS. It creates NO persistent session
+# and never attaches to / disturbs a live interactive session (e.g. Yash's Director
+# session in nhq-agentic-os). Spawn -> ask -> answer -> close.
+# Harness: `jcode run --quiet` when available (post omp→jcode migration 2026-07-19),
+# else `omp -p --no-session`. Override with NHQ_ASK_HARNESS=jcode|omp.
 #
 # Default: --no-tools — a fast, tool-free, zero-side-effect reply (the agent answers
 # from its loaded CLAUDE.md + .claude/rules context). Add `--read` to let the agent use
@@ -52,8 +52,14 @@ if [[ -n "$ASKER_KEY" && "$ASKER_KEY" == "$KEY" ]]; then
   exit 1
 fi
 
-# Default: --no-tools (fast, safe, deterministic — the agent's CLAUDE.md + rules load
-# regardless). --read enables tools (omp's yolo approvalMode auto-runs them).
+# Default: tool-free intent (fast, safe — the agent's CLAUDE.md + rules load
+# regardless). --read allows tools for a deeper answer; the prompt stays READ-ONLY.
+# (omp enforces via --no-tools; jcode enforces via the READ-ONLY prompt contract +
+# the pre_tool guards.)
+HARNESS="${NHQ_ASK_HARNESS:-}"
+if [[ -z "$HARNESS" ]]; then
+  if command -v jcode >/dev/null 2>&1; then HARNESS=jcode; else HARNESS=omp; fi
+fi
 TOOLS="--no-tools"
 [[ "$FLAG" == "--read" || "$FLAG" == "--deep" ]] && TOOLS=""
 
@@ -61,8 +67,12 @@ PROMPT="$Q
 
 [One-shot ask from '$ASKER' via nhq-ask. Answer concisely + decisively from your role and rules. READ-ONLY: do NOT edit / write / commit / push / branch — just answer. No need to run nhq-done; this is a direct reply.]"
 
-echo "nhq-ask -> $NAME  (ephemeral omp -p, no session; live sessions untouched)…" >&2
-ANSWER="$(cd "$REPO" && timeout 150 omp -p --no-session $TOOLS "$PROMPT" 2>/dev/null || true)"
+echo "nhq-ask -> $NAME  (ephemeral $HARNESS one-shot; live sessions untouched)…" >&2
+if [[ "$HARNESS" == jcode ]]; then
+  ANSWER="$(cd "$REPO" && timeout 150 jcode run --quiet "$PROMPT" 2>/dev/null | sed '/^\[Tokens\]/d' || true)"
+else
+  ANSWER="$(cd "$REPO" && timeout 150 omp -p --no-session $TOOLS "$PROMPT" 2>/dev/null || true)"
+fi
 
 if [[ -z "${ANSWER//[[:space:]]/}" ]]; then
   echo "nhq-ask: no answer captured from $NAME (timed out or empty). Try again." >&2
