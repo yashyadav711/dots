@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""nhq-jcode-voice — jcode turn_start observer → Yash voice corpus (ai/yash-voice.md).
+
+Port of omp's voice-capture extension: appends every verbatim Yash prompt to the
+canonical voice file. jcode fires `turn_start` AFTER the user message is appended
+to the session journal, so this reads the LAST user text message from
+~/.jcode/sessions/<session_id>.journal.jsonl and appends it.
+
+Filters (mirrors of the omp extension's looksLikeNoise + fleet exclusion):
+  • tool_result-only user messages (not voice)
+  • leaked relay/assignment templates (# Target / # Acceptance …)
+  • STATUS RETURN / task-notification blobs
+  • WhatsApp pastes, giant multi-line pastes (>8k chars & >40 lines)
+  • nhq-jfleet worker preambles ("You are … fleet agent …")
+  • [Tool call blocked…] / system-reminder wrappers are stripped, not dropped
+Dedupe: last-line check against the tail of the voice file (mechanical re-fires).
+
+Wiring: ~/.jcode/config.toml → [hooks] turn_start = "~/.local/bin/nhq-jcode-voice"
+Env in: JCODE_HOOK_SESSION_ID, JCODE_HOOK_CWD, JCODE_HOOK_SOURCE.
+Observer contract: detached, fire-and-forget; never blocks the agent; exit 0 always.
+"""
+import json
+import os
+import re
+import sys
+import time
+
+VOICE_FILE = os.path.expanduser("~/Github/nhq-agentic-os/ai/yash-voice.md")
+SESS_DIR = os.path.expanduser("~/.jcode/sessions")
+
+
+def log_noop(*_a):
+    sys.exit(0)
+
+
+def looks_like_noise(body: str) -> bool:
+    if re.search(r"^#{1,3}\s+(Target|Change|Acceptance|Goal|Constraints|Contract)\b", body, re.M) and \
+       re.search(r"^#{1,3}\s+(Acceptance|Contract|Change|Constraints)\b", body, re.M):
+        return True
+    if re.search(r"STATUS RETURN|<task-notification|<task-result|<system-notice", body):
+        return True
+    if re.search(r"\[\d{1,2}:\d{2},?\s*\d{0,2}/?\d{0,2}/?\d{0,4}\]", body):
+        return True
+    if len(body) > 8000 and body.count("\n") > 40:
+        return True
+    # nhq-jfleet worker preamble (delegated task, not Yash's voice)
+    if re.match(r"You are .{0,60}\(fleet agent ", body):
+        return True
+    return False
+
+
+def extract_user_text(msg) -> str:
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def clean(body: str) -> str:
+    # Strip system-reminder wrappers and leading [ISO timestamp] tags jcode adds.
+    body = re.sub(r"<system-reminder>.*?</system-reminder>", "", body, flags=re.S)
+    body = re.sub(r"^\[\d{4}-\d{2}-\d{2}T[0-9:.]+Z?\]\s*", "", body.strip())
+    return body.strip()
+
+
+def main():
+    sid = os.environ.get("JCODE_HOOK_SESSION_ID", "")
+    if not sid:
+        log_noop()
+    journal = os.path.join(SESS_DIR, f"{sid}.journal.jsonl")
+    if not os.path.isfile(journal):
+        log_noop()
+
+    # Last user message with real text, scanning backwards.
+    body = ""
+    try:
+        with open(journal, "r", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        log_noop()
+    for line in reversed(lines[-400:]):
+        if '"role"' not in line or '"user"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for msg in reversed(rec.get("append_messages", [])):
+            if msg.get("role") != "user":
+                continue
+            text = clean(extract_user_text(msg))
+            if text:
+                body = text
+                break
+        if body:
+            break
+    if not body or looks_like_noise(body):
+        log_noop()
+
+    # Dedupe: skip if this exact body is already the last captured entry.
+    try:
+        with open(VOICE_FILE, "r", errors="replace") as f:
+            tail = f.read()[-len(body) - 400:]
+        if body in tail:
+            log_noop()
+    except OSError:
+        pass
+
+    cwd = os.environ.get("JCODE_HOOK_CWD", "")
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    entry = f"\n--- {ts} | cwd: {cwd} | session: {sid.split('_')[1] if '_' in sid else sid} (jcode) ---\n{body}\n"
+    try:
+        with open(VOICE_FILE, "a") as f:
+            f.write(entry)
+    except OSError:
+        pass
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
