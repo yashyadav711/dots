@@ -1,50 +1,108 @@
 #!/usr/bin/env bash
-# nhq-help [filter] — the NHQ command wiki: seats, agents, fleet, and every nhq-* subcommand.
+# nhq-help [filter] — the NetrunnersHQ command WIKI: launchers, fleet, tools, keys, every nhq-* subcommand.
 #
-# Auto-discovers runnable nhq-* commands in ~/.local/bin (the PATH dir), reads
-# each script's line-2 header (`# nhq-x <args> — <desc>` or python
-# `"""nhq-x — <desc>`), and prints an aligned name — description table.
-# Excludes *-selftest helpers, *.bak* backups, nhq-lib.sh, and itself. No
-# registry to maintain — new subcommands appear automatically.
-# A static SEATS/AGENTS/FLEET header documents the jcode-era launch surface
-# (omp→jcode migration 2026-07-19).
+# ONE canonical implementation (Yash 2026-07-19): the fish `nhq-help`/`omp-help`
+# functions and the `nhq help` dispatcher all route here. Static wiki sections
+# (jcode-era launch surface) + an auto-discovered subcommand list (reads each
+# nhq-* script's line-2 header; zero registry to maintain).
 #
-# Usage: nhq-help            # header + all subcommands
-#        nhq-help vault      # filter subcommands (case-insensitive substring)
-set -euo pipefail
+# Usage: nhq-help            # full wiki
+#        nhq-help vault      # filter the subcommand list (skips the wiki)
+set -uo pipefail
 
 BIN_DIR="$HOME/.local/bin"
 FILTER="${1:-}"
 
-# Static header only on the unfiltered view.
-if [[ -z "$FILTER" ]]; then
-  cat <<'HDR'
-
-━━ SEATS & AGENTS (jcode is the primary harness; omp = fallback) ━━━━━━━━━━━━
-
-  nhq                      jcode main seat — claude-fable-5, auto thinking (anywhere)
-  envy                     Envy office (~/Github/nHQ/envy) — jcode, claude-opus-4-8
-  heydaddy · mirror        product agents — jcode (their repos)
-  director                 Director — still omp --continue (until her rules rewrite)
-  director-j               Director on jcode (trial)
-  envy-omp · heydaddy-omp · mirror-omp   omp fallbacks for the flipped three
-  nhq omp-seat […]         legacy omp Opus seat launcher (was bare `nhq`)
-
-  jcode --resume           continue a previous session in the current dir (picker)
-  /resume  (in-TUI)        same, from inside a session
-
-━━ FLEET (jcode-native; old tmux path still available via nhq spawn) ━━━━━━━━
-
-  nhq jfleet spawn <agent> "task"    headless worker in the agent's repo
-  nhq jfleet status|result|tell|reap  real session state via the debug socket
-  nhq ask <agent> "q"                one-shot ask (jcode run, ~4s)
-  nhq seat                           main-seat usage advice (jcode-aware)
-
-━━ ALL SUBCOMMANDS (`nhq <name>` or `nhq-<name>`) ━━━━━━━━━━━━━━━━━━━━━━━━━━
-HDR
+# NHQ palette (matches the old fish wiki): crimson headers, gold commands, dim descs.
+if [[ -t 1 ]]; then
+  RED=$'\e[1;38;2;200;16;46m'; GOLD=$'\e[1;38;2;242;183;5m'; TEAL=$'\e[1;38;2;62;124;113m'
+  DIM=$'\e[38;2;107;102;96m'; TXT=$'\e[38;2;189;184;172m'; OLIVE=$'\e[38;2;124;135;62m'; R=$'\e[0m'
+else
+  RED=""; GOLD=""; TEAL=""; DIM=""; TXT=""; OLIVE=""; R=""
 fi
 
-printf '\nNHQ commands (%s):\n\n' "$BIN_DIR"
+head_() { printf '\n  %s%s%s\n  %s%s%s\n' "$RED" "$1" "$R" "$DIM" "────────────────────────────────────────────────────────────" "$R"; }
+row()   { printf '   %s%-26s%s %s%s%s\n' "$GOLD" "$1" "$R" "$TXT" "$2" "$R"; }
+roww()  { printf '   %s%-38s%s %s%s%s\n' "$GOLD" "$1" "$R" "$TXT" "$2" "$R"; }
+note()  { printf '   %s%s%s\n' "$OLIVE" "$1" "$R"; }
+
+if [[ -z "$FILTER" ]]; then
+  RULE="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  printf '  %s%s%s\n' "$RED" "$RULE" "$R"
+  printf '     %sNETRUNNERS%s%sHQ%s   %s·%s   %sCOMMAND WIKI%s   %s·%s   %sjcode era%s\n' \
+    "$GOLD" "$R" "$RED" "$R" "$DIM" "$R" "$TEAL" "$R" "$DIM" "$R" "$OLIVE" "$R"
+  printf '  %s%s%s\n' "$RED" "$RULE" "$R"
+
+  head_ "🚀  LAUNCHERS · jcode is the primary harness"
+  row "nhq"              "MAIN SEAT · jcode on claude-fable-5, auto thinking (anywhere)"
+  row "envy"             "Envy · ~/Github/nHQ/envy · jcode on claude-opus-4-8"
+  row "heydaddy"         "HeyDaddy · jcode"
+  row "mirror"           "Mirror · jcode"
+  row "director"         "Director · still omp --continue (until her rules rewrite)"
+  row "director-j"       "Director on jcode (trial)"
+  note "omp fallbacks: envy-omp · heydaddy-omp · mirror-omp · nhq omp-seat […]"
+  note "continue a session: jcode --resume (picker) · /resume inside the TUI"
+
+  head_ "🤖  FLEET · jcode-native (debug socket, no tmux scraping)"
+  roww "nhq jfleet spawn <agent> \"task\"" "headless worker in the agent's repo"
+  roww "nhq jfleet status"                "real session state (ALIVE/DEAD + job)"
+  roww "nhq jfleet result|tell|kill|reap" "read output · steer · retire"
+  roww "nhq ask <agent> \"question\""      "one-shot ephemeral ask (~4s)"
+  roww "nhq spawn <agent> \"task\""        "legacy omp/tmux fleet path (still works)"
+  roww "nhq done|blocked <agent> \"…\""    "the callbacks that close the loop"
+  roww "nhq status · nhq threads"         "fleet state · open-threads tree"
+
+  head_ "🔀  MODELS · inside a jcode session"
+  roww "/model <name>"                 "switch model (fable-5, opus-4-8, agy models…)"
+  roww "/effort · Alt+←/→"             "reasoning effort (auto/low/…/max)"
+  roww "Ctrl+Tab / Shift+Tab"          "cycle models / favorites"
+  note "agy pool = [providers.agy] · rotator models: claude-sonnet-4-6, gemini-3.5-flash-*, …"
+
+  head_ "⌨️   JCODE SLASH COMMANDS (the NHQ set)"
+  row "/recap"          "beautiful short recap of everything done this session"
+  row "/catchup"        "what happened while you were gone + where to pick up"
+  row "/nhq-handoff"    "write the durable NHQ handoff doc (ai/session-handoff.md)"
+  row "/handoff"        "compact this conversation into a handoff for a fresh agent"
+  row "/private"        "fully private — nothing leaves the box"
+  row "/extra-private"  "max privacy posture · keep-or-delete prompt on close"
+  row "/prompt"         "read prompt.md scratchpad and do what it says"
+  row "/resume"         "session picker · /fork branch · /transfer fresh+compacted"
+  row "/compact"        "compress context · /clear start over"
+  row "/usage"          "provider quota · /info session tokens · /model models"
+  row "/skills"         "loaded skills · /<skillname> runs one"
+  note "type / in jcode for the full live list + autocomplete"
+
+  head_ "🎹  JCODE KEYS (your config)"
+  row "Alt+M"            "side panel · Alt+T diagram pane · Alt+C centered"
+  row "Ctrl+K/J"         "prev / next prompt · Ctrl+Shift+K/J scroll"
+  row "Alt+H/J/K/L"      "workspace navigation between sessions"
+  row "Ctrl+Tab"         "model switch · Alt+←/→ effort"
+  row "Alt+X"            "todo card · Alt+I info widget · Alt+G diff mode"
+  row "Ctrl+S"           "stash / pop the input draft"
+  row "Alt+R"            "resume picker · Alt+N swarm panel"
+  note "full list: /keys · remap in ~/.jcode/config.toml [keybindings]"
+
+  head_ "🧩  JCODE CLI · from the shell"
+  row "jcode run \"…\""    "one-shot print mode (-m model)"
+  row "jcode usage"      "quota across all authenticated providers"
+  row "jcode --resume"   "resume sessions (also from claude-code/codex/pi!)"
+  row "jcode debug …"    "server API: sessions, messages, swarm (fleet backbone)"
+  row "jcode replay"     "replay a session · export video"
+  row "jcode login"      "OAuth to any provider"
+
+  head_ "🐙  AGY / ANTIGRAVITY · free Gemini + Claude"
+  row "agy -p \"…\""       "research / query via the rotator (zero quota)"
+  row "agyq"             "live per-account rotator quota"
+  row "agy-usage"        "quota trends · agy-reauth switch account"
+  note "in jcode: -m claude-sonnet-4-6 / gemini-3.5-flash-* rides the same pool"
+
+  head_ "🧰  SHELL UTILITY"
+  row "reload"           "restart fish · l1/l2/l3 tree · ex extract · backup .bak"
+  row "nhq-help · omp-help · nhq help" "this wiki (one implementation)"
+
+  head_ "📚  ALL SUBCOMMANDS · nhq <name> or nhq-<name> · auto-discovered"
+fi
 
 for path in "$BIN_DIR"/nhq-*; do
   [[ -e "$path" ]] || continue
@@ -60,13 +118,19 @@ for path in "$BIN_DIR"/nhq-*; do
   fi
   real="$(readlink -f "$path")"
   line2="$(sed -n '2p' "$real" 2>/dev/null || true)"
-  desc="${line2#\#}"        # drop a leading '#'
-  desc="${desc#\"\"\"}"     # or a leading python '"""'
-  desc="${desc# }"          # drop one leading space
+  desc="${line2#\#}"
+  desc="${desc#\"\"\"}"
+  desc="${desc# }"
   if [[ "$desc" == *" — "* ]]; then
-    desc="${desc#* — }"     # keep only text after the em-dash separator
+    desc="${desc#* — }"
   fi
-  printf '  %-24s %s\n' "$name" "$desc"
+  printf '   %s%-26s%s %s%s%s\n' "$GOLD" "${name#nhq-}" "$R" "$TXT" "$desc" "$R"
 done
 
-printf '\n'
+if [[ -z "$FILTER" ]]; then
+  echo ""
+  printf '  %s%s%s\n' "$DIM" "────────────────────────────────────────────────────────────────" "$R"
+  printf '   %stip:%s fable-5/opus-4-8 are the premium seats — route fleet workers to the %sagy%s pool (zero Anthropic burn).\n' "$OLIVE" "$DIM" "$GOLD" "$DIM"
+  printf '%s' "$R"
+fi
+echo ""
