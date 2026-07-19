@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# nhq-jcode-voice-wrap — double-fork wrapper so the jcode server never holds a
+# reapable child for the voice hook. jcode's observer dispatch (v0.52.0) drops
+# the Child handle without wait(), leaking one zombie per turn; the double fork
+# reparents the real worker to init, which always reaps. Remove when the
+# upstream hooks.rs reap fix (selfdev tree, 2026-07-19) ships in the running binary.
+setsid bash -c 'exec "$HOME/.local/bin/nhq-jcode-voice"' >/dev/null 2>&1 < /dev/null &
+disown
+exit 0
