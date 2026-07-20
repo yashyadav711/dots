@@ -89,6 +89,47 @@ if [[ "$TOOL" == "Bash" ]]; then
       exit 2
     fi
   fi
+
+  # ── 4b. Director-tier PROD push/merge gate (governance 2026-07-20) ──
+  # Director is NOT fleet, so the fleet block above skips it. A Director push/merge
+  # that targets a SCOPED prod repo's main/master (heydaddy/mirror) requires Yash's
+  # "ok - Yash" signature token (nhq-approve verify). Dev/feature pushes + non-scoped
+  # repos pass untouched. Fail-closed toward requiring the signature on ambiguous
+  # prod-main targeting; NEVER gate dev/feature pushes.
+  if [[ -n "$CMD" ]] && ! fleet_tier; then
+    STRIPPED_D="$(printf '%s' "$CMD" | sed -e "s/'[^']*'/''/g" -e 's/"[^"]*"/""/g')"
+    if printf '%s' "$STRIPPED_D" | grep -qE '(^|[;&|(`]|&&)[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*)(sudo[[:space:]]+|command[[:space:]]+|exec[[:space:]]+|env[[:space:]]+)*([^[:space:]]*/)?git[[:space:]]+((-C[[:space:]]+[^[:space:]]+|--git-dir=[^[:space:]]+|-[^[:space:]]+)[[:space:]]+)*(push|merge)([[:space:]]|$)'; then
+      GCTX="$CWD"
+      _gc="$(printf '%s' "$CMD" | grep -oE -- '-C[[:space:]]+[^[:space:]]+' | head -1 | sed -E 's/^-C[[:space:]]+//')"
+      [[ -n "$_gc" ]] && GCTX="$_gc"
+      _base="$(basename "$(git -C "$GCTX" rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+      _origin="$(git -C "$GCTX" remote get-url origin 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+      _branch="$(git -C "$GCTX" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+      _scoped=0
+      case "$_base$_origin" in *heydaddy*|*mirror*) _scoped=1;; esac
+      if [[ $_scoped -eq 1 ]]; then
+        _targets_main=0
+        # merge → destination is the current branch
+        if printf '%s' "$STRIPPED_D" | grep -qw merge; then
+          [[ "$_branch" == main || "$_branch" == master ]] && _targets_main=1
+        fi
+        # push → main named as a ref, or a bare push while on main
+        if printf '%s' "$STRIPPED_D" | grep -qw push; then
+          printf '%s' "$STRIPPED_D" | grep -qE '(:|[[:space:]])(main|master)([[:space:]]|$)' && _targets_main=1
+          if [[ "$_branch" == main || "$_branch" == master ]]; then
+            printf '%s' "$STRIPPED_D" | grep -qE 'push[[:space:]]+[^[:space:]-][^[:space:]]*[[:space:]]+[^[:space:]-]' || _targets_main=1
+          fi
+        fi
+        if [[ $_targets_main -eq 1 ]]; then
+          _apbin="$HOME/.local/bin/nhq-approve"; [[ -x "$_apbin" ]] || _apbin="$(command -v nhq-approve 2>/dev/null || true)"
+          if [[ -z "$_apbin" ]] || ! "$_apbin" verify --repo "$_base" --target main >/dev/null 2>&1; then
+            echo "BLOCKED (Protocol-3): prod push/merge to ${_base}:main needs Yash's 'ok - Yash' signature. After 'ok - Yash', run: nhq-approve grant --repo ${_base} --target main  (then retry)." >&2
+            exit 2
+          fi
+        fi
+      fi
+    fi
+  fi
   # 1 + 2. The Bash-scoped guards (each self-filters on tool_name).
   run_guard "$HOME/.claude/hooks/dangerous-command-guard.sh"
   run_guard "$HOME/.local/bin/nhq-p3-guard"

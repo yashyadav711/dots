@@ -4,9 +4,12 @@
 # DENIES a git commit that stages any auth/payments/PII/audit/security path
 # (globs in p3-paths.json) UNLESS an approval token is present.
 #
-# D4 (locked) — approval hardness depends on WHO is committing:
-#   • Director-direct / human  → MAY self-approve inline with VFRAME_P3_OK=1
-#                                (Director IS the human gate; the token is logged).
+# D4 (locked) + ok-Yash signature (Yash 2026-07-20, governance-ok-yash-signature):
+# approval hardness depends on WHO is committing:
+#   • Director-direct / human  → may approve ONLY with a live `ok - Yash` signature
+#                                token (nhq-approve consume; single-use, TTL-bounded).
+#                                The old bare inline VFRAME_P3_OK=1 self-approve is GONE
+#                                on prod P3 gates — Director must hold Yash's signature.
 #   • fleet / relay agent      → HARD-blocked. No self-approve, token ignored.
 #
 # Caller identity:
@@ -150,6 +153,29 @@ p3_scope() {
 # p3_evaluate <mode>  (mode = pretooluse | precommit)
 # sets P3_MATCHED + P3_VERDICT; returns 0 allow / 1 deny. Reads P3_GIT_ARGS.
 P3_MATCHED=""; P3_VERDICT=""
+
+# Locate the nhq-approve binary (dots/bin sibling → PATH). Empty if unavailable.
+p3_approve_bin() {
+  if [[ -n "${NHQ_APPROVE_BIN:-}" ]]; then printf '%s' "$NHQ_APPROVE_BIN"; return; fi
+  if [[ -x "$BIN/nhq-approve" ]]; then printf '%s' "$BIN/nhq-approve"; return; fi
+  command -v nhq-approve 2>/dev/null || true
+}
+
+# Resolve the repo basename + branch the current commit targets, from the SAME
+# P3_GIT_ARGS context p3_scope already used (never re-parse the command string for
+# identity). Sets P3_REPO_BASE + P3_TARGET_BRANCH. Detached/unborn HEAD on a scoped
+# prod repo is treated as prod "main" (p3_scope already forces that state to scope p3).
+P3_REPO_BASE=""; P3_TARGET_BRANCH=""
+p3_resolve_identity() {
+  P3_REPO_BASE="$(basename "$(git "${P3_GIT_ARGS[@]}" rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  local branch
+  branch="$(git "${P3_GIT_ARGS[@]}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  if [[ "$branch" == master ]]; then branch=master
+  elif [[ "$branch" == main || "$branch" == HEAD || -z "$branch" ]]; then branch=main
+  fi
+  P3_TARGET_BRANCH="$branch"
+}
+
 p3_evaluate() {
   local mode="${1:-pretooluse}" f
   # H3: the git context must resolve to a real repo. If -C / GIT_DIR points nowhere
@@ -190,16 +216,18 @@ p3_evaluate() {
   if [[ "$mode" == "precommit" ]]; then
     P3_VERDICT="DENY(precommit-no-selfapprove)"; p3_audit deny; return 1
   fi
-  # PreToolUse self-approval (D4). IDENTITY is harness-env (p3_caller_privileged); the TOKEN
-  # is P3_TOKEN, set by the caller from the COMMAND's inline `VFRAME_P3_OK=1` env-prefix —
-  # because Director-the-agent can only signal intent inline, not via the hook's env. The
-  # token is honored ONLY for a harness-proven Director: a fleet agent that puts
-  # VFRAME_P3_OK=1 (or fakes NHQ_AGENT=director) inline is still fleet by identity → blocked.
+  # PreToolUse Director approval (governance 2026-07-20): a harness-proven Director
+  # approves a PROD P3 commit ONLY via a valid "ok - Yash" signature token (nhq-approve),
+  # NOT a bare inline VFRAME_P3_OK. Director writes the token after Yash types "ok - Yash";
+  # the guard CONSUMES it (single-use) + audits. No token → blocked. A fleet agent that
+  # fakes identity/token inline is still fleet by harness identity → hard-blocked below.
   if p3_caller_privileged; then
-    if [[ "${P3_TOKEN:-}" == "1" ]]; then
-      P3_VERDICT="ALLOW(director-inline-token)"; p3_audit allow; return 0
+    p3_resolve_identity
+    local _ap_bin; _ap_bin="$(p3_approve_bin)"
+    if [[ -n "$_ap_bin" ]] && "$_ap_bin" consume --repo "$P3_REPO_BASE" --target "$P3_TARGET_BRANCH" >/dev/null 2>&1; then
+      P3_VERDICT="ALLOW(yash-signature-token)"; p3_audit allow; return 0
     fi
-    P3_VERDICT="DENY(director-no-token)"; p3_audit deny; return 1
+    P3_VERDICT="DENY(no-yash-signature)"; p3_audit deny; return 1
   fi
   P3_VERDICT="DENY(fleet-hard-block)"; p3_audit deny; return 1
 }
@@ -237,7 +265,8 @@ p3_deny_reason() {
   local m; m="$(printf '%s' "$P3_MATCHED" | tr '\n' ' ')"
   case "$P3_VERDICT" in
     DENY\(fleet-hard-block\)) echo "this commit stages protected path(s) [$m]; fleet/relay agents are hard-blocked from auth/payments/PII/audit/security commits — escalate to Yash via nhq-blocked." ;;
-    DENY\(director-no-token\)) echo "this commit stages protected path(s) [$m]; Director self-approves by prefixing the commit inline: 'VFRAME_P3_OK=1 git commit --no-verify …' (the --no-verify clears the hard pre-commit hook; the approval is logged to audit.jsonl)." ;;
+    DENY\(no-yash-signature\)) echo "this commit stages protected path(s) [$m] on a PROD target — it needs Yash's 'ok - Yash' signature. After Yash types 'ok - Yash' in chat, Director runs: nhq-approve grant --repo <repo> --target <branch> , then retries the commit (token is single-use + logged to audit.jsonl)." ;;
+    DENY\(director-no-token\)) echo "this commit stages protected path(s) [$m]; (legacy) obtain Yash's 'ok - Yash' signature then 'nhq-approve grant …' — bare inline self-approve is retired." ;;
     DENY\(precommit-no-selfapprove\)) echo "this commit stages protected path(s) [$m]; the pre-commit gate never trusts inline env — no self-approve here. A legitimate Director p3 commit is approved at the PreToolUse layer (harness env); to bypass the hook deliberately use 'git commit --no-verify' as a conscious human override." ;;
     DENY\(unresolvable-repo\)) echo "the git target (-C / GIT_DIR) does not resolve to a real repository — refusing to evaluate a misdirected commit." ;;
     DENY\(firststone-whole-repo\)) echo "firststone is Julian's repo — Director/NHQ agents do not commit to it (whole-repo Protocol-3 block). Hand any firststone change to Julian." ;;

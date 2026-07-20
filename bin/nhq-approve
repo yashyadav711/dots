@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# nhq-approve — the `ok - Yash` digital-signature approval token store.
+#
+# Governance (Yash 2026-07-20, governance-ok-yash-signature-2026-07-20): Director
+# holds ALL keystrokes; Yash no longer runs commands by hand. Yash's approval for
+# any gated PROD action = typing the exact phrase `ok - Yash` in chat = his digital
+# signature. This tool turns that signature into a verifiable, audited, single-use
+# token that the P3 commit gate and the prod push/merge gate can check — replacing
+# Director's old unprovable inline self-approve.
+#
+# Token store: ~/.nhq-approval.json (chmod 600), a JSON array of grants.
+#   grant = { repo, target, granted_at, expires_at, nonce, consumed }
+#
+# Subcommands:
+#   grant   --repo <r> --target <b> [--ttl <mins,default 30>]  append a fresh grant, print nonce
+#   verify  --repo <r> --target <b>                            exit 0 if a live grant exists (no consume)
+#   consume --repo <r> --target <b>                            verify + mark consumed (single-use)
+#   list                                                       print the store (pretty)
+#   clear                                                      wipe the store
+#
+# Director calls `grant` ONLY after seeing the literal `ok - Yash` in chat. The P3
+# commit gate consumes; the push/merge gate verifies (does not consume) so the
+# release action still requires a live signature even with no new P3 commit.
+#
+# Robust to a missing/empty/corrupt store (treated as "no grants"). Uses jq.
+# Env override (selftest): NHQ_APPROVAL_STORE.
+set -uo pipefail
+
+store_file() { printf '%s' "${NHQ_APPROVAL_STORE:-$HOME/.nhq-approval.json}"; }
+
+# Read the store as a JSON array; a missing/empty/corrupt store degrades to [].
+store_read() {
+  local sf; sf="$(store_file)"
+  [[ -f "$sf" ]] || { printf '[]'; return 0; }
+  jq -e 'type=="array"' "$sf" >/dev/null 2>&1 && cat "$sf" || printf '[]'
+}
+
+# Atomically write a JSON array to the store, chmod 600.
+store_write() {
+  local sf tmp; sf="$(store_file)"
+  tmp="$(mktemp "${sf}.XXXXXX" 2>/dev/null)" || tmp="${sf}.tmp.$$"
+  printf '%s\n' "$1" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$sf" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  chmod 600 "$sf" 2>/dev/null || true
+}
+
+# Normalize repo to a bare basename, lowercased (matches p3_scope's identity form).
+norm_repo() { basename -- "$1" 2>/dev/null | tr '[:upper:]' '[:lower:]'; }
+
+# Parse --repo/--target/--ttl flags into REPO/TARGET/TTL.
+REPO=""; TARGET=""; TTL=30
+parse_flags() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)   REPO="${2:-}"; shift 2 ;;
+      --target) TARGET="${2:-}"; shift 2 ;;
+      --ttl)    TTL="${2:-30}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  REPO="$(norm_repo "$REPO")"
+  TARGET="$(printf '%s' "$TARGET" | tr '[:upper:]' '[:lower:]')"
+}
+
+# A grant matches if repo+target line up, it is not consumed, and now < expires_at.
+# jq filter shared by verify/consume.
+match_filter() {
+  local now="$1"
+  printf '%s' '.repo==$r and .target==$t and (.consumed|not) and ((.expires_at // 0) > ($now|tonumber))'
+}
+
+cmd_grant() {
+  parse_flags "$@"
+  [[ -n "$REPO" && -n "$TARGET" ]] || { echo "nhq-approve grant: --repo and --target required" >&2; return 2; }
+  local now nonce ttl_secs arr new
+  now="$(date +%s)"
+  # TTL in minutes → seconds; non-numeric TTL falls back to 30m.
+  [[ "$TTL" =~ ^[0-9]+$ ]] || TTL=30
+  ttl_secs=$(( TTL * 60 ))
+  nonce="$( (head -c 16 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n') || true )"
+  [[ -n "$nonce" ]] || nonce="$now-$RANDOM-$RANDOM"
+  arr="$(store_read)"
+  new="$(jq -c \
+    --arg r "$REPO" --arg t "$TARGET" --arg n "$nonce" \
+    --argjson ga "$now" --argjson ea "$(( now + ttl_secs ))" \
+    '. + [{repo:$r, target:$t, granted_at:$ga, expires_at:$ea, nonce:$n, consumed:false}]' \
+    <<<"$arr" 2>/dev/null)" || { echo "nhq-approve: failed to build grant" >&2; return 1; }
+  store_write "$new" || { echo "nhq-approve: failed to write store" >&2; return 1; }
+  printf '%s\n' "$nonce"
+  return 0
+}
+
+cmd_verify() {
+  parse_flags "$@"
+  [[ -n "$REPO" && -n "$TARGET" ]] || { echo "nhq-approve verify: --repo and --target required" >&2; return 2; }
+  local now arr
+  now="$(date +%s)"
+  arr="$(store_read)"
+  jq -e --arg r "$REPO" --arg t "$TARGET" --argjson now "$now" \
+    "any(.[]; $(match_filter "$now"))" <<<"$arr" >/dev/null 2>&1
+}
+
+cmd_consume() {
+  parse_flags "$@"
+  [[ -n "$REPO" && -n "$TARGET" ]] || { echo "nhq-approve consume: --repo and --target required" >&2; return 2; }
+  local now arr new consumed_one
+  now="$(date +%s)"
+  arr="$(store_read)"
+  # Mark the FIRST matching live grant consumed; report whether one was found.
+  new="$(jq -c --arg r "$REPO" --arg t "$TARGET" --argjson now "$now" '
+    ( [ range(0; length) as $i | select(.[$i] as $g
+        | ($g.repo==$r and $g.target==$t and ($g.consumed|not)
+           and (($g.expires_at // 0) > $now))) | $i ] ) as $idx
+    | if ($idx|length) > 0
+      then (.[$idx[0]].consumed = true)
+      else .
+      end' <<<"$arr" 2>/dev/null)" || { echo "nhq-approve: consume jq failed" >&2; return 1; }
+  # Did anything actually get consumed? Compare consumed-count before/after.
+  consumed_one="$(jq -n --argjson a "$arr" --argjson b "$new" \
+    '([$a[]|select(.consumed)]|length) as $x | ([$b[]|select(.consumed)]|length) as $y | ($y > $x)' 2>/dev/null)"
+  [[ "$consumed_one" == "true" ]] || return 1
+  store_write "$new" || { echo "nhq-approve: failed to write store" >&2; return 1; }
+  return 0
+}
+
+cmd_list() {
+  local arr; arr="$(store_read)"
+  jq '.' <<<"$arr" 2>/dev/null || printf '[]\n'
+}
+
+cmd_clear() {
+  store_write '[]' && echo "nhq-approve: store cleared" || { echo "nhq-approve: failed to clear store" >&2; return 1; }
+}
+
+case "${1:-}" in
+  grant)   shift; cmd_grant "$@" ;;
+  verify)  shift; cmd_verify "$@" ;;
+  consume) shift; cmd_consume "$@" ;;
+  list)    shift; cmd_list "$@" ;;
+  clear)   shift; cmd_clear "$@" ;;
+  *)
+    echo "usage: nhq-approve {grant|verify|consume --repo <r> --target <b> [--ttl <mins>]|list|clear}" >&2
+    exit 2
+    ;;
+esac
