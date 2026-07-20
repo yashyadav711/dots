@@ -163,12 +163,19 @@ p3_approve_bin() {
 
 # Resolve the repo basename + branch the current commit targets, from the SAME
 # P3_GIT_ARGS context p3_scope already used (never re-parse the command string for
-# identity). Sets P3_REPO_BASE + P3_TARGET_BRANCH. Detached/unborn HEAD on a scoped
-# prod repo is treated as prod "main" (p3_scope already forces that state to scope p3).
+# identity). Sets P3_REPO_BASE + P3_TARGET_BRANCH. The repo identity is CANONICALIZED
+# to the scoped prod name (heydaddy/mirror) via the SAME origin/base match p3_scope
+# uses — so a token granted `--repo heydaddy` also covers a linked worktree dir
+# (heydaddy-wt-*) whose raw basename differs. Detached/unborn HEAD on a scoped prod
+# repo is treated as prod "main" (p3_scope already forces that state to scope p3).
 P3_REPO_BASE=""; P3_TARGET_BRANCH=""
 p3_resolve_identity() {
-  P3_REPO_BASE="$(basename "$(git "${P3_GIT_ARGS[@]}" rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
-  local branch
+  local origin base branch
+  origin="$(git "${P3_GIT_ARGS[@]}" remote get-url origin 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  base="$(basename "$(git "${P3_GIT_ARGS[@]}" rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  if [[ "$origin" == *yashyadav711/heydaddy* || "$base" == heydaddy ]]; then P3_REPO_BASE=heydaddy
+  elif [[ "$origin" == *yashyadav711/mirror* || "$base" == mirror ]]; then P3_REPO_BASE=mirror
+  else P3_REPO_BASE="$base"; fi
   branch="$(git "${P3_GIT_ARGS[@]}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
   if [[ "$branch" == master ]]; then branch=master
   elif [[ "$branch" == main || "$branch" == HEAD || -z "$branch" ]]; then branch=main

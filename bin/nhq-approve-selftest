@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# nhq-approve-selftest — proves the `ok - Yash` signature-token gate (governance
+# 2026-07-20, governance-ok-yash-signature). Covers all 8 acceptance cases from
+# SPEC-guard-ok-yash-signature.md, hermetically, against throwaway repos + a
+# throwaway approval store. Fires NO real desktop toast, touches NO real store.
+#
+# Usage: nhq-approve-selftest       (exits non-zero if any assertion fails)
+set -uo pipefail
+
+BIN="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+APPROVE="$BIN/nhq-approve"
+P3="$BIN/nhq-p3-guard"
+PRETOOL="$BIN/nhq-jcode-pretool"
+
+# Hermetic env: throwaway store, silent audit/notify, sandbox p3 policy.
+export NHQ_APPROVAL_STORE="$TMP/approval.json"
+export NHQ_APPROVE_BIN="$APPROVE"
+export NHQ_AUDIT_BIN=/bin/true
+export NHQ_NOTIFY="$TMP/notify-noop"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$NHQ_NOTIFY"; chmod +x "$NHQ_NOTIFY"
+export NHQ_NOTIFY_SUPPRESS=1 NHQ_TEST=1
+
+P3PF="$TMP/p3-paths.json"
+cat > "$P3PF" <<'JSON'
+{"version":1,"categories":{"auth":["**/.env","**/*.env"],"audit":["**/audit.jsonl"]},"exclusions":[]}
+JSON
+export NHQ_P3_PATHS="$P3PF"
+
+pass=0; fail=0
+ok() { echo "  PASS: $1"; pass=$((pass + 1)); }
+no() { echo "  FAIL: $1"; fail=$((fail + 1)); }
+eq() { if [[ "$2" == "$3" ]]; then ok "$1 ($2)"; else no "$1 — got '$2' want '$3'"; fi; }
+
+# Build a git repo at $1 with origin $2, on branch $3, staging file $4 with content $5.
+mkrepo() {
+  local dir="$1" origin="$2" branch="$3" file="${4:-}" content="${5:-}"
+  git init -q -b "$branch" "$dir"
+  git -C "$dir" remote add origin "$origin"
+  git -C "$dir" -c user.email=a@b.c -c user.name=x commit --allow-empty -qm base
+  if [[ -n "$file" ]]; then
+    mkdir -p "$dir/$(dirname "$file")" 2>/dev/null || true
+    printf '%s\n' "$content" > "$dir/$file"
+    git -C "$dir" add "$file"
+  fi
+}
+
+# p3 commit verdict for a repo under a caller identity (env assignments in $@).
+p3verdict() { # $1=repo $2..=env
+  local repo="$1"; shift
+  env "$@" "$P3" check "$repo" 2>/dev/null | sed -n '1p' | sed 's/^P3: //'
+}
+p3allow() { # $1=repo $2..=env → allow|deny
+  local repo="$1"; shift
+  if env "$@" "$P3" check "$repo" >/dev/null 2>&1; then echo allow; else echo deny; fi
+}
+
+# jcode pretool push/merge rc for a Director/fleet caller (0 allow, 2 block).
+pretool_rc() { # $1=cmd $2=cwd $3..=env
+  local cmd="$1" cwd="$2"; shift 2
+  printf '{"command":%s}' "$(jq -Rn --arg c "$cmd" '$c')" | \
+    env -u TMUX -u NHQ_SESSION "$@" \
+      JCODE_HOOK_TOOL_NAME=bash JCODE_HOOK_CWD="$cwd" \
+      NHQ_APPROVAL_STORE="$NHQ_APPROVAL_STORE" NHQ_NOTIFY="$NHQ_NOTIFY" \
+      NHQ_NOTIFY_SUPPRESS=1 "$PRETOOL" >/dev/null 2>&1
+  echo $?
+}
+
+echo "── A: nhq-approve token store primitives ──────────────────────────────"
+"$APPROVE" clear >/dev/null
+eq "verify empty store → miss"        "$(("$APPROVE" verify --repo heydaddy --target main >/dev/null 2>&1) && echo hit || echo miss)" "miss"
+N="$("$APPROVE" grant --repo heydaddy --target main --ttl 30)"
+eq "grant prints a nonce"             "$([[ -n "$N" ]] && echo yes || echo no)" "yes"
+eq "verify after grant → hit"         "$(("$APPROVE" verify --repo heydaddy --target main >/dev/null 2>&1) && echo hit || echo miss)" "hit"
+eq "verify wrong target → miss"       "$(("$APPROVE" verify --repo heydaddy --target dev  >/dev/null 2>&1) && echo hit || echo miss)" "miss"
+eq "verify wrong repo → miss"         "$(("$APPROVE" verify --repo mirror   --target main >/dev/null 2>&1) && echo hit || echo miss)" "miss"
+eq "consume once → ok"                "$(("$APPROVE" consume --repo heydaddy --target main >/dev/null 2>&1) && echo ok || echo fail)" "ok"
+eq "consume again → single-use fail"  "$(("$APPROVE" consume --repo heydaddy --target main >/dev/null 2>&1) && echo ok || echo fail)" "fail"
+# corrupt store degrades to no-grants (not a crash)
+printf 'not json{{\n' > "$NHQ_APPROVAL_STORE"
+eq "corrupt store verify → miss"      "$(("$APPROVE" verify --repo heydaddy --target main >/dev/null 2>&1) && echo hit || echo miss)" "miss"
+"$APPROVE" clear >/dev/null
+eq "store chmod 600"                  "$(stat -c '%a' "$NHQ_APPROVAL_STORE" 2>/dev/null)" "600"
+
+echo "── B: nhq-p3-guard prod P3 commit gate (the 6 commit cases) ────────────"
+HD="$TMP/heydaddy"
+mkrepo "$HD" "https://github.com/yashyadav711/heydaddy.git" main ".env" "SECRET=1"
+"$APPROVE" clear >/dev/null
+
+# 1. Director prod P3 commit WITHOUT a token → DENY(no-yash-signature).
+eq "1. Director prod P3, no token → verdict" "$(p3verdict "$HD" NHQ_AGENT=Director NHQ_SESSION=main)" "DENY(no-yash-signature)"
+
+# 2. grant then Director prod P3 commit → ALLOW(yash-signature-token) + grant consumed.
+"$APPROVE" grant --repo heydaddy --target main >/dev/null
+eq "2. Director prod P3, with token → verdict" "$(p3verdict "$HD" NHQ_AGENT=Director NHQ_SESSION=main)" "ALLOW(yash-signature-token)"
+eq "2b. grant now consumed (verify miss)"      "$(("$APPROVE" verify --repo heydaddy --target main >/dev/null 2>&1) && echo hit || echo miss)" "miss"
+
+# 3. second commit reusing same grant → DENY (single-use).
+eq "3. Director prod P3, reuse token → DENY"   "$(p3allow "$HD" NHQ_AGENT=Director NHQ_SESSION=main)" "deny"
+
+# 4. expired grant (ttl in the past) → DENY.
+"$APPROVE" clear >/dev/null
+"$APPROVE" grant --repo heydaddy --target main --ttl 0 >/dev/null
+eq "4. Director prod P3, expired grant → DENY"  "$(p3allow "$HD" NHQ_AGENT=Director NHQ_SESSION=main)" "deny"
+
+# 5. Fleet-tier prod P3 commit (even with a token) → still DENY(fleet-hard-block).
+"$APPROVE" clear >/dev/null
+"$APPROVE" grant --repo heydaddy --target main >/dev/null
+eq "5. Fleet prod P3, with token → verdict"    "$(p3verdict "$HD" NHQ_AGENT=Envy NHQ_SESSION=fleet-envy-x)" "DENY(fleet-hard-block)"
+eq "5b. Fleet did NOT consume the grant"       "$(("$APPROVE" verify --repo heydaddy --target main >/dev/null 2>&1) && echo hit || echo miss)" "hit"
+"$APPROVE" clear >/dev/null
+
+# 6. Dev/feature commit (scope none) → ALLOW(out-of-scope), no token needed.
+FEAT="$TMP/heydaddy-feat"
+mkrepo "$FEAT" "https://github.com/yashyadav711/heydaddy.git" main ".env" "SECRET=1"
+git -C "$FEAT" checkout -q -b feat/x
+eq "6. Director feat-branch P3 commit → verdict" "$(p3verdict "$FEAT" NHQ_AGENT=Director NHQ_SESSION=main)" "ALLOW(out-of-scope)"
+# non-scoped repo, even on main, is out of scope
+DOTS="$TMP/dots"
+mkrepo "$DOTS" "https://github.com/1jehuang/dots.git" main ".env" "SECRET=1"
+eq "6b. Director non-scoped-repo main P3 → verdict" "$(p3verdict "$DOTS" NHQ_AGENT=Director NHQ_SESSION=main)" "ALLOW(out-of-scope)"
+
+echo "── C: nhq-jcode-pretool Director prod push/merge gate (cases 7 + 8) ────"
+"$APPROVE" clear >/dev/null
+# 7. Director push to dev / a feat branch → NOT gated (passes).
+PFEAT="$TMP/hd-push-feat"
+mkrepo "$PFEAT" "https://github.com/yashyadav711/heydaddy.git" main
+git -C "$PFEAT" checkout -q -b feat/x
+eq "7. Director push feat/x (scoped repo) → allow"   "$(pretool_rc "git -C $PFEAT push origin feat/x" "$PFEAT" NHQ_AGENT=Director)" "0"
+eq "7b. Director bare push while on feat → allow"    "$(pretool_rc "git -C $PFEAT push" "$PFEAT" NHQ_AGENT=Director)" "0"
+# Director on main pushing an explicit dev refspec → not main → allow
+PMAIN="$TMP/hd-push-main"
+mkrepo "$PMAIN" "https://github.com/yashyadav711/heydaddy.git" main
+eq "7c. Director push origin dev (on main) → allow"  "$(pretool_rc "git -C $PMAIN push origin dev" "$PMAIN" NHQ_AGENT=Director)" "0"
+# non-scoped repo main push → allow
+eq "7d. Director push non-scoped repo main → allow"  "$(pretool_rc "git -C $DOTS push origin main" "$DOTS" NHQ_AGENT=Director)" "0"
+
+# 8. Director push to scoped-repo main WITHOUT token → blocked; WITH token → allowed.
+eq "8a. Director push heydaddy main, no token → BLOCK" "$(pretool_rc "git -C $PMAIN push origin main" "$PMAIN" NHQ_AGENT=Director)" "2"
+"$APPROVE" grant --repo heydaddy --target main >/dev/null
+eq "8b. Director push heydaddy main, with token → allow" "$(pretool_rc "git -C $PMAIN push origin main" "$PMAIN" NHQ_AGENT=Director)" "0"
+eq "8c. push did NOT consume token (still valid)"   "$(("$APPROVE" verify --repo heydaddy --target main >/dev/null 2>&1) && echo hit || echo miss)" "hit"
+# merge naming main while on main → blocked without token
+git -C "$PMAIN" checkout -q -b feat3
+git -C "$PMAIN" checkout -q main
+"$APPROVE" clear >/dev/null
+eq "8d. Director merge feat3 on main, no token → BLOCK" "$(pretool_rc "git -C $PMAIN merge feat3" "$PMAIN" NHQ_AGENT=Director)" "2"
+# quoted 'git push origin main' inside echo must NOT fire
+eq "8e. Director echo 'git push origin main' → allow"  "$(pretool_rc "echo \"git push origin main\"" "$PMAIN" NHQ_AGENT=Director)" "0"
+
+echo "── D: regressions — frozen behavior preserved ─────────────────────────"
+# firststone whole-repo block still fires
+FS="$TMP/firststone"
+mkrepo "$FS" "https://github.com/someone/firststone.git" main "readme.md" "hi"
+eq "firststone whole-repo commit → DENY" "$(p3verdict "$FS" NHQ_AGENT=Director NHQ_SESSION=main)" "DENY(firststone-whole-repo)"
+# precommit mode never self-approves (even with a live token)
+"$APPROVE" grant --repo heydaddy --target main >/dev/null
+eq "precommit prod P3 → DENY(precommit-no-selfapprove)" "$(env NHQ_AGENT=Director NHQ_SESSION=main "$P3" check "$HD" precommit 2>/dev/null | sed -n '1p' | sed 's/^P3: //')" "DENY(precommit-no-selfapprove)"
+# no-policy-file fails closed on a scoped prod repo
+eq "no-policy-file prod P3 → DENY(no-policy-file)" "$(env NHQ_P3_PATHS="$TMP/does-not-exist.json" NHQ_AGENT=Director NHQ_SESSION=main "$P3" check "$HD" 2>/dev/null | sed -n '1p' | sed 's/^P3: //')" "DENY(no-policy-file)"
+
+echo "────────────────────────────────────────────────────────────────────────"
+echo "nhq-approve-selftest: $pass passed, $fail failed"
+[[ $fail -eq 0 ]]

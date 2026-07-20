@@ -105,8 +105,11 @@ if [[ "$TOOL" == "Bash" ]]; then
       _base="$(basename "$(git -C "$GCTX" rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
       _origin="$(git -C "$GCTX" remote get-url origin 2>/dev/null | tr '[:upper:]' '[:lower:]')"
       _branch="$(git -C "$GCTX" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-      _scoped=0
-      case "$_base$_origin" in *heydaddy*|*mirror*) _scoped=1;; esac
+      _scoped=0; _repo="$_base"
+      # CANONICALIZE to the scoped prod name (same origin/base match p3_scope uses) so a
+      # token granted `--repo heydaddy` also covers a linked worktree dir (heydaddy-wt-*).
+      if [[ "$_origin" == *yashyadav711/heydaddy* || "$_base" == heydaddy ]]; then _scoped=1; _repo=heydaddy
+      elif [[ "$_origin" == *yashyadav711/mirror* || "$_base" == mirror ]]; then _scoped=1; _repo=mirror; fi
       if [[ $_scoped -eq 1 ]]; then
         _targets_main=0
         # merge → destination is the current branch
@@ -121,9 +124,9 @@ if [[ "$TOOL" == "Bash" ]]; then
           fi
         fi
         if [[ $_targets_main -eq 1 ]]; then
-          _apbin="$HOME/.local/bin/nhq-approve"; [[ -x "$_apbin" ]] || _apbin="$(command -v nhq-approve 2>/dev/null || true)"
-          if [[ -z "$_apbin" ]] || ! "$_apbin" verify --repo "$_base" --target main >/dev/null 2>&1; then
-            echo "BLOCKED (Protocol-3): prod push/merge to ${_base}:main needs Yash's 'ok - Yash' signature. After 'ok - Yash', run: nhq-approve grant --repo ${_base} --target main  (then retry)." >&2
+          _apbin="${NHQ_APPROVE_BIN:-$HOME/.local/bin/nhq-approve}"; [[ -x "$_apbin" ]] || _apbin="$(command -v nhq-approve 2>/dev/null || true)"
+          if [[ -z "$_apbin" ]] || ! "$_apbin" verify --repo "$_repo" --target main >/dev/null 2>&1; then
+            echo "BLOCKED (Protocol-3): prod push/merge to ${_repo}:main needs Yash's 'ok - Yash' signature. After 'ok - Yash', run: nhq-approve grant --repo ${_repo} --target main  (then retry)." >&2
             exit 2
           fi
         fi
