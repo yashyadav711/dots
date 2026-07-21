@@ -61,9 +61,13 @@ load_credentials() {
   local perms
   perms="$(stat -c '%a' "$CONFIG_PATH" 2>/dev/null)" \
     || die_config "cannot read credentials file permissions"
-  # Numeric-compare the octal mode; reject group/world-accessible files.
-  [ "$perms" -le 600 ] 2>/dev/null \
-    || die_config "credentials file must not be group- or world-readable"
+  # Reject any group or other permission bit (octal mask 0077); this accepts
+  # owner-only modes such as 0400, 0600, and 0700 while rejecting exposures
+  # like 0402 or 0640 that a plain numeric comparison would let through.
+  [[ "$perms" =~ ^[0-7]+$ ]] 2>/dev/null \
+    || die_config "cannot read credentials file permissions"
+  (( (0$perms & 0077) == 0 )) \
+    || die_config "credentials file must not be group- or world-accessible"
 
   local token="" chat_id="" line seen_token=0 seen_chat=0
   while IFS= read -r line || [ -n "$line" ]; do

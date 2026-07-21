@@ -214,6 +214,29 @@ assert_file_empty "$CURL_ARGS"; assert_file_empty "$CURL_CONFIG_CAPTURE"; assert
 chmod 600 "$CREDENTIALS"
 
 reset_captures
+chmod 402 "$CREDENTIALS"
+run_fail 2 "world-readable-only (0402) credentials are rejected" "$BOT" notify --event completed --title "Never send"
+assert_file_empty "$CURL_ARGS"; assert_file_empty "$CURL_CONFIG_CAPTURE"; assert_file_empty "$CURL_PAYLOAD"
+chmod 600 "$CREDENTIALS"
+
+reset_captures
+chmod 002 "$CREDENTIALS"
+run_fail 2 "world-writable (0002) credentials are rejected" "$BOT" notify --event completed --title "Never send"
+assert_file_empty "$CURL_ARGS"; assert_file_empty "$CURL_CONFIG_CAPTURE"; assert_file_empty "$CURL_PAYLOAD"
+chmod 600 "$CREDENTIALS"
+
+reset_captures
+chmod 640 "$CREDENTIALS"
+run_fail 2 "group-readable (0640) credentials are rejected" "$BOT" notify --event completed --title "Never send"
+assert_file_empty "$CURL_ARGS"; assert_file_empty "$CURL_CONFIG_CAPTURE"; assert_file_empty "$CURL_PAYLOAD"
+chmod 600 "$CREDENTIALS"
+
+reset_captures
+chmod 700 "$CREDENTIALS"
+run_ok "owner-only (0700) credentials are accepted" "$BOT" notify --event completed --title "Owner only"
+chmod 600 "$CREDENTIALS"
+
+reset_captures
 rm -f "$CREDENTIALS"
 run_fail 2 "missing credentials file is rejected" "$BOT" notify --event completed --title "T"
 assert_file_empty "$CURL_ARGS"
