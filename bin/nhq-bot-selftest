@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# Hermetic selftest for nhq-bot. Never performs a network request: PATH is
+# prepended with a mock curl that captures arguments and emits a configurable
+# response. The script itself is the test result (exit == failure count).
+set -uo pipefail
+
+passes=0
+failures=0
+
+# --- isolated environment -------------------------------------------------
+TEST_HOME="$(mktemp -d)"
+export HOME="$TEST_HOME"
+export PATH="$TEST_HOME/bin:$PATH"
+cleanup() { rm -rf "$TEST_HOME"; }
+trap cleanup EXIT
+
+# Capture files written by the mock curl.
+export CURL_ARGS="$TEST_HOME/curl.args"
+export CURL_CONFIG_CAPTURE="$TEST_HOME/curl.config"
+export CURL_PAYLOAD="$TEST_HOME/curl.payload"
+# Mock curl behaviour (overridable per-invocation via a VAR=... prefix).
+export MOCK_CURL_RESPONSE='{"ok":true,"result":{"message_id":1}}'
+export MOCK_CURL_EXIT=0
+
+LAST_OUTPUT=""
+
+# --- helpers --------------------------------------------------------------
+pass() { echo "PASS: $1"; passes=$((passes + 1)); }
+fail() { echo "FAIL: $1"; failures=$((failures + 1)); }
+
+reset_captures() { rm -f "$CURL_ARGS" "$CURL_CONFIG_CAPTURE" "$CURL_PAYLOAD"; }
+
+run_ok() {
+  local desc="$1"; shift
+  local rc=0
+  LAST_OUTPUT="$("$@" 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    pass "$desc"
+  else
+    fail "$desc (expected exit 0, got $rc)"
+  fi
+}
+
+run_fail() {
+  local expected="$1" desc="$2"; shift 2
+  local rc=0
+  LAST_OUTPUT="$("$@" 2>&1)" || rc=$?
+  if [ "$rc" -eq "$expected" ]; then
+    pass "$desc"
+  else
+    fail "$desc (expected exit $expected, got $rc)"
+  fi
+}
+
+assert_file_contains() {
+  if [ -f "$1" ] && grep -qF -- "$2" "$1"; then
+    pass "file $(basename "$1") contains '$2'"
+  else
+    fail "file $(basename "$1") should contain '$2'"
+  fi
+}
+
+assert_file_excludes() {
+  if [ -f "$1" ] && grep -qF -- "$2" "$1"; then
+    fail "file $(basename "$1") should NOT contain '$2'"
+  else
+    pass "file $(basename "$1") excludes '$2'"
+  fi
+}
+
+assert_file_empty() {
+  if [ -f "$1" ] && [ -s "$1" ]; then
+    fail "file $(basename "$1") should be empty/absent"
+  else
+    pass "file $(basename "$1") is empty/absent"
+  fi
+}
+
+assert_output_excludes() {
+  if printf '%s' "$LAST_OUTPUT" | grep -qF -- "$1"; then
+    fail "output should NOT contain '$1'"
+  else
+    pass "output excludes '$1'"
+  fi
+}
+
+assert_output_contains() {
+  if printf '%s' "$LAST_OUTPUT" | grep -qF -- "$1"; then
+    pass "output contains '$1'"
+  else
+    fail "output should contain '$1'"
+  fi
+}
+
+# --- mock curl: NEVER touches the network ---------------------------------
+mkdir -p "$TEST_HOME/bin"
+cat > "$TEST_HOME/bin/curl" <<'CURL_EOF'
+#!/usr/bin/env bash
+# Mock curl. Records argv, copies the --config and @payload files, then emits a
+# canned response. It must never make a network request.
+printf '%s\n' "$*" > "$CURL_ARGS"
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--config" ] && [ -f "$arg" ]; then
+    cat "$arg" > "$CURL_CONFIG_CAPTURE"
+  fi
+  case "$arg" in
+    @*) f="${arg#@}"; [ -f "$f" ] && cat "$f" > "$CURL_PAYLOAD" ;;
+  esac
+  prev="$arg"
+done
+[ -n "${MOCK_CURL_RESPONSE:-}" ] && printf '%s' "$MOCK_CURL_RESPONSE"
+exit "${MOCK_CURL_EXIT:-0}"
+CURL_EOF
+chmod +x "$TEST_HOME/bin/curl"
+
+# --- credentials fixture --------------------------------------------------
+mkdir -p "$TEST_HOME/.config/nhq"
+CREDENTIALS="$TEST_HOME/.config/nhq/telegram-bot.env"
+write_creds() { printf '%s\n' "$@" > "$CREDENTIALS"; chmod 600 "$CREDENTIALS"; }
+valid_creds() {
+  write_creds 'TELEGRAM_BOT_TOKEN=test-token' 'NHQ_TELEGRAM_CHAT_ID=12345'
+}
+valid_creds
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BOT="$SCRIPT_DIR/nhq-bot"
+
+# ==========================================================================
+# 0. Binary presence (drives the RED phase)
+# ==========================================================================
+if [ -x "$BOT" ]; then
+  pass "nhq-bot exists and is executable"
+else
+  fail "nhq-bot is missing or not executable: $BOT"
+fi
+
+# ==========================================================================
+# 1. Happy path: completed event, all optional flags, HTML escaping
+# ==========================================================================
+reset_captures
+MOCK_CURL_RESPONSE='{"ok":true,"result":{"message_id":1}}' \
+  run_ok "completed sends one POST with escaped HTML" \
+  "$BOT" notify --event completed --title 'A < B & C' \
+  --body 'passed > failed' --url 'https://example.test/a?x=1&y=2' \
+  --agent 'envy "x"' --runtime omp
+assert_file_contains "$CURL_CONFIG_CAPTURE" 'https://api.telegram.org/bottest-token/sendMessage'
+assert_file_contains "$CURL_PAYLOAD" '"chat_id":"12345"'
+assert_file_contains "$CURL_PAYLOAD" '"parse_mode":"HTML"'
+assert_file_contains "$CURL_PAYLOAD" 'A &lt; B &amp; C'
+assert_file_contains "$CURL_PAYLOAD" 'passed &gt; failed'
+assert_file_contains "$CURL_PAYLOAD" 'envy &quot;x&quot;'
+assert_file_contains "$CURL_PAYLOAD" '✅ COMPLETED'
+
+# ==========================================================================
+# 2. Every permitted event label
+# ==========================================================================
+reset_captures
+run_ok "failed event delivers" "$BOT" notify --event failed --title "Delivery"
+assert_file_contains "$CURL_PAYLOAD" '❌ FAILED'
+
+reset_captures
+run_ok "blocked event delivers" "$BOT" notify --event blocked --title "Halted"
+assert_file_contains "$CURL_PAYLOAD" '🛑 BLOCKED'
+
+# ==========================================================================
+# 3. --help succeeds and leaks no config
+# ==========================================================================
+reset_captures
+run_ok "--help exits 0" "$BOT" --help
+assert_output_contains "Usage:"
+assert_output_excludes 'test-token'
+assert_output_excludes '12345'
+assert_file_empty "$CURL_ARGS"
+
+# ==========================================================================
+# 4. Argument validation failures (exit 2, never send)
+# ==========================================================================
+reset_captures
+run_fail 2 "unknown event is rejected" "$BOT" notify --event started --title "Never send"
+assert_file_empty "$CURL_ARGS"; assert_file_empty "$CURL_CONFIG_CAPTURE"; assert_file_empty "$CURL_PAYLOAD"
+
+reset_captures
+run_fail 2 "empty title is rejected" "$BOT" notify --event completed --title ""
+assert_file_empty "$CURL_ARGS"; assert_file_empty "$CURL_CONFIG_CAPTURE"; assert_file_empty "$CURL_PAYLOAD"
+
+reset_captures
+run_fail 2 "missing --event is rejected" "$BOT" notify --title "No event"
+assert_file_empty "$CURL_ARGS"
+
+reset_captures
+run_fail 2 "missing --title is rejected" "$BOT" notify --event completed
+assert_file_empty "$CURL_ARGS"
+
+reset_captures
+run_fail 2 "unknown flag is rejected" "$BOT" notify --event completed --title "T" --bogus x
+assert_file_empty "$CURL_ARGS"
+
+reset_captures
+run_fail 2 "duplicate scalar flag is rejected" "$BOT" notify --event completed --event failed --title "T"
+assert_file_empty "$CURL_ARGS"
+
+reset_captures
+run_fail 2 "missing flag value is rejected" "$BOT" notify --event completed --title
+assert_file_empty "$CURL_ARGS"
+
+# ==========================================================================
+# 5. Credential file validation (exit 2, never send)
+# ==========================================================================
+reset_captures
+chmod 644 "$CREDENTIALS"
+run_fail 2 "group-readable credentials are rejected" "$BOT" notify --event completed --title "Never send"
+assert_file_empty "$CURL_ARGS"; assert_file_empty "$CURL_CONFIG_CAPTURE"; assert_file_empty "$CURL_PAYLOAD"
+chmod 600 "$CREDENTIALS"
+
+reset_captures
+rm -f "$CREDENTIALS"
+run_fail 2 "missing credentials file is rejected" "$BOT" notify --event completed --title "T"
+assert_file_empty "$CURL_ARGS"
+valid_creds
+
+reset_captures
+write_creds 'TELEGRAM_BOT_TOKEN=' 'NHQ_TELEGRAM_CHAT_ID=12345'
+run_fail 2 "empty token is rejected" "$BOT" notify --event completed --title "T"
+assert_file_empty "$CURL_ARGS"
+
+reset_captures
+write_creds 'TELEGRAM_BOT_TOKEN=test-token' 'NHQ_TELEGRAM_CHAT_ID='
+run_fail 2 "empty chat id is rejected" "$BOT" notify --event completed --title "T"
+assert_file_empty "$CURL_ARGS"
+
+reset_captures
+write_creds 'TELEGRAM_BOT_TOKEN=test-token' 'NHQ_TELEGRAM_CHAT_ID=0'
+run_fail 2 "zero chat id is rejected" "$BOT" notify --event completed --title "T"
+assert_file_empty "$CURL_ARGS"
+
+reset_captures
+write_creds 'TELEGRAM_BOT_TOKEN=test-token' 'NHQ_TELEGRAM_CHAT_ID=-123'
+run_fail 2 "negative chat id is rejected" "$BOT" notify --event completed --title "T"
+assert_file_empty "$CURL_ARGS"
+
+reset_captures
+write_creds 'TELEGRAM_BOT_TOKEN=test-token' 'NHQ_TELEGRAM_CHAT_ID=12a45'
+run_fail 2 "non-numeric chat id is rejected" "$BOT" notify --event completed --title "T"
+assert_file_empty "$CURL_ARGS"
+
+reset_captures
+write_creds 'TELEGRAM_BOT_TOKEN=test-token' 'NHQ_TELEGRAM_CHAT_ID=12345' 'EXTRA=1'
+run_fail 2 "unknown credential key is rejected" "$BOT" notify --event completed --title "T"
+assert_file_empty "$CURL_ARGS"
+
+reset_captures
+write_creds 'TELEGRAM_BOT_TOKEN=test-token' 'TELEGRAM_BOT_TOKEN=other' 'NHQ_TELEGRAM_CHAT_ID=12345'
+run_fail 2 "duplicate credential key is rejected" "$BOT" notify --event completed --title "T"
+assert_file_empty "$CURL_ARGS"
+valid_creds
+
+# ==========================================================================
+# 6. Telegram response handling & secret redaction (exit 1)
+# ==========================================================================
+reset_captures
+MOCK_CURL_RESPONSE='{"ok":false,"error_code":401,"description":"Unauthorized"}' \
+  run_fail 1 "Telegram API false is non-zero" "$BOT" notify --event failed --title "Delivery check"
+assert_output_excludes 'test-token'
+assert_output_excludes '12345'
+
+reset_captures
+MOCK_CURL_RESPONSE='not json at all' \
+  run_fail 1 "malformed JSON response is non-zero" "$BOT" notify --event completed --title "T"
+assert_output_excludes 'test-token'
+
+reset_captures
+MOCK_CURL_RESPONSE='' MOCK_CURL_EXIT=7 \
+  run_fail 1 "curl transport failure is non-zero" "$BOT" notify --event completed --title "T"
+assert_output_excludes 'test-token'
+
+# ==========================================================================
+# 7. Secrets never reach curl argv on a successful send
+# ==========================================================================
+reset_captures
+MOCK_CURL_RESPONSE='{"ok":true}' \
+  run_ok "successful send" "$BOT" notify --event completed --title "T"
+assert_file_excludes "$CURL_ARGS" 'test-token'
+assert_file_excludes "$CURL_ARGS" '12345'
+assert_output_excludes 'test-token'
+assert_output_excludes '12345'
+
+# --- summary --------------------------------------------------------------
+echo ""
+echo "Tests run: $((passes + failures))  passed: $passes  failed: $failures"
+exit "$failures"
