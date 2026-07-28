@@ -190,15 +190,11 @@ fi
 prev_line="$(deploy_top)"; prev_id="${prev_line%% *}"
 echo "→ current deployment: ${prev_id:0:8}${prev_id:+ (${prev_line##* })}"
 
+if [[ "$TIER" == "be" ]]; then
   echo "→ uploading working tree + triggering the build (railway up --detach)…"
   echo "   this uploads a tarball and prints nothing while it does; capped at ${TRIGGER_TIMEOUT}s."
-  # Resolve the current git commit and branch to bake into the image (issue #279).
-  git_commit="$(git -C "$HEYDADDY_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
-  git_branch="$(git -C "$HEYDADDY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
   ( cd "$HEYDADDY_DIR" && rw "$TRIGGER_TIMEOUT" up \
-      --project "$PROJECT_ID" --environment "$RW_ENV" --service "$SERVICE" --detach \
-      --build-arg "GIT_COMMIT=$git_commit" \
-      --build-arg "GIT_BRANCH=$git_branch" )
+      --project "$PROJECT_ID" --environment "$RW_ENV" --service "$SERVICE" --detach )
   rc=$?
 else
   echo "→ triggering redeploy from the connected GitHub source…"
