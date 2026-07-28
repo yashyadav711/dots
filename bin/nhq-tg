@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# nhq-tg — two-way Telegram channel for NHQ / Director. Bot: @netrunnersHQ_bot
+#
+# Outbound: Director pings Yash's phone when a long turn finishes.
+# Inbound:  Yash replies in Telegram; the reply is queued as a DIRECTIVE which the
+#           omp `telegram-inbox` extension injects into the next turn. That is the
+#           point — a notification you can ANSWER, not just read. (Stolen from
+#           jcode's channel mechanism, ported omp-native 2026-07-28.)
+#
+# Secrets: token read ONLY from ~/.config/nhq/telegram-bot.env (chmod 600, outside
+# every git repo). Never taken as an argument, never echoed, never logged. `status`
+# reports presence and byte count, never the value.
+#
+# Usage:
+#   nhq-tg send "<text>"     send a message to the configured chat
+#   nhq-tg poll              one pass: fetch new updates into the directive queue
+#   nhq-tg watch [secs]      poll in a loop (default 15s) — run under tmux/systemd
+#   nhq-tg drain             print unconsumed directives as JSON, mark them consumed
+#   nhq-tg status            show config + live getMe, without revealing the token
+set -uo pipefail
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nhq"
+ENV_FILE="$CONF_DIR/telegram-bot.env"
+OFFSET_FILE="$CONF_DIR/telegram-offset"
+QUEUE="$HOME/.nhq-directives.jsonl"
+API="https://api.telegram.org"
+
+die() { printf 'nhq-tg: %s\n' "$1" >&2; exit 1; }
+
+load_creds() {
+  [[ -r "$ENV_FILE" ]] || die "no credentials at $ENV_FILE (need TELEGRAM_BOT_TOKEN + NHQ_TELEGRAM_CHAT_ID, chmod 600)"
+  set -a; # shellcheck disable=SC1090
+  . "$ENV_FILE"; set +a
+  [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] || die "TELEGRAM_BOT_TOKEN missing in $ENV_FILE"
+}
+
+api() { # api <method> [curl args...]
+  local method="$1"; shift
+  curl -sS --max-time 30 "$API/bot$TELEGRAM_BOT_TOKEN/$method" "$@"
+}
+
+cmd_status() {
+  local tok="absent" pend=0
+  if [[ -r "$ENV_FILE" ]]; then
+    tok="present ($(wc -c < "$ENV_FILE" | tr -d ' ') bytes, mode $(stat -c %a "$ENV_FILE"))"
+  fi
+  [[ -r "$QUEUE" ]] && pend="$(grep -c '"consumed": false' "$QUEUE" 2>/dev/null || true)"
+  printf 'bot        @netrunnersHQ_bot\n'
+  printf 'creds      %s\n' "$tok"
+  printf 'queue      %s (%s pending)\n' "$QUEUE" "${pend:-0}"
+  printf 'offset     %s\n' "$([[ -r "$OFFSET_FILE" ]] && cat "$OFFSET_FILE" || echo 0)"
+  [[ -r "$ENV_FILE" ]] || return 0
+  load_creds
+  printf 'chat_id    %s\n' "${NHQ_TELEGRAM_CHAT_ID:-absent}"
+  api getMe | python3 -c 'import json,sys
+d=json.load(sys.stdin); r=d.get("result",{})
+print("getMe      " + (("@"+str(r.get("username"))+"  ("+str(r.get("first_name"))+")") if d.get("ok") else "AUTH FAILED"))' 2>/dev/null \
+    || printf 'getMe      unreachable\n'
+}
+
+cmd_send() {
+  local text="${1:-}"
+  [[ -n "$text" ]] || die "nothing to send"
+  load_creds
+  [[ -n "${NHQ_TELEGRAM_CHAT_ID:-}" ]] || die "NHQ_TELEGRAM_CHAT_ID missing in $ENV_FILE"
+  local out
+  out="$(api sendMessage \
+    --data-urlencode "chat_id=$NHQ_TELEGRAM_CHAT_ID" \
+    --data-urlencode "text=$text")" || die "send failed (network)"
+  printf '%s' "$out" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+if not d.get("ok"):
+    sys.exit("nhq-tg: send rejected: " + str(d.get("description")))' || exit 1
+}
+
+# Fetch new updates; append each incoming text message to the directive queue.
+cmd_poll() {
+  load_creds
+  mkdir -p "$CONF_DIR"; touch "$QUEUE"; chmod 600 "$QUEUE"
+  local offset raw
+  offset="$([[ -r "$OFFSET_FILE" ]] && cat "$OFFSET_FILE" || echo 0)"
+  raw="$(api getUpdates --data-urlencode "offset=$offset" --data-urlencode "timeout=0")" || return 0
+  QUEUE="$QUEUE" OFFSET_FILE="$OFFSET_FILE" python3 - "$raw" <<'PY'
+import json, os, sys, time, uuid
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if not d.get("ok"):
+    sys.exit(0)
+queue, offset_file = os.environ["QUEUE"], os.environ["OFFSET_FILE"]
+last, wrote = None, 0
+with open(queue, "a") as f:
+    for u in d.get("result", []):
+        last = u.get("update_id")
+        msg = u.get("message") or u.get("edited_message") or {}
+        text = msg.get("text")
+        if not text:
+            continue
+        f.write(json.dumps({
+            "id": "tg_" + uuid.uuid4().hex[:8],
+            "text": text,
+            "from": (msg.get("from") or {}).get("first_name"),
+            "chat_id": (msg.get("chat") or {}).get("id"),
+            "received_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "consumed": False,
+        }, ensure_ascii=False) + "\n")
+        wrote += 1
+if last is not None:
+    with open(offset_file, "w") as f:
+        f.write(str(last + 1))
+if wrote:
+    print(f"nhq-tg: queued {wrote} directive(s)")
+PY
+}
+
+cmd_watch() {
+  local every="${1:-15}"
+  while true; do cmd_poll || true; sleep "$every"; done
+}
+
+# Print unconsumed directives as a JSON array, then mark them consumed.
+cmd_drain() {
+  [[ -r "$QUEUE" ]] || { echo "[]"; return 0; }
+  QUEUE="$QUEUE" python3 - <<'PY'
+import json, os
+q = os.environ["QUEUE"]
+rows = []
+with open(q) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            pass
+pending = [r for r in rows if not r.get("consumed")]
+print(json.dumps(pending, ensure_ascii=False))
+if pending:
+    for r in rows:
+        r["consumed"] = True
+    with open(q, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+PY
+}
+
+case "${1:-status}" in
+  send)   shift; cmd_send "${1:-}" ;;
+  poll)   cmd_poll ;;
+  watch)  shift; cmd_watch "${1:-15}" ;;
+  drain)  cmd_drain ;;
+  status) cmd_status ;;
+  *)      die "unknown command '${1}'. Try: send | poll | watch | drain | status" ;;
+esac
