@@ -77,9 +77,17 @@ if not d.get("ok"):
 cmd_poll() {
   load_creds
   mkdir -p "$CONF_DIR"; touch "$QUEUE"; chmod 600 "$QUEUE"
-  local offset raw
+  # Long polling: `timeout=N` makes Telegram HOLD the connection until a message
+  # arrives or N seconds pass. One held request per N seconds instead of a tight
+  # re-poll loop — fewer calls AND lower latency than sleeping between short polls
+  # (Yash 2026-07-28: "15 second baar baar call karne mein resources barbad na?").
+  # curl's own deadline must exceed the server-side timeout or it aborts first.
+  local offset raw wait="${1:-0}"
   offset="$([[ -r "$OFFSET_FILE" ]] && cat "$OFFSET_FILE" || echo 0)"
-  raw="$(api getUpdates --data-urlencode "offset=$offset" --data-urlencode "timeout=0")" || return 0
+  raw="$(curl -sS --max-time "$((wait + 15))" \
+          "$API/bot$TELEGRAM_BOT_TOKEN/getUpdates" \
+          --data-urlencode "offset=$offset" \
+          --data-urlencode "timeout=$wait")" || return 0
   QUEUE="$QUEUE" OFFSET_FILE="$OFFSET_FILE" python3 - "$raw" <<'PY'
 import json, os, sys, time, uuid
 try:
@@ -115,8 +123,17 @@ PY
 }
 
 cmd_watch() {
-  local every="${1:-15}"
-  while true; do cmd_poll || true; sleep "$every"; done
+  # Each pass HOLDS the connection for `wait` seconds server-side, so there is no
+  # sleep and no busy-polling: ~1 request per `wait` seconds, and a message that
+  # arrives at second 2 is delivered at second 2, not at the next tick. The short
+  # guard-sleep only applies when a pass returns early (network blip), so a hard
+  # failure cannot become a hot loop.
+  local wait="${1:-25}"
+  while true; do
+    local t0=$SECONDS
+    cmd_poll "$wait" || true
+    (( SECONDS - t0 < 2 )) && sleep 3
+  done
 }
 
 # Print unconsumed directives as a JSON array, then mark them consumed.
@@ -149,7 +166,7 @@ PY
 case "${1:-status}" in
   send)   shift; cmd_send "${1:-}" ;;
   poll)   cmd_poll ;;
-  watch)  shift; cmd_watch "${1:-15}" ;;
+  watch)  shift; cmd_watch "${1:-25}" ;;
   drain)  cmd_drain ;;
   status) cmd_status ;;
   *)      die "unknown command '${1}'. Try: send | poll | watch | drain | status" ;;
