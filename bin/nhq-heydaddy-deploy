@@ -133,6 +133,9 @@ if [[ "$dry_run" == 1 ]]; then
     step "python -m backend.migrate upgrade   — ABORT the whole deploy if it fails"
   fi
   if [[ "$TIER" == "be" ]]; then
+    step "stamp release commit → railway variable set RAILWAY_GIT_COMMIT_SHA=<HEAD> RAILWAY_GIT_BRANCH=<branch> --skip-deploys (no extra deploy; #279)"
+  fi
+  if [[ "$TIER" == "be" ]]; then
     step "cd $HEYDADDY_DIR && railway up --project $PROJECT_ID --environment $RW_ENV --service $SERVICE --detach"
   else
     step "railway redeploy --from-source --project $PROJECT_ID --environment $RW_ENV --service $SERVICE --yes"
@@ -184,6 +187,37 @@ if [[ "$is_prod" == 1 && "$TIER" == "be" ]]; then
     exit 1
   fi
   echo "  ✓ prod migrations up to date"
+fi
+
+# ── Stamp the release commit (#279) ──────────────────────────────────────────
+# /health, /version, the admin health card and the Sentry release all read
+# RAILWAY_GIT_COMMIT_SHA / RAILWAY_GIT_BRANCH (backend/main.py, routers/_version.py,
+# routers/admin.py, observability.py) and fall back to "unknown". A `railway up`
+# tarball deploy injects NO git metadata, and `railway up` has NO --build-arg, so
+# the only way a real SHA reaches those handlers is a service variable set here,
+# just before the upload. --skip-deploys is REQUIRED: a plain `variable set`
+# triggers its own redeploy, which would race the `railway up` below — this keeps
+# it at exactly one deploy. Best-effort: a failed stamp degrades to "unknown", it
+# never blocks a release. FE tiers redeploy from a GitHub-connected source where
+# Railway injects these itself, so this is backend-only.
+if [[ "$TIER" == "be" ]]; then
+  stamp_sha="$(cd "$HEYDADDY_DIR" 2>/dev/null && git rev-parse HEAD 2>/dev/null)"
+  stamp_branch="$(cd "$HEYDADDY_DIR" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  if [[ -n "$stamp_sha" ]]; then
+    echo "→ stamping release commit ${stamp_sha:0:8} (branch ${stamp_branch:-unknown}) as a runtime var — no extra deploy…"
+    rw "$RW_TIMEOUT" variable set "RAILWAY_GIT_COMMIT_SHA=$stamp_sha" \
+       --project "$PROJECT_ID" --service "$SERVICE" --environment "$RW_ENV" --skip-deploys \
+       >/dev/null 2>&1 \
+      || echo "   ⚠ could not set RAILWAY_GIT_COMMIT_SHA — /health may report 'unknown' (deploy continues)" >&2
+    if [[ -n "$stamp_branch" && "$stamp_branch" != "HEAD" ]]; then
+      rw "$RW_TIMEOUT" variable set "RAILWAY_GIT_BRANCH=$stamp_branch" \
+         --project "$PROJECT_ID" --service "$SERVICE" --environment "$RW_ENV" --skip-deploys \
+         >/dev/null 2>&1 \
+        || echo "   ⚠ could not set RAILWAY_GIT_BRANCH (deploy continues)" >&2
+    fi
+  else
+    echo "   ⚠ $HEYDADDY_DIR is not a git checkout — skipping commit stamp; /health may report 'unknown'" >&2
+  fi
 fi
 
 # ── Trigger ───────────────────────────────────────────────────────────────────

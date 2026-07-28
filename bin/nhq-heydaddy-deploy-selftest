@@ -18,6 +18,13 @@ WORK="$(mktemp -d -t nhq-hd-deploy-selftest.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/stub" "$WORK/bin" "$WORK/src"
 
+# #279 — HEYDADDY_DIR must be a real git checkout so the release-commit stamp
+# (railway variable set RAILWAY_GIT_COMMIT_SHA=<HEAD> …) actually runs and can
+# be asserted. One empty commit is enough for `git rev-parse HEAD`.
+git -C "$WORK/src" init -q
+git -C "$WORK/src" -c user.email=selftest@nhq -c user.name=selftest -c commit.gpgsign=false \
+    commit -q --allow-empty -m "selftest fixture"
+
 # ── Fake railway ──────────────────────────────────────────────────────────────
 # STUB picks the scenario. A call counter in $WORK/calls drives the deployment
 # list through the same state sequence Railway would report.
@@ -36,6 +43,11 @@ case "${1:-}" in
     exit 0 ;;
   variables)
     echo "DATABASE_URL=postgresql://stub:stub@db.example.invalid:5432/postgres"
+    exit 0 ;;
+  variable)
+    # #279 — record the `variable set …` invocation so the stamp assertion can
+    # prove RAILWAY_GIT_COMMIT_SHA was set WITH --skip-deploys (no extra deploy).
+    printf '%s\n' "$*" >> "${VARSET:-/dev/null}"
     exit 0 ;;
   deployment)
     n=$(( $(cat "$CALLS" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$CALLS"
@@ -64,6 +76,7 @@ done
 export PATH="$WORK/stub:$PATH"
 export HEYDADDY_DIR="$WORK/src"
 export CALLS="$WORK/calls"
+export VARSET="$WORK/varset"   # #279 — where the railway stub logs `variable set` calls
 # Tiny deadlines so the timeout paths are provable in seconds, not minutes.
 export NHQ_DEPLOY_POLL=1 NHQ_DEPLOY_TIMEOUT=5 NHQ_DEPLOY_TRIGGER_TIMEOUT=2 \
        NHQ_DEPLOY_RW_TIMEOUT=10 NHQ_DEPLOY_MIGRATE_TIMEOUT=5 NHQ_DEPLOY_HEALTH_TRIES=2
@@ -128,6 +141,17 @@ check "prod needs -y or a typed confirm"     prod-be normal 1 20 "aborted"
 "$DISPATCHER" --dry-run >/dev/null 2>&1; [[ $? == 2 ]] \
   && { printf '  ✓ %-38s exit 2\n' "direct call (not a symlink) refused"; pass=$(( pass + 1 )); } \
   || { printf '  ✗ %-38s should exit 2\n' "direct call (not a symlink) refused"; fail=$(( fail + 1 )); }
+
+echo ""
+echo "(f) #279 — a backend deploy stamps the release commit as a runtime var"
+: > "$VARSET"
+check "be deploy stamps the release commit"  dev-be  normal 0 30 "stamping release commit" -y
+if grep -q 'RAILWAY_GIT_COMMIT_SHA=' "$VARSET" && grep -q -- '--skip-deploys' "$VARSET"; then
+  printf '  ✓ %-38s set with --skip-deploys (no extra deploy)\n' "commit var stamped safely"; pass=$(( pass + 1 ))
+else
+  printf '  ✗ %-38s missing the var or --skip-deploys\n' "commit var stamped safely"
+  sed 's/^/        | /' "$VARSET" 2>/dev/null; fail=$(( fail + 1 ))
+fi
 
 echo ""
 echo "──────────────────────────────────────────"
