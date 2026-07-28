@@ -136,11 +136,40 @@ cmd_watch() {
   done
 }
 
-# Print unconsumed directives as a JSON array, then mark them consumed.
-cmd_drain() {
+# READ-ONLY: print unconsumed directives as a JSON array. Consumes NOTHING.
+#
+# `drain` (read + mark consumed in one shot) was the original design and it ATE three
+# of Yash's messages on 2026-07-28: the consumer marked them consumed, then failed to
+# deliver them, and the loss was silent. Consumption must FOLLOW delivery, never precede
+# it — so a consumer now calls `peek`, delivers, and only then `ack`s the ids it handled.
+# A consumer that crashes, is stale, or returns the wrong shape loses nothing.
+cmd_peek() {
   [[ -r "$QUEUE" ]] || { echo "[]"; return 0; }
   QUEUE="$QUEUE" python3 - <<'PY'
 import json, os
+rows = []
+with open(os.environ["QUEUE"]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            pass
+print(json.dumps([r for r in rows if not r.get("consumed")], ensure_ascii=False))
+PY
+}
+
+# Mark specific ids consumed, AFTER the consumer has actually delivered them.
+# `nhq-tg ack <id> [id...]`  ·  `nhq-tg ack --all` for a manual sweep.
+cmd_ack() {
+  [[ -r "$QUEUE" ]] || return 0
+  [[ $# -gt 0 ]] || die "ack needs at least one id (or --all)"
+  QUEUE="$QUEUE" python3 - "$@" <<'PY'
+import json, os, sys
+ids = set(sys.argv[1:])
+all_of_them = "--all" in ids
 q = os.environ["QUEUE"]
 rows = []
 with open(q) as f:
@@ -152,14 +181,46 @@ with open(q) as f:
             rows.append(json.loads(line))
         except Exception:
             pass
-pending = [r for r in rows if not r.get("consumed")]
-print(json.dumps(pending, ensure_ascii=False))
-if pending:
-    for r in rows:
+n = 0
+for r in rows:
+    if not r.get("consumed") and (all_of_them or r.get("id") in ids):
         r["consumed"] = True
-    with open(q, "w") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        n += 1
+with open(q, "w") as f:
+    for r in rows:
+        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+print(f"nhq-tg: acked {n}")
+PY
+}
+
+# Requeue the last N consumed rows — the recovery path for a swallowed message.
+cmd_unack() {
+  local n="${1:-1}"
+  [[ -r "$QUEUE" ]] || return 0
+  QUEUE="$QUEUE" python3 - "$n" <<'PY'
+import json, os, sys
+n = int(sys.argv[1])
+q = os.environ["QUEUE"]
+rows = []
+with open(q) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            pass
+done = [r for r in rows if r.get("consumed")]
+for r in done[-n:]:
+    copy = dict(r)
+    copy["consumed"] = False
+    copy["id"] = str(r.get("id")) + "_requeued"
+    rows.append(copy)
+with open(q, "w") as f:
+    for r in rows:
+        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+print(f"nhq-tg: requeued {len(done[-n:])}")
 PY
 }
 
@@ -167,7 +228,11 @@ case "${1:-status}" in
   send)   shift; cmd_send "${1:-}" ;;
   poll)   cmd_poll ;;
   watch)  shift; cmd_watch "${1:-25}" ;;
-  drain)  cmd_drain ;;
+  peek)   cmd_peek ;;
+  ack)    shift; cmd_ack "$@" ;;
+  unack)  shift; cmd_unack "${1:-1}" ;;
+  # `drain` is RETIRED — it consumed before delivery and silently ate messages.
+  drain)  die "drain is retired (it consumed before delivery and lost messages). Use: peek → deliver → ack <ids>" ;;
   status) cmd_status ;;
-  *)      die "unknown command '${1}'. Try: send | poll | watch | drain | status" ;;
+  *)      die "unknown command '${1}'. Try: send | poll | watch | peek | ack | unack | status" ;;
 esac
