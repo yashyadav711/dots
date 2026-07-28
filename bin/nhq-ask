@@ -58,7 +58,7 @@ fi
 # the pre_tool guards.)
 HARNESS="${NHQ_ASK_HARNESS:-}"
 if [[ -z "$HARNESS" ]]; then
-  if command -v jcode >/dev/null 2>&1; then HARNESS=jcode; else HARNESS=omp; fi
+  HARNESS=omp   # reverted 2026-07-28: NHQ defaults to omp (set NHQ_ASK_HARNESS=jcode to use jcode)
 fi
 TOOLS="--no-tools"
 [[ "$FLAG" == "--read" || "$FLAG" == "--deep" ]] && TOOLS=""

@@ -7,7 +7,7 @@
 # dispatcher, not a rename. Discovery stays automatic: new nhq-<sub> scripts
 # appear as subcommands with zero registry.
 #
-#   nhq                    # launch the MAIN SEAT: jcode on claude-opus-4-8 (thinking auto)
+#   nhq                    # launch the MAIN SEAT: omp on claude-opus-4-8 (agy workers)
 #   nhq status             # fleet overview
 #   nhq help [filter]      # list all subcommands (nhq-help)
 #   nhq status             # fleet state        (nhq-status)
@@ -25,11 +25,10 @@ set -uo pipefail
 BIN_DIR="$HOME/.local/bin"
 
 if [[ $# -eq 0 ]]; then
-  # Bare `nhq` = the main seat (successor of the old omp Opus seat launcher):
-  # jcode on Claude Opus 4.8, model default (auto) thinking/effort. Fable and
-  # Opus share the same Anthropic OAuth pool, so the main seat rides Opus
-  # directly (fleet workers still route to the free agy pool — zero extra burn).
-  exec jcode -m claude-opus-4-8
+  # Bare `nhq` = the main seat: omp on Claude Opus 4.8 (fleet workers on the free agy pool).
+  # Reverted from jcode 2026-07-28 — jcode stays installed (steal audit); launch it
+  # explicitly via the -j aliases (envy-j / heydaddy-j) if ever needed.
+  exec "$HOME/.local/bin/nhq-omp-seat"
 fi
 
 SUB="$1"; shift

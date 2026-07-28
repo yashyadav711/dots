@@ -11,7 +11,7 @@ set -euo pipefail
 THRESHOLD="${NHQ_SEAT_THRESHOLD:-70}"
 SOURCE="${NHQ_SEAT_SOURCE:-}"
 if [[ -z "$SOURCE" ]]; then
-  if command -v jcode >/dev/null 2>&1; then SOURCE=jcode; else SOURCE=omp; fi
+  SOURCE=omp   # reverted 2026-07-28: NHQ reads omp usage (set NHQ_SEAT_SOURCE=jcode to use jcode)
 fi
 
 if [[ "$SOURCE" == jcode ]]; then

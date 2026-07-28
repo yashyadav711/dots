@@ -234,12 +234,12 @@ function copy; cat $argv | nhq-clip; end
 # VFrame project setup alias
 alias setupproject='bash -c "$(curl -fsSL https://raw.githubusercontent.com/yashyadav711/vframe-installer/main/setup-vframe.sh)"'
 
-# jump into HeyDaddy on jcode (flipped 2026-07-19, trial 4313253d passed; omp fallback: heydaddy-omp)
-alias heydaddy='cd ~/Github/Work/heydaddy && jcode'
-# launch Envy in its office (~/Github/nHQ/envy) on jcode (flipped 2026-07-19; omp fallback: envy-omp)
-alias envy='cd ~/Github/nHQ/envy && jcode -m claude-opus-4-8'
-# jump into Mirror on jcode (flipped 2026-07-19, trial adc4663 passed; omp fallback: mirror-omp)
-alias mirror='cd ~/Github/Work/mirror && jcode'
+# jump into HeyDaddy on omp (reverted from jcode 2026-07-28; jcode still available: heydaddy-j)
+alias heydaddy='cd ~/Github/Work/heydaddy && omp --continue'
+# launch Envy in its office (~/Github/nHQ/envy) on omp (reverted 2026-07-28; jcode: envy-j)
+alias envy='cd ~/Github/nHQ/envy && omp'
+# jump into Mirror on omp (reverted 2026-07-28; jcode: mirror-j)
+alias mirror='cd ~/Github/Work/mirror && omp --continue'
 # jump into Director (nhq-agentic-os) — STAYS on omp until her rules rewrite + jcode trial (use director-j to try jcode)
 alias director='cd ~/Github/nhq-agentic-os && omp --continue'
 # jump into HeyDaddy-Design on omp
@@ -374,3 +374,6 @@ function nhq-features-agy-resume --description 'NHQ-Features — free Opus, resu
 function omp-private --description 'omp ephemeral — no session transcript saved to disk'
     omp --no-session $argv
 end
+
+# Added by codebase-memory-mcp install
+fish_add_path /home/yash/.local/bin
