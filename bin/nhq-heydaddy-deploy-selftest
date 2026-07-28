@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# nhq-heydaddy-deploy-selftest — proves nhq-heydaddy-deploy can never hang.
+#
+# heydaddy#225: the dispatcher blocked forever on `railway up` with no output,
+# so `heydaddy-promote to-prod` could never finish unattended. The fix is
+# detach + poll + hard deadlines. This selftest exercises that WITHOUT touching
+# Railway: it puts a fake `railway` and `curl` on PATH and drives the dispatcher
+# through a normal build, a build that never finishes, an upload that never
+# returns, and a failing build — asserting exit codes and the loud messages.
+#
+# Run:  nhq-heydaddy-deploy-selftest        (nothing is deployed; no network)
+set -uo pipefail
+
+DISPATCHER="$(cd "$(dirname "$0")" && pwd)/nhq-heydaddy-deploy"
+[[ -x "$DISPATCHER" ]] || { echo "cannot find an executable $DISPATCHER" >&2; exit 2; }
+
+WORK="$(mktemp -d -t nhq-hd-deploy-selftest.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/stub" "$WORK/bin" "$WORK/src"
+
+# ── Fake railway ──────────────────────────────────────────────────────────────
+# STUB picks the scenario. A call counter in $WORK/calls drives the deployment
+# list through the same state sequence Railway would report.
+cat > "$WORK/stub/railway" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+OLD=aaaaaaaa-0000-0000-0000-000000000000
+NEW=bbbbbbbb-1111-1111-1111-111111111111
+emit() { printf '[{"id":"%s","status":"%s"}]\n' "$1" "$2"; }
+
+case "${1:-}" in
+  up|redeploy)
+    echo "railway-stub: $1 triggered (scenario=$STUB)" >&2
+    [[ "$STUB" == stuck_upload ]] && exec sleep 3600
+    [[ "$STUB" == trigger_fails ]] && exit 7
+    exit 0 ;;
+  variables)
+    echo "DATABASE_URL=postgresql://stub:stub@db.example.invalid:5432/postgres"
+    exit 0 ;;
+  deployment)
+    n=$(( $(cat "$CALLS" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$CALLS"
+    case "$STUB" in
+      normal)       (( n <= 2 )) && emit "$OLD" SUCCESS || { (( n == 3 )) && emit "$NEW" BUILDING || emit "$NEW" SUCCESS; } ;;
+      stuck_build)  (( n <= 1 )) && emit "$OLD" SUCCESS || emit "$NEW" BUILDING ;;
+      failing)      (( n <= 1 )) && emit "$OLD" SUCCESS || { (( n == 2 )) && emit "$NEW" BUILDING || emit "$NEW" FAILED; } ;;
+      *)            emit "$OLD" SUCCESS ;;
+    esac
+    exit 0 ;;
+esac
+exit 0
+STUB
+
+# ── Fake curl (the health check only reads the status code) ──────────────────
+cat > "$WORK/stub/curl" <<'STUB'
+#!/usr/bin/env bash
+echo "${STUB_HTTP:-200}"
+STUB
+
+chmod +x "$WORK/stub/railway" "$WORK/stub/curl"
+for face in dev-be dev-fe prod-be prod-fe; do
+  ln -sf "$DISPATCHER" "$WORK/bin/nhq-heydaddy-$face-deploy"
+done
+
+export PATH="$WORK/stub:$PATH"
+export HEYDADDY_DIR="$WORK/src"
+export CALLS="$WORK/calls"
+# Tiny deadlines so the timeout paths are provable in seconds, not minutes.
+export NHQ_DEPLOY_POLL=1 NHQ_DEPLOY_TIMEOUT=5 NHQ_DEPLOY_TRIGGER_TIMEOUT=2 \
+       NHQ_DEPLOY_RW_TIMEOUT=10 NHQ_DEPLOY_MIGRATE_TIMEOUT=5 NHQ_DEPLOY_HEALTH_TRIES=2
+
+pass=0; fail=0
+# check <name> <face> <scenario> <expected-rc> <max-wall-seconds> <expected-substring> [flags…]
+check() {
+  local name="$1" face="$2" scenario="$3" want_rc="$4" max_s="$5" want_txt="$6"; shift 6
+  local out rc t0 t1 dur
+  : > "$CALLS"
+  t0=$SECONDS
+  # The outer `timeout` is the real assertion: if the dispatcher ever hangs,
+  # it is killed here and the test fails instead of blocking the suite.
+  out="$(STUB="$scenario" timeout --kill-after=5 "$max_s" \
+         "$WORK/bin/nhq-heydaddy-$face-deploy" "$@" 2>&1 </dev/null)"; rc=$?
+  t1=$SECONDS; dur=$(( t1 - t0 ))
+
+  if (( rc == 124 || rc == 137 )); then
+    printf '  ✗ %-38s HUNG — killed after %ss\n' "$name" "$max_s"; fail=$(( fail + 1 )); return
+  fi
+  if (( rc != want_rc )); then
+    printf '  ✗ %-38s exit %s, wanted %s (%ss)\n' "$name" "$rc" "$want_rc" "$dur"
+    echo "$out" | sed 's/^/        | /' | tail -12; fail=$(( fail + 1 )); return
+  fi
+  if [[ -n "$want_txt" ]] && ! grep -qF -- "$want_txt" <<<"$out"; then
+    printf '  ✗ %-38s exit %s ok, but missing: %s\n' "$name" "$rc" "$want_txt"
+    echo "$out" | sed 's/^/        | /' | tail -12; fail=$(( fail + 1 )); return
+  fi
+  printf '  ✓ %-38s exit %s in %ss\n' "$name" "$rc" "$dur"; pass=$(( pass + 1 ))
+  [[ "${VERBOSE:-0}" == 1 ]] && echo "$out" | sed 's/^/        | /'
+  return 0
+}
+
+echo "nhq-heydaddy-deploy selftest — no Railway, no network, nothing deployed"
+echo ""
+echo "(a) a normal build"
+check "dev backend deploys + goes healthy"   dev-be  normal 0 30 "live + healthy" -y
+check "dev frontend deploys + goes healthy"  dev-fe  normal 0 30 "live + healthy" -y
+
+echo ""
+echo "(b) a build that never finishes — must hit the deadline and fail LOUD"
+check "stuck build hits NHQ_DEPLOY_TIMEOUT"  dev-be  stuck_build  1 30 "TIMED OUT after 5s" -y
+check "stuck upload hits trigger timeout"    dev-be  stuck_upload 1 30 "did not return within 2s" -y
+
+echo ""
+echo "(c) a failing build — must return non-zero so heydaddy-promote stops"
+check "FAILED build exits non-zero"          dev-be  failing       1 30 "deploy FAILED" -y
+check "trigger error exits non-zero"         dev-be  trigger_fails 1 30 "trigger failed (exit 7)" -y
+
+echo ""
+echo "(d) unhealthy after a SUCCESS build — still non-zero"
+STUB_HTTP=502 check "health 502 exits non-zero"  dev-be normal 1 30 "returned 502" -y
+
+echo ""
+echo "(e) CLI surface preserved"
+check "--dry-run touches nothing"            prod-be normal 0 20 "DRY RUN" --dry-run
+check "--dry-run makes no railway call"      dev-be  normal 0 20 "DRY RUN" --dry-run
+[[ ! -s "$CALLS" ]] && { printf '  ✓ %-38s no railway invocation\n' "--dry-run really is inert"; pass=$(( pass + 1 )); } \
+                    || { printf '  ✗ %-38s railway WAS called\n' "--dry-run really is inert"; fail=$(( fail + 1 )); }
+check "bad flag rejected"                    dev-be  normal 2 20 "unknown flag" --nope
+check "prod needs -y or a typed confirm"     prod-be normal 1 20 "aborted"
+"$DISPATCHER" --dry-run >/dev/null 2>&1; [[ $? == 2 ]] \
+  && { printf '  ✓ %-38s exit 2\n' "direct call (not a symlink) refused"; pass=$(( pass + 1 )); } \
+  || { printf '  ✗ %-38s should exit 2\n' "direct call (not a symlink) refused"; fail=$(( fail + 1 )); }
+
+echo ""
+echo "──────────────────────────────────────────"
+echo "  $pass passed, $fail failed"
+echo "──────────────────────────────────────────"
+(( fail == 0 )) || exit 1
