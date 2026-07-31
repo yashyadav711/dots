@@ -3,6 +3,9 @@
 #
 #   nhq-handoff validate [file]   schema-check a handoff doc (default ai/session-handoff.md)
 #   nhq-handoff validate --json [file]
+#   nhq-handoff sync [file]       the FULL pre-handoff sweep — validate + everything that
+#                                 silently drifts out of sync with it (see below)
+#   nhq-handoff sync --json [file]
 #
 # A handoff is the load-bearing context swap between sessions; a handoff missing its
 # required sections silently drops carry-over (the background-leak tax's cousin). This
@@ -11,12 +14,115 @@
 # Required section categories (each satisfied by ANY ## / ### heading whose text
 # matches the pattern, case-insensitive). Override the whole set with NHQ_HANDOFF_SECTIONS
 # ("label:regex" entries, one per line).
+#
+# `sync` exists because a VALID handoff can still be a LYING handoff. On 2026-07-31 a
+# handoff correctly listed every required section while two commits sat unpushed — so the
+# next session would have trusted "it's on staging" and been wrong. Schema-checking the
+# prose cannot catch that; only looking at the world can. `sync` therefore checks the
+# things that drift out from under a handoff while it is being written:
+#
+#   1. the doc still validates                       (the original check)
+#   2. UNPUSHED COMMITS in every tracked repo/worktree  <- the one that bit us
+#   3. uncommitted changes sitting in a working tree
+#   4. ai/open-threads.md still parses                (nhq-threads --verify)
+#   5. open GitHub issues that the handoff never mentions
+#   6. threads pointing at issues GitHub says are closed
+#
+# Exits non-zero on any drift, with the exact command to fix each one. Degrades cleanly
+# offline: network-dependent checks report "skipped (offline)" rather than failing.
+# Repos scanned: $NHQ_HANDOFF_REPOS (newline/space list), else the sensible defaults below.
 set -uo pipefail
 
 DEFAULT_SECTIONS='shipped:shipped|done|completed|ship
 open-threads:open|carry|thread
 pending:pending|push|blocked|next|todo'
 
+# Worktrees are included deliberately: tonight's unpushed commits lived in a worktree,
+# not in the main checkout, which is exactly why nobody noticed.
+DEFAULT_REPOS="$HOME/Github/nhq-agentic-os
+$HOME/Github/Work/heydaddy
+$HOME/Github/dots"
+
+# Two severities, because they mean different things at handoff time.
+#   drift() = BLOCKING. Work that exists locally and would be lost or misreported
+#             by the next session. Fails the exit code.
+#   warn()  = advisory. Parked branches, old worktrees — real, but not a lie in the
+#             handoff. Printed, never fails the run. Without this split the sweep
+#             cries wolf on every stale worktree and stops being read.
+DRIFT=""      # human-readable findings, one per line
+DRIFT_N=0     # blocking only
+WARN_N=0
+drift() { DRIFT+="$1"$'\n'; DRIFT_N=$((DRIFT_N+1)); }
+warn()  { DRIFT+="$1"$'\n'; WARN_N=$((WARN_N+1)); }
+note()  { DRIFT+="$1"$'\n'; }
+
+online() { timeout 4 git ls-remote --exit-code https://github.com >/dev/null 2>&1 || \
+           timeout 4 curl -sfI https://github.com >/dev/null 2>&1; }
+
+# Every checkout git knows about for a repo: the main one plus its worktrees.
+repo_trees() {
+  local r="$1"
+  [[ -d "$r/.git" || -f "$r/.git" ]] || return 0
+  git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}'
+}
+
+# 2 + 3 — unpushed commits and dirty trees. The load-bearing check.
+check_git() {
+  local repos="${NHQ_HANDOFF_REPOS:-$DEFAULT_REPOS}" r t br ahead dirty
+  for r in $repos; do
+    for t in $(repo_trees "$r"); do
+      [[ -d "$t" ]] || continue
+      br="$(git -C "$t" rev-parse --abbrev-ref HEAD 2>/dev/null)" || continue
+      [[ "$br" == "HEAD" ]] && continue   # detached, nothing to push to
+      if git -C "$t" rev-parse --verify -q "@{u}" >/dev/null 2>&1; then
+        ahead="$(git -C "$t" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)"
+        if [[ "${ahead:-0}" -gt 0 ]]; then
+          drift "🔴 UNPUSHED  $ahead commit(s) on '$br' in $t"
+          note  "             fix: git -C $t push origin $br"
+        fi
+      else
+        warn  "🟡 NO UPSTREAM  '$br' in $t has never been pushed"
+        note  "             fix: git -C $t push -u origin $br"
+      fi
+      dirty="$(git -C "$t" status --porcelain 2>/dev/null | grep -cv '^??' || true)"
+      if [[ "${dirty:-0}" -gt 0 ]]; then
+        warn  "🟡 UNCOMMITTED  $dirty tracked file(s) modified in $t"
+        note  "             fix: git -C $t status --short"
+      fi
+    done
+  done
+}
+
+# 4 — the thread file is parsed by a tool; a format break is a real break.
+check_threads() {
+  command -v nhq-threads >/dev/null 2>&1 || { note "⚪ threads     skipped (nhq-threads not on PATH)"; return; }
+  if nhq-threads --verify >/dev/null 2>&1; then
+    note "✅ threads     ai/open-threads.md parses"
+  else
+    drift "🔴 THREADS     ai/open-threads.md failed its self-test"
+    note  "             fix: nhq-threads --verify"
+  fi
+}
+
+# 5 + 6 — issues the handoff forgot, and threads pointing at closed issues.
+check_issues() {
+  local file="$1" nums n
+  command -v gh >/dev/null 2>&1 || { note "⚪ issues      skipped (gh not on PATH)"; return; }
+  if ! online; then note "⚪ issues      skipped (offline)"; return; fi
+  nums="$(gh issue list --state open --limit 60 --json number -q '.[].number' 2>/dev/null)" || {
+    note "⚪ issues      skipped (gh call failed)"; return; }
+  [[ -z "$nums" ]] && { note "✅ issues      none open"; return; }
+  local missing=""
+  for n in $nums; do
+    grep -qE "#$n\b" "$file" 2>/dev/null || missing+="#$n "
+  done
+  if [[ -n "$missing" ]]; then
+    warn  "🟡 UNMENTIONED  open issue(s) absent from the handoff: $missing"
+    note  "             fix: mention them, or say why they are out of scope"
+  else
+    note "✅ issues      every open issue appears in the handoff"
+  fi
+}
 handoff_default_file() { printf '%s' "${NHQ_HANDOFF:-${1:-ai/session-handoff.md}}"; }
 
 # hv_validate <file> — sets HV_MISSING (newline list of missing labels); 0 ok / 1 fail.
@@ -66,5 +172,46 @@ case "${1:-}" in
       exit 1
     fi
     ;;
-  *) echo "usage: nhq-handoff validate [--json] [file]" >&2; exit 2 ;;
+
+  sync)
+    shift
+    JSON=0; [[ "${1:-}" == "--json" ]] && { JSON=1; shift; }
+    FILE="$(handoff_default_file "${1:-}")"
+
+    # 1 — the original schema check. A missing section is drift too.
+    if hv_validate "$FILE"; then
+      note "✅ sections    $(printf '%s' "$HV_PRESENT" | tr '\n' ' ')"
+    else
+      drift "🔴 SECTIONS    missing: $(printf '%s' "$HV_MISSING" | tr '\n' ' ')"
+      note  "             fix: add the heading(s) to $FILE"
+    fi
+
+    check_git
+    check_threads
+    check_issues "$FILE"
+
+    if [[ "$JSON" -eq 1 ]]; then
+      jq -n --arg f "$FILE" --argjson n "$DRIFT_N" \
+        --argjson w "$WARN_N" \
+        --argjson d "$(printf '%s' "$DRIFT" | jq -R . | jq -s 'map(select(.!=""))')" \
+        '{file:$f, clean:($n==0), blocking:$n, advisory:$w, findings:$d}'
+    else
+      echo "── nhq-handoff sync · $FILE ──"
+      printf '%s' "$DRIFT" | sed '/^$/d'
+      echo "──"
+      if [[ "$DRIFT_N" -eq 0 ]]; then
+        if [[ "$WARN_N" -eq 0 ]]; then
+          echo "✅ clean — the handoff matches the world. Safe to swap sessions."
+        else
+          echo "✅ no blockers — $WARN_N advisory item(s) above, none of which make the handoff untrue."
+        fi
+      else
+        echo "❌ $DRIFT_N BLOCKING item(s) (+$WARN_N advisory). The handoff is VALID but not TRUE until the 🔴 lines are resolved." >&2
+      fi
+    fi
+    [[ "$DRIFT_N" -eq 0 ]]
+    exit $?
+    ;;
+
+  *) echo "usage: nhq-handoff {validate|sync} [--json] [file]" >&2; exit 2 ;;
 esac
