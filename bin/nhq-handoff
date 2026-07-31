@@ -67,21 +67,28 @@ repo_trees() {
 }
 
 # 2 + 3 — unpushed commits and dirty trees. The load-bearing check.
+#
+# The comparison target is `origin/<same-branch-name>`, NOT `@{u}`. Feature branches here
+# routinely track origin/dev (that is how they were created), so `@{u}..HEAD` measures
+# "ahead of dev" — which is the NORMAL state of every unmerged feature branch. Using it
+# printed 🔴 UNPUSHED for four healthy branches, and a check that cries wolf stops being
+# read. Only "commits that exist nowhere on the remote" is a real handoff lie.
 check_git() {
-  local repos="${NHQ_HANDOFF_REPOS:-$DEFAULT_REPOS}" r t br ahead dirty
+  local repos="${NHQ_HANDOFF_REPOS:-$DEFAULT_REPOS}" r t br ahead dirty remote
   for r in $repos; do
     for t in $(repo_trees "$r"); do
       [[ -d "$t" ]] || continue
       br="$(git -C "$t" rev-parse --abbrev-ref HEAD 2>/dev/null)" || continue
       [[ "$br" == "HEAD" ]] && continue   # detached, nothing to push to
-      if git -C "$t" rev-parse --verify -q "@{u}" >/dev/null 2>&1; then
-        ahead="$(git -C "$t" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)"
+      remote="refs/remotes/origin/$br"
+      if git -C "$t" rev-parse --verify -q "$remote" >/dev/null 2>&1; then
+        ahead="$(git -C "$t" rev-list --count "$remote..HEAD" 2>/dev/null || echo 0)"
         if [[ "${ahead:-0}" -gt 0 ]]; then
           drift "🔴 UNPUSHED  $ahead commit(s) on '$br' in $t"
           note  "             fix: git -C $t push origin $br"
         fi
       else
-        warn  "🟡 NO UPSTREAM  '$br' in $t has never been pushed"
+        warn  "🟡 NO REMOTE BRANCH  '$br' in $t exists only locally"
         note  "             fix: git -C $t push -u origin $br"
       fi
       dirty="$(git -C "$t" status --porcelain 2>/dev/null | grep -cv '^??' || true)"
@@ -105,23 +112,37 @@ check_threads() {
 }
 
 # 5 + 6 — issues the handoff forgot, and threads pointing at closed issues.
+#
+# Scoped to the PRODUCT repos, not the cwd. Bare `gh issue list` resolves the repo from
+# the working directory, and a handoff sweep is normally run from nhq-agentic-os — which
+# has zero open issues. That printed a green "✅ issues none open" while heydaddy carried
+# dozens, i.e. the exact false-clean this check exists to prevent. Override with
+# NHQ_HANDOFF_ISSUE_REPOS (space/newline list of owner/repo).
+DEFAULT_ISSUE_REPOS="yashyadav711/heydaddy"
 check_issues() {
-  local file="$1" nums n
+  local file="$1" repos slug nums n found=0
   command -v gh >/dev/null 2>&1 || { note "⚪ issues      skipped (gh not on PATH)"; return; }
   if ! online; then note "⚪ issues      skipped (offline)"; return; fi
-  nums="$(gh issue list --state open --limit 60 --json number -q '.[].number' 2>/dev/null)" || {
-    note "⚪ issues      skipped (gh call failed)"; return; }
-  [[ -z "$nums" ]] && { note "✅ issues      none open"; return; }
-  local missing=""
-  for n in $nums; do
-    grep -qE "#$n\b" "$file" 2>/dev/null || missing+="#$n "
+  repos="${NHQ_HANDOFF_ISSUE_REPOS:-$DEFAULT_ISSUE_REPOS}"
+  for slug in $repos; do
+    nums="$(gh issue list --repo "$slug" --state open --limit 100 --json number -q '.[].number' 2>/dev/null)" || {
+      note "⚪ issues      skipped ($slug: gh call failed)"; continue; }
+    found=1
+    if [[ -z "$nums" ]]; then note "✅ issues      $slug: none open"; continue; fi
+    local missing="" total=0
+    for n in $nums; do
+      total=$((total+1))
+      grep -qE "#$n\b" "$file" 2>/dev/null || missing+="#$n "
+    done
+    if [[ -n "$missing" ]]; then
+      warn  "🟡 UNMENTIONED  $slug: open issue(s) absent from the handoff: $missing"
+      note  "             fix: mention them, or say why they are out of scope"
+    else
+      note "✅ issues      $slug: all $total open issue(s) appear in the handoff"
+    fi
   done
-  if [[ -n "$missing" ]]; then
-    warn  "🟡 UNMENTIONED  open issue(s) absent from the handoff: $missing"
-    note  "             fix: mention them, or say why they are out of scope"
-  else
-    note "✅ issues      every open issue appears in the handoff"
-  fi
+  [[ "$found" -eq 0 ]] && note "⚪ issues      skipped (no reachable product repo)"
+  return 0
 }
 handoff_default_file() { printf '%s' "${NHQ_HANDOFF:-${1:-ai/session-handoff.md}}"; }
 
