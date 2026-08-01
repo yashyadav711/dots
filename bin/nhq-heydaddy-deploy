@@ -43,7 +43,32 @@
 # a hard overall deadline that fails LOUD, and any failure exits non-zero so
 # heydaddy-promote stops instead of shipping half a release.
 #
-# Made by Director for Yash — 2026-06-30; #225 detach+poll+timeout rewrite 2026-07-28.
+# ── 2026-08-01 — the false failure on a healthy prod release ─────────────────
+# Symptom: `nhq-heydaddy-prod-fe-deploy` printed an empty "current deployment:"
+# and then "the deploy trigger failed (exit 1) … Nothing was polled". The trigger
+# had actually SUCCEEDED — deployment ffb875fa was created at that exact second
+# and finished SUCCESS. The re-run the message demanded produced a duplicate
+# build. Two independent defects, both of them "an error was turned into silence":
+#   A. `deploy_top` piped railway's stderr to /dev/null, swallowed every parse
+#      exception with `except: sys.exit(0)`, and returned "" for THREE different
+#      situations — API error, empty list, unparseable JSON. The caller printed
+#      that "" into "→ current deployment: " (an empty sentence) and kept going
+#      with no baseline. Worse, `prev_id=""` makes `id != prev_id` true for the
+#      PREVIOUS deployment, so the poll loop could have reported the old build's
+#      SUCCESS as this run's.
+#   B. The trigger's exit code was treated as the whole truth. It isn't: the CLI
+#      fires the deploy mutation and THEN reads the reply, and every read failure
+#      after that point (reqwest timeout, edge 502/HTML body, 429, OAuth-refresh
+#      blip) surfaces as a non-zero exit for a deploy that is already running.
+# Fix: deploy_top now reports WHY it failed instead of returning ""; an
+# unreadable baseline is an explicit, named condition that switches new-deploy
+# detection from "id changed" to "created after we pressed the button"; and a
+# non-zero trigger is re-checked against the deployment list before it is called
+# a failure — if a new deployment exists it is polled and the trigger is reported
+# as noisy. #225's timeout/kill/stdin-closed hang protection is unchanged.
+#
+# Made by Director for Yash — 2026-06-30; #225 detach+poll+timeout rewrite 2026-07-28;
+# false-failure / empty-baseline fix 2026-08-01.
 set -uo pipefail
 
 PROJECT_ID="0a52cb6e-d0da-49d2-b608-ea1fa6b4c68f"   # heydaddy
@@ -55,6 +80,10 @@ POLL_INTERVAL="${NHQ_DEPLOY_POLL:-10}"
 RW_TIMEOUT="${NHQ_DEPLOY_RW_TIMEOUT:-90}"
 MIGRATE_TIMEOUT="${NHQ_DEPLOY_MIGRATE_TIMEOUT:-600}"
 HEALTH_TRIES="${NHQ_DEPLOY_HEALTH_TRIES:-8}"
+# How many times to re-ask the API "did a deployment actually appear?" after a
+# non-zero trigger, before believing the trigger's exit code (see the trigger
+# section — a noisy trigger on a healthy deploy is how you get a duplicate build).
+TRIGGER_RECHECK_TRIES="${NHQ_DEPLOY_TRIGGER_RECHECK:-3}"
 
 # ── Resolve env + tier from the invoked name ─────────────────────────────────
 self="$(basename "$0")"
@@ -105,16 +134,92 @@ hhmmss() { printf '%02d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
 # EOFs out immediately instead of blocking this script forever (#225).
 rw() { local t="$1"; shift; timeout --kill-after=10 "$t" railway "$@" </dev/null; }
 
-# Newest deployment for this service as "<id> <STATUS>" (empty if unknown).
+# Collapse anything multi-line into one short, printable line.
+oneline() { printf '%s' "${1-}" | tr '\n\t' '  ' | tr -s ' ' | cut -c1-200; }
+
+# ── Deployment-list reader ────────────────────────────────────────────────────
+# Answers "what is the newest deployment for this service?" and has THREE
+# possible outcomes. Collapsing them into one empty string is half of what broke
+# the 2026-08-01 prod release:
+#   return 0 → DEPLOY_TOP_LINE = "<id> <STATUS> <createdAt-epoch>"
+#   return 1 → DEPLOY_TOP_ERR  = why the list could not be READ
+#   return 1 → DEPLOY_TOP_ERR  = the list was read fine and is EMPTY
+# The old version routed railway's stderr to /dev/null, swallowed every parse
+# exception with `except: sys.exit(0)`, and printed "" for all three. The caller
+# interpolated that "" straight into "→ current deployment: " — an empty
+# sentence — and then carried on with no baseline at all, which in turn let the
+# poll loop mistake the PREVIOUS deployment for the new one.
+DEPLOY_TOP_LINE=""
+DEPLOY_TOP_ERR=""
+RW_ERRFILE="$(mktemp -t nhq-heydaddy-deploy.XXXXXX)"
+trap 'rm -f "$RW_ERRFILE"' EXIT
+
 deploy_top() {
-  rw "$RW_TIMEOUT" deployment list \
-      --project "$PROJECT_ID" --environment "$RW_ENV" --service "$SERVICE" \
-      --limit 5 --json 2>/dev/null \
-  | python3 -c 'import json,sys
-try: d = json.load(sys.stdin)
-except Exception: sys.exit(0)
-if isinstance(d, list) and d:
-    print(d[0].get("id", ""), d[0].get("status", ""))' 2>/dev/null
+  DEPLOY_TOP_LINE=""; DEPLOY_TOP_ERR=""
+  local raw rc parsed
+  raw="$(rw "$RW_TIMEOUT" deployment list \
+          --project "$PROJECT_ID" --environment "$RW_ENV" --service "$SERVICE" \
+          --limit 5 --json 2>"$RW_ERRFILE")"
+  rc=$?
+  if (( rc == 124 || rc == 137 )); then
+    DEPLOY_TOP_ERR="'railway deployment list' did not answer within ${RW_TIMEOUT}s"
+    return 1
+  fi
+  if (( rc != 0 )); then
+    DEPLOY_TOP_ERR="'railway deployment list' exited $rc — $(oneline "$(cat "$RW_ERRFILE" 2>/dev/null)")"
+    return 1
+  fi
+  parsed="$(printf '%s' "$raw" | python3 -c '
+import calendar, json, sys, time
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception as e:
+    print("ERR railway returned unparseable JSON (%s); first 120 chars: %r"
+          % (e.__class__.__name__, raw[:120]))
+    raise SystemExit(0)
+if not isinstance(d, list):
+    print("ERR expected a JSON list of deployments, got %s" % type(d).__name__)
+    raise SystemExit(0)
+if not d:
+    print("ERR the deployment list is empty — this service has never deployed")
+    raise SystemExit(0)
+top = d[0]
+if not isinstance(top, dict) or not top.get("id"):
+    keys = sorted(top)[:8] if isinstance(top, dict) else type(top).__name__
+    print("ERR newest entry carries no id field (saw: %s)" % (keys,))
+    raise SystemExit(0)
+try:
+    epoch = calendar.timegm(time.strptime((top.get("createdAt") or "")[:19],
+                                          "%Y-%m-%dT%H:%M:%S"))
+except Exception:
+    epoch = 0
+print("OK", top["id"], top.get("status") or "UNKNOWN", epoch)
+' 2>&1)"
+  if [[ "$parsed" == OK\ * ]]; then
+    DEPLOY_TOP_LINE="${parsed#OK }"
+    return 0
+  fi
+  DEPLOY_TOP_ERR="$(oneline "${parsed#ERR }")"
+  [[ -n "$DEPLOY_TOP_ERR" ]] || DEPLOY_TOP_ERR="could not parse the deployment list"
+  return 1
+}
+
+# Is "<id> <createdAt-epoch>" a deployment that THIS run caused?
+# With a baseline, "the id changed" is exact and immune to clock skew. Without
+# one it falls back to "created at or after the moment we pressed the button",
+# allowing 120s of skew between this box and Railway. The fallback is load-
+# bearing: when prev_id is empty, `id != prev_id` is TRUE for the previous
+# deployment too, so the poll loop would latch onto the old SUCCESS and declare
+# victory without ever waiting for the build it just started.
+is_new_deployment() {
+  local id="$1" created="${2:-0}"
+  [[ -n "$id" ]] || return 1
+  if [[ -n "$prev_id" ]]; then
+    [[ "$id" != "$prev_id" ]]
+  else
+    (( created >= trigger_started_epoch - 120 ))
+  fi
 }
 
 rule
@@ -142,7 +247,32 @@ if [[ "$dry_run" == 1 ]]; then
   fi
   step "poll 'railway deployment list' every ${POLL_INTERVAL}s until the NEW deployment is SUCCESS"
   echo "     (FAILED/CRASHED → exit 1 · nothing terminal within ${TOTAL_TIMEOUT}s → exit 1, loudly)"
+  echo "     a non-zero trigger is re-checked ${TRIGGER_RECHECK_TRIES}× against the deployment list"
+  echo "     first — if a new deployment appeared it is polled, not aborted"
   step "curl $HEALTH_URL — expect $HEALTH_WANT"
+
+  # Read-only probe. This is the ONLY thing the dry run touches on the network:
+  # a `deployment list` GET. It exercises the exact parser the real run uses, so
+  # a dry run now proves the baseline parses instead of asserting it does.
+  echo ""
+  echo "Baseline probe (read-only — lists deployments, triggers nothing):"
+  probe_now="$(date -u +%s)"
+  if deploy_top; then
+    read -r p_id p_st p_ts _ <<<"$DEPLOY_TOP_LINE"
+    if (( p_ts > 0 )); then
+      p_when="$(date -u -d "@$p_ts" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "epoch $p_ts")"
+      p_age=" ($(hhmmss $(( probe_now - p_ts ))) ago)"
+    else
+      p_when="unknown"; p_age=""
+    fi
+    echo "  ✓ parsed  id=$p_id  status=$p_st  created=$p_when$p_age"
+    echo "  the real run would print → \"→ current deployment: ${p_id:0:8} ($p_st)\""
+    echo "  and would recognise its own build by \"id changed from ${p_id:0:8}\"."
+  else
+    echo "  ⚠ NO BASELINE — $DEPLOY_TOP_ERR"
+    echo "  the real run would print → \"→ current deployment: ⚠ UNKNOWN …\" with that"
+    echo "  reason, keep going, and recognise its own build by creation time instead."
+  fi
   exit 0
 fi
 
@@ -221,8 +351,20 @@ if [[ "$TIER" == "be" ]]; then
 fi
 
 # ── Trigger ───────────────────────────────────────────────────────────────────
-prev_line="$(deploy_top)"; prev_id="${prev_line%% *}"
-echo "→ current deployment: ${prev_id:0:8}${prev_id:+ (${prev_line##* })}"
+prev_id=""; prev_status=""
+if deploy_top; then
+  read -r prev_id prev_status _ <<<"$DEPLOY_TOP_LINE"
+  echo "→ current deployment: ${prev_id:0:8} ($prev_status)"
+else
+  # An unreadable baseline used to print as an empty sentence and then silently
+  # weaken every later check. It is now a named condition with its reason.
+  echo "→ current deployment: ⚠ UNKNOWN — could not read the deployment list."
+  echo "   reason: $DEPLOY_TOP_ERR"
+  echo "   Continuing WITHOUT a baseline. This run will recognise its own build by"
+  echo "   creation time rather than by 'the id changed', and will NOT mistake the"
+  echo "   deployment already on top for the one it is about to start."
+fi
+trigger_started_epoch="$(date -u +%s)"
 
 if [[ "$TIER" == "be" ]]; then
   echo "→ uploading working tree + triggering the build (railway up --detach)…"
@@ -237,38 +379,91 @@ else
   rc=$?
 fi
 
-if (( rc == 124 || rc == 137 )); then
-  loud "the deploy trigger did not return within ${TRIGGER_TIMEOUT}s — killed it." \
-       "This is the #225 hang, caught instead of waited on. A build may still have" \
-       "been queued server-side — check before re-running:" \
-       "  railway deployment list --project $PROJECT_ID --environment $RW_ENV --service $SERVICE"
-  exit 1
-elif (( rc != 0 )); then
-  loud "the deploy trigger failed (exit $rc) for $LABEL." "Nothing was polled; fix the error above and re-run."
-  exit 1
+# ── A non-zero trigger is not proof that nothing shipped ─────────────────────
+# `railway redeploy --from-source` fires the serviceInstanceDeploy(latestCommit:
+# true) mutation and then READS the reply. Every read failure AFTER that point —
+# the reqwest client-level timeout, a 502/HTML body from the edge, a 429, an
+# OAuth-refresh blip, a response the client cannot deserialize — propagates
+# through `?` and exits non-zero for a deploy the server has ALREADY started
+# (railwayapp/cli src/client.rs: `.send().await?` then `response.json().await?`,
+# both downstream of the mutation). `railway up --detach` has the same shape.
+# Observed on prod 2026-08-01: trigger reported exit 1, deployment ffb875fa was
+# created at that exact second and finished SUCCESS, and the "re-run" this error
+# used to demand produced a duplicate build. A false failure on a healthy prod
+# release is how someone rolls back something that was fine — so ask the API
+# before believing the exit code.
+noisy_trigger=0
+if (( rc != 0 )); then
+  if (( rc == 124 || rc == 137 )); then
+    echo "⚠  the deploy trigger did not return within ${TRIGGER_TIMEOUT}s — killed it (#225 hang guard)." >&2
+  else
+    echo "⚠  the deploy trigger exited $rc." >&2
+  fi
+  echo "   Checking whether a deployment appeared anyway before calling this a failure…" >&2
+  adopted_id=""; adopted_status=""
+  for (( try = 1; try <= TRIGGER_RECHECK_TRIES; try++ )); do
+    if deploy_top; then
+      read -r chk_id chk_status chk_ts _ <<<"$DEPLOY_TOP_LINE"
+      if is_new_deployment "$chk_id" "$chk_ts"; then
+        adopted_id="$chk_id"; adopted_status="$chk_status"; break
+      fi
+      printf '   [recheck %d/%d] no new deployment — top is still %s (%s)\n' \
+        "$try" "$TRIGGER_RECHECK_TRIES" "${chk_id:0:8}" "$chk_status" >&2
+    else
+      printf '   [recheck %d/%d] could not read the list — %s\n' \
+        "$try" "$TRIGGER_RECHECK_TRIES" "$DEPLOY_TOP_ERR" >&2
+    fi
+    (( try < TRIGGER_RECHECK_TRIES )) && sleep "$POLL_INTERVAL"
+  done
+
+  if [[ -n "$adopted_id" ]]; then
+    noisy_trigger=1
+    echo "   ✓ a new deployment DID appear: ${adopted_id:0:8} ($adopted_status)." >&2
+    echo "   → the trigger was NOISY, not failed. Polling that build instead of aborting." >&2
+    echo "   → do NOT re-run this deploy — that is what produces a duplicate build." >&2
+  elif (( rc == 124 || rc == 137 )); then
+    loud "the deploy trigger did not return within ${TRIGGER_TIMEOUT}s for $LABEL — killed it." \
+         "This is the #225 hang, caught instead of waited on." \
+         "Re-checked the deployment list ${TRIGGER_RECHECK_TRIES}× afterwards and NO new deployment" \
+         "appeared, so nothing shipped and re-running will not duplicate a build:" \
+         "  railway deployment list --project $PROJECT_ID --environment $RW_ENV --service $SERVICE"
+    exit 1
+  else
+    loud "the deploy trigger failed (exit $rc) for $LABEL, and nothing shipped." \
+         "Re-checked the deployment list ${TRIGGER_RECHECK_TRIES}× afterwards and NO new deployment" \
+         "appeared, so fixing the error above and re-running is safe:" \
+         "  railway deployment list --project $PROJECT_ID --environment $RW_ENV --service $SERVICE"
+    exit 1
+  fi
 fi
 
 # ── Poll to a terminal state, with a hard deadline ───────────────────────────
 echo "→ waiting for the new deployment to finish (poll ${POLL_INTERVAL}s, deadline ${TOTAL_TIMEOUT}s)…"
 started=$SECONDS
-new_id=""; outcome="timeout"
+new_id=""; new_status=""; outcome="timeout"
 while (( SECONDS - started < TOTAL_TIMEOUT )); do
-  line="$(deploy_top)"; id="${line%% *}"; st="${line##* }"
   elapsed=$(( SECONDS - started ))
-  if [[ -n "$id" && "$id" != "$prev_id" ]]; then
-    printf '    [+%s] %s  %s\n' "$(hhmmss "$elapsed")" "${id:0:8}" "${st:-?}"
-    case "$st" in
-      SUCCESS)                  new_id="$id"; outcome="success"; break ;;
-      FAILED|CRASHED|REMOVED)   new_id="$id"; outcome="failed";  break ;;
-    esac
+  if deploy_top; then
+    read -r id st ts _ <<<"$DEPLOY_TOP_LINE"
+    if is_new_deployment "$id" "$ts"; then
+      printf '    [+%s] %s  %s\n' "$(hhmmss "$elapsed")" "${id:0:8}" "${st:-?}"
+      case "$st" in
+        SUCCESS)                  new_id="$id"; new_status="$st"; outcome="success"; break ;;
+        FAILED|CRASHED|REMOVED)   new_id="$id"; new_status="$st"; outcome="failed";  break ;;
+      esac
+    else
+      printf '    [+%s] waiting for the new deployment to appear (top is still %s)…\n' \
+        "$(hhmmss "$elapsed")" "${id:0:8}"
+    fi
   else
-    printf '    [+%s] waiting for the new deployment to appear…\n' "$(hhmmss "$elapsed")"
+    # Don't render a transient API blip as "waiting…" — that reads like progress.
+    printf '    [+%s] deployment list unreadable — %s\n' "$(hhmmss "$elapsed")" "$DEPLOY_TOP_ERR"
   fi
   sleep "$POLL_INTERVAL"
 done
 
 if [[ "$outcome" == "failed" ]]; then
-  loud "deploy $st for $LABEL (deployment ${new_id:0:8})." \
+  loud "deploy $new_status for $LABEL (deployment ${new_id:0:8})." \
        "logs: railway logs --project $PROJECT_ID --environment $RW_ENV --service $SERVICE"
   exit 1
 fi
@@ -304,5 +499,7 @@ fi
 
 rule
 echo "✅ $LABEL live + healthy (${new_id:0:8})"
+(( noisy_trigger == 1 )) && \
+  echo "   note: the trigger command exited non-zero but the deploy was real — see above."
 rule
 exit 0
