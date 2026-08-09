@@ -8,8 +8,12 @@ API_BASE="${NHQ_BOT_API_BASE:-https://api.telegram.org}"
 usage() {
   cat <<'EOF'
 Usage: nhq-bot notify --event <blocked|failed|completed> --title <text> [options]
+       nhq-bot relay  --text <text> | --file <path>
 
-Send a private Telegram notification for a terminal agent state.
+notify — send a private Telegram notification for a terminal agent state.
+relay  — send a message body VERBATIM, with no header and no markup parsing.
+         Use when the message is meant to be copied out of Telegram and pasted
+         somewhere else; notify's status header would come with it.
 
 Options:
   --event <blocked|failed|completed>  Terminal state (required)
@@ -100,6 +104,67 @@ load_credentials() {
   NHQ_TELEGRAM_CHAT_ID="$chat_id"
 }
 
+# send_plain — POST a message body to Telegram with NO CLI-owned markup.
+# `notify` wraps every message in a bold status header, which is right for an
+# agent notification and wrong for anything Yash needs to copy out and paste
+# somewhere else. `relay` exists for that second case: what goes in is exactly
+# what lands in the chat, so a long-press copy gives a clean paste.
+# Telegram hard-rejects a sendMessage body over 4096 characters with a bare
+# HTTP 400, so a long relay is split here rather than failing. Splitting is on
+# blank lines first and single newlines second, never mid-sentence, because the
+# whole point of relay is that the text is read and pasted by a human.
+send_plain() {
+  local text="$1"
+  local limit=3900          # headroom under 4096 for multi-byte characters
+  if [ "${#text}" -gt "$limit" ]; then
+    local rest="$text" chunk cut
+    while [ "${#rest}" -gt "$limit" ]; do
+      chunk="${rest:0:$limit}"
+      cut="$(printf '%s' "$chunk" | grep -bo $'\n\n' | tail -1 | cut -d: -f1)"
+      [ -z "$cut" ] && cut="$(printf '%s' "$chunk" | grep -bo $'\n' | tail -1 | cut -d: -f1)"
+      [ -z "$cut" ] && cut="$limit"
+      send_one "${rest:0:$cut}"
+      rest="${rest:$cut}"
+      # drop the leading newlines the split left behind
+      while [ "${rest:0:1}" = $'\n' ]; do rest="${rest:1}"; done
+    done
+    [ -n "$rest" ] && send_one "$rest"
+    return 0
+  fi
+  send_one "$text"
+}
+
+send_one() {
+  local text="$1"
+  load_credentials
+  command -v jq >/dev/null 2>&1 || die_delivery "jq is required"
+
+  # These are GLOBALS on purpose. The EXIT trap fires after this function has
+  # returned, so function-locals would already be out of scope and `set -u`
+  # would abort the cleanup with "unbound variable".
+  RELAY_PAYLOAD_FILE="$(mktemp)" || die_delivery "cannot create request payload"
+  RELAY_CURL_CONFIG="$(mktemp)" || die_delivery "cannot create curl config"
+  trap 'rm -f "${RELAY_PAYLOAD_FILE:-}" "${RELAY_CURL_CONFIG:-}"' EXIT
+  chmod 600 "$RELAY_PAYLOAD_FILE" "$RELAY_CURL_CONFIG"
+
+  # No parse_mode: the body is delivered verbatim, so Markdown/HTML characters
+  # in a drafted message can never be interpreted or rejected as bad markup.
+  jq -cn --arg chat_id "$NHQ_TELEGRAM_CHAT_ID" --arg text "$text" \
+    '{chat_id:$chat_id,text:$text}' \
+    >"$RELAY_PAYLOAD_FILE" || die_delivery "cannot encode request"
+
+  printf 'url = "%s"\nrequest = "POST"\n' \
+    "$API_BASE/bot${TELEGRAM_BOT_TOKEN}/sendMessage" >"$RELAY_CURL_CONFIG"
+
+  local response
+  response="$(curl --silent --show-error --fail-with-body --config "$RELAY_CURL_CONFIG" \
+    --header 'Content-Type: application/json' --data-binary "@$RELAY_PAYLOAD_FILE")" \
+    || die_delivery "Telegram request failed"
+
+  printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1 \
+    || die_delivery "Telegram API rejected the relay message"
+}
+
 main() {
   [ $# -gt 0 ] || die_config "no command given"
 
@@ -107,6 +172,30 @@ main() {
   case "$1" in
     --help|-h) usage; exit 0 ;;
     notify) shift ;;
+    relay)
+      shift
+      local relay_text="" relay_file="" seen_relay=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --help|-h) usage; exit 0 ;;
+          --text)
+            [ "$seen_relay" -eq 1 ] && die_config "pass only one of --text/--file"
+            [ $# -ge 2 ] || die_config "missing value for --text"
+            relay_text="$2"; seen_relay=1; shift 2 ;;
+          --file)
+            [ "$seen_relay" -eq 1 ] && die_config "pass only one of --text/--file"
+            [ $# -ge 2 ] || die_config "missing value for --file"
+            relay_file="$2"; seen_relay=1; shift 2 ;;
+          *) die_config "unknown relay option: $1" ;;
+        esac
+      done
+      if [ -n "$relay_file" ]; then
+        [ -r "$relay_file" ] || die_config "cannot read --file: $relay_file"
+        relay_text="$(cat "$relay_file")"
+      fi
+      [ -n "$relay_text" ] || die_config "relay needs --text or a non-empty --file"
+      send_plain "$relay_text"
+      exit 0 ;;
     *) die_config "unknown command: $1" ;;
   esac
 
