@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# nhq-port — claim a port from the NHQ reserved pool, so two agents never collide.
+#
+# Why this exists: agents kept picking a port at random, starting a dev server on
+# it, and handing Yash a URL that his tablet could not reach — because the port
+# was never opened in the firewall. Worse, the check "is it open?" was repeatedly
+# done from the same machine, which bypasses the firewall entirely and always
+# says yes. Both failures are now impossible: the pool is opened once in ufw, and
+# claiming is the only sanctioned way to pick a port.
+#
+#   nhq-port claim <name>    -> prints a port, records the holder
+#   nhq-port release <name>  -> frees it
+#   nhq-port list            -> what is held, and by what
+#   nhq-port check           -> verify the pool is actually open in the firewall
+#
+# The pool is 3900-3909. Ten ports, contiguous, memorable, and clear of
+# everything this machine already uses. Opened to any source, matching the
+# machine's existing rules — the laptop never leaves the home network, so a
+# subnet restriction would only break the day the router hands out a new range.
+set -euo pipefail
+
+POOL_START=3900
+POOL_END=3909
+LEDGER="${NHQ_PORT_LEDGER:-$HOME/.nhq/ports.tsv}"
+
+mkdir -p "$(dirname "$LEDGER")"
+[ -f "$LEDGER" ] || : >"$LEDGER"
+
+die() { printf 'nhq-port: %s\n' "$1" >&2; exit 1; }
+
+# A port is free if nothing is listening AND no live claim holds it. A claim
+# whose process is gone is stale and gets reaped, so a crashed agent does not
+# leak a port forever.
+port_listening() {
+  ss -ltn 2>/dev/null | awk -v p=":$1\$" '$4 ~ p {found=1} END {exit !found}'
+}
+
+# A claim expires only when it is BOTH old and idle. Tying liveness to a pid was
+# the obvious approach and it was wrong: every `nhq-port` run is its own
+# short-lived process, so the recorded pid was dead by the next invocation and
+# every claim reaped itself instantly. The server holding the port outlives the
+# command that claimed it, so "is something listening" is the honest signal.
+CLAIM_TTL_HOURS="${NHQ_PORT_TTL_HOURS:-12}"
+
+reap() {
+  # These MUST be local. `read` in the loop below assigns into the caller's
+  # scope otherwise, and `name` is exactly the variable cmd_claim is holding —
+  # so reaping silently blanked the name being claimed and every row landed
+  # nameless.
+  local tmp now cutoff port name pid ts when
+  tmp="$(mktemp)"
+  now="$(date +%s)"
+  cutoff=$(( now - CLAIM_TTL_HOURS * 3600 ))
+  while IFS=$'\t' read -r port name pid ts; do
+    [ -z "${port:-}" ] && continue
+    when="$(date -d "${ts:-@0}" +%s 2>/dev/null || echo "$now")"
+    # keep it if something is still serving on it, or if it is not yet stale
+    if port_listening "$port" || [ "$when" -gt "$cutoff" ]; then
+      printf '%s\t%s\t%s\t%s\n' "$port" "$name" "$pid" "$ts" >>"$tmp"
+    fi
+  done <"$LEDGER"
+  mv "$tmp" "$LEDGER"
+}
+
+cmd_claim() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "claim needs a name, e.g. nhq-port claim admin-ui"
+  reap
+  # already holding one under this name? hand back the same port, idempotent.
+  local existing
+  existing="$(awk -F'\t' -v n="$name" '$2==n {print $1; exit}' "$LEDGER")"
+  if [ -n "$existing" ]; then printf '%s\n' "$existing"; return 0; fi
+
+  local p
+  for ((p=POOL_START; p<=POOL_END; p++)); do
+    awk -F'\t' -v q="$p" '$1==q {exit 1}' "$LEDGER" || continue
+    port_listening "$p" && continue
+    printf '%s\t%s\t%s\t%s\n' "$p" "$name" "$PPID" "$(date -Iseconds)" >>"$LEDGER"
+    printf '%s\n' "$p"
+    return 0
+  done
+  die "pool $POOL_START-$POOL_END is fully claimed — run 'nhq-port list' and release something"
+}
+
+cmd_release() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "release needs a name"
+  local tmp; tmp="$(mktemp)"
+  awk -F'\t' -v n="$name" '$2!=n' "$LEDGER" >"$tmp"
+  mv "$tmp" "$LEDGER"
+  printf 'released %s\n' "$name"
+}
+
+cmd_list() {
+  reap
+  if [ ! -s "$LEDGER" ]; then printf 'pool %s-%s — nothing claimed\n' "$POOL_START" "$POOL_END"; return 0; fi
+  printf '%-6s %-22s %-8s %s\n' PORT NAME PID SINCE
+  while IFS=$'\t' read -r port name pid ts; do
+    [ -z "${port:-}" ] && continue
+    printf '%-6s %-22s %-8s %s\n' "$port" "$name" "$pid" "$ts"
+  done <"$LEDGER"
+}
+
+# The check that actually means something: read the firewall's own rules rather
+# than curling the port from this machine, which never traverses the firewall
+# and so always succeeds regardless of whether the rule exists.
+cmd_check() {
+  local rules=/etc/ufw/user.rules
+  [ -r "$rules" ] || die "cannot read $rules"
+  local open=0 p
+  for ((p=POOL_START; p<=POOL_END; p++)); do
+    if grep -qE "^### tuple ### allow tcp ${p}(:| )" "$rules" \
+       || grep -qE "^### tuple ### allow tcp ${POOL_START}:${POOL_END} " "$rules"; then
+      open=$((open+1))
+    fi
+  done
+  if [ "$open" -eq 0 ]; then
+    printf 'pool %s-%s is NOT open in ufw.\n\nRun this once:\n  sudo ufw allow %s:%s/tcp comment "NHQ agent services"\n' \
+      "$POOL_START" "$POOL_END" "$POOL_START" "$POOL_END"
+    exit 1
+  fi
+  printf 'pool %s-%s is open in ufw (%s of 10 rules present)\n' "$POOL_START" "$POOL_END" "$open"
+}
+
+case "${1:-}" in
+  claim)   shift; cmd_claim "$@" ;;
+  release) shift; cmd_release "$@" ;;
+  list)    cmd_list ;;
+  check)   cmd_check ;;
+  *) cat <<EOF
+nhq-port — claim a port from the NHQ reserved pool ($POOL_START-$POOL_END)
+
+  nhq-port claim <name>    print a free port and record the claim (idempotent)
+  nhq-port release <name>  free it
+  nhq-port list            what is held
+  nhq-port check           verify the pool is open in ufw (reads the rules, not curl)
+
+Every agent serving anything Yash opens in a browser MUST claim from this pool.
+Picking a port by hand is how a URL ends up unreachable from his tablet.
+EOF
+    exit 2 ;;
+esac
