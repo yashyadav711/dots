@@ -1,15 +1,55 @@
 #!/usr/bin/env python3
-"""agy-snapshot — append per-account quota snapshot row to usage-history.csv."""
-import csv, json, os, datetime, urllib.request, sys
+"""agy-snapshot — append per-account quota snapshot row to usage-history.csv.
 
-URL      = "http://localhost:51200/api/status"
-CSV_PATH = os.path.expanduser("~/.pi-antigravity-rotator/usage-history.csv")
-MODELS   = ["claude-opus-4-6-thinking", "gemini-3.1-pro", "gemini-3.5-flash"]
-HEADER   = ["timestamp", "email", "status", "total_requests",
-            "quota_claude", "quota_gemini_pro", "quota_gemini_flash"]
+The rotator's /api/status became admin-token protected on 2026-07-06 22:27 IST
+(src/admin-auth.ts). This script was never updated, so it has 401'd every 15
+minutes since — the last row in usage-history.csv is 2026-07-06T16:51:22Z, six
+minutes before the token file was created. 3,330 snapshots were lost before it
+was noticed, because a failing timer is invisible unless somebody reads the CSV.
+
+Token resolution mirrors the rotator's own CLI (src/cli.ts `status`):
+  1. $PI_ROTATOR_ADMIN_TOKEN
+  2. ~/.pi-antigravity-rotator/.admin-token   (mode 0600, written by ensureAdminToken)
+The value is never printed, logged or written to the CSV.
+"""
+import csv, json, os, datetime, urllib.request, urllib.error, sys
+
+URL       = "http://localhost:51200/api/status"
+CSV_PATH  = os.path.expanduser("~/.pi-antigravity-rotator/usage-history.csv")
+TOKEN_FILE = os.path.expanduser("~/.pi-antigravity-rotator/.admin-token")
+MODELS    = ["claude-opus-4-6-thinking", "gemini-3.1-pro", "gemini-3.5-flash"]
+HEADER    = ["timestamp", "email", "status", "total_requests",
+             "quota_claude", "quota_gemini_pro", "quota_gemini_flash"]
+
+
+def admin_token():
+    env = (os.environ.get("PI_ROTATOR_ADMIN_TOKEN") or "").strip()
+    if env:
+        return env
+    try:
+        with open(TOKEN_FILE) as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+token = admin_token()
+req = urllib.request.Request(URL)
+if token:
+    req.add_header("X-Rotator-Admin-Token", token)
 
 try:
-    data = json.loads(urllib.request.urlopen(URL, timeout=5).read())
+    data = json.loads(urllib.request.urlopen(req, timeout=5).read())
+except urllib.error.HTTPError as e:
+    if e.code == 401:
+        where = "PI_ROTATOR_ADMIN_TOKEN" if token and os.environ.get("PI_ROTATOR_ADMIN_TOKEN") \
+                else TOKEN_FILE if token else "nowhere — no token found"
+        print(f"[agy-snapshot] 401 Unauthorized. Token source: {where}. "
+              f"The rotator may have rotated its admin token; compare with "
+              f"`grep admin_token` in the rotator settings store.", file=sys.stderr)
+    else:
+        print(f"[agy-snapshot] Cannot reach rotator: HTTP {e.code} {e.reason}", file=sys.stderr)
+    sys.exit(1)
 except Exception as e:
     print(f"[agy-snapshot] Cannot reach rotator: {e}", file=sys.stderr)
     sys.exit(1)
