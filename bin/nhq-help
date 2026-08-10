@@ -39,7 +39,7 @@ if [[ -z "$FILTER" ]]; then
   row "envy"             "Envy · ~/Github/nHQ/envy · jcode on claude-opus-4-8"
   row "heydaddy"         "HeyDaddy · jcode"
   row "mirror"           "Mirror · jcode"
-  row "director"         "Director · still omp --continue (until her rules rewrite)"
+  row "director"         "Director · omp seat (in Orca)"
   row "director-j"       "Director on jcode (trial)"
   note "omp fallbacks: envy-omp · heydaddy-omp · mirror-omp · nhq omp-seat […]"
   note "continue a session: jcode --resume (picker) · /resume inside the TUI"
@@ -96,6 +96,14 @@ if [[ -z "$FILTER" ]]; then
   row "agyq"             "live per-account rotator quota"
   row "agy-usage"        "quota trends · agy-reauth switch account"
   note "in jcode: -m claude-sonnet-4-6 / gemini-3.5-flash-* rides the same pool"
+
+  head_ "🌙  THE RUN · plan the night, watch the machine"
+  roww "nhq-run add|show|dispatch"      "the overnight queue — what the AGENTS do tonight"
+  roww "nhq-mon [--watch] [--ci]"       "one screen: RAM/swap, worktrees, queue, CI + a verdict"
+  roww "nhq-calendar"                    "Yash's dated commitments — what HE owes, not the agents"
+  roww "nhq-brief"                       "the daily brief · one issue per person, one link per day"
+  roww "nhq-threads --set ID --who NAME" "open threads · --who names who a ⏳ wait is actually on"
+  note "a ⏳ thread with no ◆ who: renders '?' — the tool never guesses an owner"
 
   head_ "🧰  SHELL UTILITY"
   row "reload"           "restart fish · l1/l2/l3 tree · ex extract · backup .bak"

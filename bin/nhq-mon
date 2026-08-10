@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""nhq-mon — one screen answering "what is running and is this laptop coping?"
+
+Built for unattended overnight runs on a 7.5 GiB machine. During a run there are
+agents, git worktrees, CI jobs and dev servers in flight at once, and the failure
+mode is never one big thing — it is six small ones adding up until the box swaps
+itself to death while nobody is watching.
+
+This composes what already exists rather than re-implementing it:
+  nhq-status   fleet tmux sessions (tokens/cost/state)   -> --agents
+  nhq-warden   the 30 s watchdog                         -> thresholds copied, not invented
+  nhq-run      the overnight queue                       -> wave progress
+  nhq-port     the reserved port pool                    -> listeners
+
+What it adds that nothing else covers:
+  • git worktrees across every repo, with size AND whether they sit on tmpfs
+  • the tmpfs trap: /tmp is RAM-backed here, so a worktree in /tmp costs RAM twice
+  • a single VERDICT line, so the answer is readable in one glance, not derived
+
+Thresholds are deliberately identical to nhq-warden (RAM 400 MiB, swap-free 1 GiB,
+disk 90%) so the two never disagree. nhq-mon adds a TIGHT tier above each WARN
+because unattended is less forgiving than attended.
+
+Usage:
+  nhq-mon                 # the screen
+  nhq-mon --watch [SECS]  # redraw every SECS (default 20), Ctrl-C to exit
+  nhq-mon --ci            # also query GitHub for in-flight Actions runs (network)
+  nhq-mon --json          # machine-readable, for a guard or a log
+  nhq-mon --quiet         # verdict line only — the between-waves check
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+# ── thresholds ───────────────────────────────────────────────────────────────
+# WARN mirrors nhq-warden exactly. TIGHT is nhq-mon's earlier, unattended-run tier.
+RAM_AVAIL_MIB_WARN = 400
+RAM_AVAIL_MIB_TIGHT = 900
+SWAP_FREE_MIB_WARN = 1024
+SWAP_FREE_MIB_TIGHT = 4096
+DISK_USED_PCT_WARN = 90
+DISK_USED_PCT_TIGHT = 85
+TMPFS_USED_PCT_TIGHT = 50   # /tmp is RAM here; half full is already expensive
+LOAD_PER_CORE_TIGHT = 2.0
+WORKTREE_ROWS = 6           # rows shown before the tail is summarised
+
+REPOS = [
+    "/home/yash/Github/Work/heydaddy",
+    "/home/yash/Github/nhq-agentic-os",
+    "/home/yash/Github/Work/mirror",
+    "/home/yash/Github/dots",
+    "/home/yash/Github/nHQ/netrunners-status",
+]
+
+G = "\033[32m"; Y = "\033[33m"; R = "\033[31m"; D = "\033[2m"; B = "\033[1m"; X = "\033[0m"
+CLEAR = "\033[2J\033[H"
+
+
+def sh(cmd: list[str], timeout: float = 8.0) -> str:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.stdout.strip()
+    except Exception:
+        return ""
+
+
+def meminfo() -> dict[str, int]:
+    """/proc/meminfo in MiB — the same source nhq-warden reads."""
+    out = {}
+    for line in open("/proc/meminfo"):
+        k, _, rest = line.partition(":")
+        try:
+            out[k] = int(rest.strip().split()[0]) // 1024
+        except (ValueError, IndexError):
+            pass
+    return out
+
+
+def mount_usage(path: str) -> tuple[int, int, int] | None:
+    """(used_pct, free_mib, total_mib) for the filesystem holding `path`."""
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    total = st.f_blocks * st.f_frsize
+    free = st.f_bavail * st.f_frsize
+    if not total:
+        return None
+    used_pct = round((total - free) * 100 / total)
+    return used_pct, free // 1024 // 1024, total // 1024 // 1024
+
+
+def on_tmpfs(path: str) -> bool:
+    """True when `path` lives on a RAM-backed filesystem."""
+    best, kind = "", ""
+    try:
+        for line in open("/proc/mounts"):
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            mp, fstype = parts[1], parts[2]
+            if path.startswith(mp) and len(mp) > len(best):
+                best, kind = mp, fstype
+    except OSError:
+        return False
+    return kind in ("tmpfs", "ramfs")
+
+
+def worktrees() -> list[dict]:
+    """Every git worktree across the known repos, deduped, with size and medium."""
+    seen: dict[str, dict] = {}
+    for repo in REPOS:
+        if not os.path.isdir(repo):
+            continue
+        out = sh(["git", "-C", repo, "worktree", "list", "--porcelain"])
+        path = None
+        for line in out.splitlines():
+            if line.startswith("worktree "):
+                path = line[9:].strip()
+            elif line.startswith("branch ") and path:
+                if path not in seen and path != repo:
+                    seen[path] = {
+                        "path": path,
+                        "branch": line[7:].strip().replace("refs/heads/", ""),
+                        "ram_backed": on_tmpfs(path),
+                        "exists": os.path.isdir(path),
+                    }
+                path = None
+    # One `du` for every path beats one per worktree: 33 subprocesses became 1,
+    # which is the difference between a 14 s report and a glanceable one.
+    live = [w["path"] for w in seen.values() if w["exists"]]
+    sizes: dict[str, int] = {}
+    if live:
+        for row in sh(["du", "-sm", "--"] + live, timeout=60).splitlines():
+            mib, _, path = row.partition("\t")
+            try:
+                sizes[path.strip()] = int(mib)
+            except ValueError:
+                pass
+    for w in seen.values():
+        w["mib"] = sizes.get(w["path"], 0)
+    return sorted(seen.values(), key=lambda w: -w["mib"])
+
+
+def agent_procs() -> dict[str, int]:
+    """Live agent-ish processes by kind, so an orphan is visible."""
+    out = sh(["ps", "-eo", "comm="])
+    counts: dict[str, int] = {}
+    for name in out.splitlines():
+        n = name.strip()
+        for kind in ("omp", "claude", "node", "vitest", "playwright", "pytest", "tsserver"):
+            if n == kind or n.startswith(kind):
+                counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def zombies() -> int:
+    return sum(1 for s in sh(["ps", "-eo", "stat="]).split() if s.startswith("Z"))
+
+
+def run_queue() -> dict:
+    out = sh(["nhq-run", "show"], timeout=12)
+    if not out:
+        return {}
+    waves = out.count("── Wave")
+    tasks = len([l for l in out.splitlines() if l.strip().startswith("[")])
+    return {"waves": waves, "tasks": tasks}
+
+
+def fleet() -> str:
+    return sh(["nhq-status", "--human"], timeout=12) if shutil.which("nhq-status") else ""
+
+
+def ci_runs() -> list[str]:
+    out = sh(["gh", "run", "list", "--repo", "yashyadav711/heydaddy",
+              "--status", "in_progress", "--limit", "5",
+              "--json", "displayTitle,workflowName"], timeout=20)
+    try:
+        return [f"{r['workflowName']} · {r['displayTitle'][:44]}" for r in json.loads(out or "[]")]
+    except Exception:
+        return []
+
+
+def collect(want_ci: bool) -> dict:
+    m = meminfo()
+    root = mount_usage("/") or (0, 0, 0)
+    tmp = mount_usage("/tmp") or (0, 0, 0)
+    load1 = float(open("/proc/loadavg").read().split()[0])
+    cores = os.cpu_count() or 1
+    wts = worktrees()
+    d = {
+        "ram_avail_mib": m.get("MemAvailable", 0),
+        "ram_total_mib": m.get("MemTotal", 0),
+        "swap_free_mib": m.get("SwapFree", 0),
+        "swap_used_mib": m.get("SwapTotal", 0) - m.get("SwapFree", 0),
+        "load1": load1, "cores": cores, "load_per_core": round(load1 / cores, 2),
+        "disk_used_pct": root[0], "disk_free_mib": root[1],
+        "tmp_used_pct": tmp[0], "tmp_free_mib": tmp[1], "tmp_is_ram": on_tmpfs("/tmp"),
+        "worktrees": wts,
+        "worktrees_on_ram": [w for w in wts if w["ram_backed"]],
+        "procs": agent_procs(),
+        "zombies": zombies(),
+        "queue": run_queue(),
+        "ci": ci_runs() if want_ci else None,
+    }
+    d["problems"], d["verdict"] = judge(d)
+    return d
+
+
+def judge(d: dict) -> tuple[list[tuple[str, str]], str]:
+    """Return (problems, verdict). Each problem is (severity, message)."""
+    p: list[tuple[str, str]] = []
+    if d["ram_avail_mib"] < RAM_AVAIL_MIB_WARN:
+        p.append(("danger", f"RAM available {d['ram_avail_mib']} MiB — below the warden's {RAM_AVAIL_MIB_WARN} MiB alert"))
+    elif d["ram_avail_mib"] < RAM_AVAIL_MIB_TIGHT:
+        p.append(("tight", f"RAM available {d['ram_avail_mib']} MiB — thin for unattended work"))
+    if d["swap_free_mib"] < SWAP_FREE_MIB_WARN:
+        p.append(("danger", f"swap free {d['swap_free_mib']} MiB — the freeze pattern starts here"))
+    elif d["swap_free_mib"] < SWAP_FREE_MIB_TIGHT:
+        p.append(("tight", f"swap free {d['swap_free_mib']} MiB and falling"))
+    if d["disk_used_pct"] > DISK_USED_PCT_WARN:
+        p.append(("danger", f"/ is {d['disk_used_pct']}% full"))
+    elif d["disk_used_pct"] > DISK_USED_PCT_TIGHT:
+        p.append(("tight", f"/ is {d['disk_used_pct']}% full"))
+    if d["tmp_is_ram"] and d["tmp_used_pct"] > TMPFS_USED_PCT_TIGHT:
+        p.append(("tight", f"/tmp is RAM-backed and {d['tmp_used_pct']}% full — that RAM is gone twice"))
+    for w in d["worktrees_on_ram"]:
+        sev = "danger" if w["mib"] > 400 else "tight"
+        p.append((sev, f"worktree on RAM: {w['path']} ({w['mib']} MiB) — move it off /tmp"))
+    if d["load_per_core"] > LOAD_PER_CORE_TIGHT:
+        p.append(("tight", f"load {d['load1']} across {d['cores']} cores"))
+    if d["zombies"] >= 5:
+        p.append(("tight", f"{d['zombies']} zombie processes"))
+    if any(s == "danger" for s, _ in p):
+        return p, "danger"
+    return p, ("tight" if p else "healthy")
+
+
+def render(d: dict, quiet: bool) -> str:
+    colour = {"healthy": G, "tight": Y, "danger": R}[d["verdict"]]
+    word = {"healthy": "HEALTHY", "tight": "TIGHT", "danger": "DANGER"}[d["verdict"]]
+    head = (f"{colour}{B}● {word}{X}  "
+            f"RAM {d['ram_avail_mib']}/{d['ram_total_mib']} MiB free · "
+            f"swap {d['swap_free_mib']} MiB free · "
+            f"load {d['load1']}/{d['cores']} · "
+            f"/ {d['disk_used_pct']}%")
+    if quiet:
+        top = "; ".join(m for _, m in d["problems"][:2])
+        return head + (f"\n{Y}  {top}{X}" if top else "")
+
+    L = [head, ""]
+    if d["problems"]:
+        L.append(f"{B}What is wrong{X}")
+        for sev, msg in d["problems"]:
+            L.append(f"  {(R if sev == 'danger' else Y)}{'✗' if sev == 'danger' else '!'}{X} {msg}")
+        L.append("")
+
+    procs = ", ".join(f"{k} ×{v}" for k, v in sorted(d["procs"].items())) or f"{D}none{X}"
+    L += [f"{B}Running{X}", f"  procs   {procs}"]
+    q = d["queue"]
+    if q:
+        L.append(f"  queue   {q['tasks']} tasks across {q['waves']} waves")
+    if d["ci"] is not None:
+        L.append(f"  ci      {'; '.join(d['ci']) if d['ci'] else f'{D}nothing in flight{X}'}")
+    L.append("")
+
+    wts = d["worktrees"]
+    total_mib = sum(w["mib"] for w in wts)
+    L.append(f"{B}Worktrees{X}  {D}{len(wts)} · {total_mib} MiB total{X}")
+    if not wts:
+        L.append(f"  {D}none{X}")
+    # Anything RAM-backed or missing is always shown; the rest is capped, because a
+    # 33-line dump is not a glance. The tail is summed so nothing is hidden.
+    always = [w for w in wts if w["ram_backed"] or not w["exists"]]
+    rest = [w for w in wts if w not in always]
+    shown = always + rest[:WORKTREE_ROWS]
+    for w in shown:
+        medium = f"{R}RAM{X}" if w["ram_backed"] else f"{D}disk{X}"
+        gone = "" if w["exists"] else f"  {R}(missing — prune){X}"
+        L.append(f"  {w['mib']:>5} MiB  {medium}  {w['branch'][:22]:<22} {D}{w['path']}{X}{gone}")
+    hidden = rest[WORKTREE_ROWS:]
+    if hidden:
+        L.append(f"  {D}+ {len(hidden)} more · {sum(w['mib'] for w in hidden)} MiB{X}")
+    L.append("")
+
+    L.append(f"{B}Storage{X}")
+    L.append(f"  /       {d['disk_used_pct']}% used · {d['disk_free_mib']} MiB free")
+    ram_note = f"  {Y}← RAM-backed{X}" if d["tmp_is_ram"] else ""
+    L.append(f"  /tmp    {d['tmp_used_pct']}% used · {d['tmp_free_mib']} MiB free{ram_note}")
+    return "\n".join(L)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="nhq-mon", description="what is running, and is the laptop coping")
+    ap.add_argument("--watch", nargs="?", const=20, type=int, metavar="SECS",
+                    help="redraw every SECS (default 20)")
+    ap.add_argument("--ci", action="store_true", help="also query GitHub for in-flight runs")
+    ap.add_argument("--json", action="store_true", help="machine-readable")
+    ap.add_argument("--quiet", action="store_true", help="verdict line only")
+    a = ap.parse_args(argv)
+
+    if a.json:
+        print(json.dumps(collect(a.ci), indent=2))
+        return 0
+    if not a.watch:
+        d = collect(a.ci)
+        print(render(d, a.quiet))
+        return 2 if d["verdict"] == "danger" else 0
+    try:
+        while True:
+            d = collect(a.ci)
+            print(CLEAR + render(d, a.quiet))
+            print(f"\n{D}refreshing every {a.watch}s · Ctrl-C to exit{X}")
+            time.sleep(a.watch)
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
