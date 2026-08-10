@@ -32,6 +32,7 @@ Usage:
   nhq-threads --live                # live ANSI view, redraws on file change
   nhq-threads --live --mirror --needs-you   # live view, only Mirror's 🔴
   nhq-threads --file PATH           # override the source file
+  nhq-threads --set ID --who NAME   # name who a ⏳ thread waits on ("?" if unset)
   nhq-threads --verify              # also run self-test, print parse stats to stderr
   nhq-threads --issues              # open GitHub issues grouped by project
   nhq-threads --issues --web --heydaddy   # web-safe, only heydaddy's issues
@@ -92,12 +93,21 @@ STATUS_KEYS = sorted(STATUS, key=len, reverse=True)
 # parent group with no direct threads; its children are the real buckets.
 CATEGORIES = {"WORK", "HEYDADDY", "HEYDADDY-ENGINE", "MIRROR", "FIRSTSTONE", "JULIAN", "OPS", "OFF-WORK"}
 
-# Who is on the hook, derived from the status emoji (everything else -> Director).
-WHO_BY_STATUS = {"🔴": "Yash", "⏳": "Julian/ext", "✅": "Yash"}
+# Who is on the hook.  Only 🔴/✅ imply an owner (both mean "Yash decides").
+# ⏳ deliberately maps to nobody: "waiting" says nothing about WHO is being
+# waited on — a thread can wait on Yash, a lawyer, a vendor or CI.  Declare the
+# owner with a `◆ who:` line; an undeclared ⏳ renders "?" instead of guessing.
+WHO_BY_STATUS = {"🔴": "Yash", "✅": "Yash"}
+# Free-text `◆ who:` values folded onto the palette keys.  Anything unlisted is
+# rendered verbatim (e.g. "lawyer", "Railway") in the neutral colour.
+WHO_ALIAS = {
+    "yash": "Yash", "julian": "Julian/ext", "julián": "Julian/ext",
+    "ext": "Julian/ext", "director": "Director", "me": "Director",
+}
 # Fallback action phrase when a thread has no explicit `▶ next:` field.
 ACTION_BY_STATUS = {
     "🔴": "your call",
-    "⏳": "awaiting Julian",
+    "⏳": "waiting",
     "✅": "confirm close",
     "🟡": "Director working",
     "👉": "in progress",
@@ -107,8 +117,10 @@ ACTION_BY_STATUS = {
     "🔵": "await review",
     "❓": "unclear",
 }
-# Terminal-mode colour for the Who chip (NHQ palette).
-WHO_COLOR = {"Yash": "#F2B705", "Julian/ext": "#7C873E", "Director": "#BDB8AC"}
+# Terminal-mode colour for the Who chip (NHQ palette).  "?" is an undeclared
+# owner on a ⏳ thread — red, because an unowned wait is how a thread rots.
+WHO_COLOR = {"Yash": "#F2B705", "Julian/ext": "#7C873E", "Director": "#BDB8AC",
+             "?": "#C8102E"}
 
 # Category theme: (colour hex, glyph, motif label) for the header row.
 CAT_THEME = {
@@ -128,6 +140,8 @@ STATE_ORDER = {
 
 # An optional `▶ next: <phrase>` action field inside a thread block.
 NEXT_RE = re.compile(r"▶\s*next:\s*(.+?)\s*$")
+# An optional `◆ who: <name>` owner field inside a thread block.
+WHO_RE = re.compile(r"◆\s*who:\s*(.+?)\s*$")
 
 # A thread-start line: optional tree gutter, a branch glyph, then `[id]`.
 THREAD_RE = re.compile(r"^[\s│]*[├└]──\s+(\[[^\]]+\](?:\s*/\s*\[[^\]]+\])*)\s*(.*)$")
@@ -215,6 +229,7 @@ def parse(block: list[str]) -> tuple[list[dict], int]:
                 "state": state,
                 "cat": cat or "WORK",
                 "next": "",
+                "who": "",
                 "idx": source_count,
             }
             threads.append(current)
@@ -223,6 +238,11 @@ def parse(block: list[str]) -> tuple[list[dict], int]:
         nm = NEXT_RE.search(line)
         if nm and current is not None:
             current["next"] = nm.group(1).strip()
+            continue
+        # An optional `◆ who:` owner field attaches to the current thread.
+        wm = WHO_RE.search(line)
+        if wm and current is not None:
+            current["who"] = wm.group(1).strip()
             continue
         # Otherwise skip indented sub-lines (opened:, 💬 last:, nested detail).
         cm = CAT_RE.match(line)
@@ -277,6 +297,18 @@ def _thread_cell(t: dict) -> str:
 
 
 def _who(t: dict) -> str:
+    """Owner of a thread: a declared `◆ who:` wins, then the status emoji.
+
+    A ⏳ thread with no declared owner answers "?".  This used to answer
+    "Julian/ext", which silently reassigned Yash's and Director's waits to
+    Julian on every render — and cost one thread a false "deferred" status
+    applied purely to dodge the wrong chip.
+    """
+    declared = (t.get("who") or "").strip()
+    if declared:
+        return WHO_ALIAS.get(declared.lower(), declared)
+    if t["emoji"] == "⏳":
+        return "?"
     return WHO_BY_STATUS.get(t["emoji"], "Director")
 
 
@@ -674,8 +706,24 @@ def _rewrite_next(lines: list[str], start: int, end: int, nexttext: str) -> int:
     return end
 
 
+def _rewrite_who(lines: list[str], start: int, end: int, who: str) -> int:
+    for j in range(start, end):
+        k = lines[j].find("◆ who:")
+        if k != -1:
+            lines[j] = f"{lines[j][:k]}◆ who: {who}"
+            return end
+    # insert a ◆ who line just before the 💬 last line, mirroring its gutter
+    for j in range(start, end):
+        k = lines[j].find("💬 last:")
+        if k != -1:
+            gutter = lines[j][:k].replace("└──", "├──", 1)
+            lines.insert(j, f"{gutter}◆ who: {who}")
+            return end + 1
+    return end
+
+
 def do_write(path: str, tid: str, to_status=None, note=None,
-             next_=None, done=False) -> int:
+             next_=None, who=None, done=False) -> int:
     """Apply an in-place edit to thread `tid`, integrity-checked + atomic."""
     import datetime
     try:
@@ -716,9 +764,13 @@ def do_write(path: str, tid: str, to_status=None, note=None,
     if next_ is not None:
         end = _rewrite_next(lines, idx, end, next_)
         changed.append("next")
+    if who is not None:
+        end = _rewrite_who(lines, idx, end, who)
+        changed.append("who")
 
     if not changed:
-        print("nhq-threads: nothing to set (use --to / --note / --next / --done)",
+        print("nhq-threads: nothing to set "
+              "(use --to / --note / --next / --who / --done)",
               file=sys.stderr)
         return 2
 
@@ -946,7 +998,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="only this thread id (repeatable; matches tr/vr pairs)")
     # ── write path ──
     ap.add_argument("--set", metavar="ID",
-                    help="edit thread ID in place (combine with --to/--note/--next)")
+                    help="edit thread ID in place "
+                         "(combine with --to/--note/--next/--who)")
     ap.add_argument("--done", metavar="ID",
                     help="mark thread ID close-ready (✅) + stamp its 💬 last note")
     ap.add_argument("--to", metavar="STATUS",
@@ -956,6 +1009,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="replace the thread's 💬 last note (date-stamped)")
     ap.add_argument("--next", dest="next_", metavar="TEXT",
                     help="set the thread's ▶ next action (inserts if absent)")
+    ap.add_argument("--who", metavar="NAME",
+                    help="set who the thread is waiting on (◆ who:, inserts if "
+                         "absent). Required to name an owner on a ⏳ thread — "
+                         "an undeclared ⏳ renders '?', never a guess.")
     # ── issues + vault sync ──
     ap.add_argument("--issues", action="store_true",
                     help="render open GitHub issues grouped by project "
@@ -967,10 +1024,10 @@ def main(argv: list[str] | None = None) -> int:
     _wpath = os.path.expanduser(args.file)
     if args.done:
         return do_write(_wpath, args.done, to_status=args.to, note=args.note,
-                        next_=args.next_, done=True)
+                        next_=args.next_, who=args.who, done=True)
     if args.set:
         return do_write(_wpath, args.set, to_status=args.to, note=args.note,
-                        next_=args.next_, done=False)
+                        next_=args.next_, who=args.who, done=False)
 
     # render mode: --live forces ansi; else --ansi; else --web; else latex.
     if args.live:
