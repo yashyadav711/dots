@@ -121,10 +121,46 @@ L10N = {
 }
 
 
+# ── time ─────────────────────────────────────────────────────────────────
+# DUPLICATED BYTE-IDENTICALLY in bin/nhq-run, bin/nhq-brief and bin/nhq-calendar.
+# They are standalone scripts with no shared import — change one, change all three.
+
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30), "IST")
+
+
+def _now_iso():
+    """Now, ISO 8601 carrying the offset: 2026-08-10T07:39:12+05:30.
+
+    Derived from IST explicitly rather than read off the ambient zone, so the
+    value stays correct under any TZ and the offset survives into the store.
+    """
+    return datetime.datetime.now(IST).replace(microsecond=0).isoformat()
+
+
+def _fmt_ts(ts):
+    """The one display format, everywhere: '2026-08-10 07:39 IST'.
+
+    A date-only value renders as the bare date. A clock time that was never
+    recorded is never invented.
+    """
+    s = str(ts or "").strip()
+    if not s:
+        return ""
+    if len(s) == 10:
+        return s
+    try:
+        d = datetime.datetime.fromisoformat(s)
+    except ValueError:
+        return s
+    if d.tzinfo is None:  # a naive wall-clock value is already IST
+        d = d.replace(tzinfo=IST)
+    return d.astimezone(IST).strftime("%Y-%m-%d %H:%M") + " IST"
+
+
 # ── dates ────────────────────────────────────────────────────────────────
 
 def _today():
-    return datetime.date.today().isoformat()
+    return datetime.datetime.now(IST).date().isoformat()
 
 
 def _resolve_date(s):
@@ -132,7 +168,7 @@ def _resolve_date(s):
     if not s:
         return None
     s = s.strip().lower()
-    t = datetime.date.today()
+    t = datetime.date.fromisoformat(_today())
     if s == "today":
         return t.isoformat()
     if s == "tomorrow":
@@ -340,11 +376,14 @@ def render(person, date, repo=REPO):
             L += _table(by[s], t["cols"][s], date, repo, s)
         L.append("")
 
+    # The brief is re-synced through the night; the stamp says which build you
+    # are reading. Same helper, same string, as nhq-run and nhq-calendar.
     L += ["---", "",
           "<sub>" + t["footer"].format(
               other=_brief_url(date, t["other"], repo, known),
               proc=PROCEDURE_URL,
-              yday=_brief_url(_shift(date, -1), person, repo, known)) + "</sub>"]
+              yday=_brief_url(_shift(date, -1), person, repo, known))
+          + f" · {_fmt_ts(_now_iso())}</sub>"]
     return "\n".join(L) + "\n"
 
 
