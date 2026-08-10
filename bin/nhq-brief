@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""nhq-brief — the daily brief: one issue per person, one link per day.
+
+Two GitHub issues a day — Yash's in English, Julián's in Spanish — with the
+same five sections in the same order, so each of them opens ONE link and sees
+the whole day: what needs them, what is waiting on someone else, what was
+decided, what landed, and what is still hanging from earlier days.
+
+The brief is an INDEX, not a container. Every row links OUT to the real issue
+where that topic actually lives, and discussion happens THERE — never split
+across two briefs. That rule is what stops a thread fragmenting in half.
+
+Store  : ~/.nhq/briefs.jsonl        (source of truth, one JSON per line)
+Issues : ~/.nhq/briefs-issues.json  (date -> {person: issue number}, written by `sync`)
+Repo   : yashyadav711/heydaddy      (labels: brief · day/<date> · for/yash|for/julian)
+
+Usage:
+  nhq-brief add "<text>" --for yash|julian --section needs|waiting|decided|landed
+                         [--issue N[,N]] [--since YYYY-MM-DD] [--who "..."] [--note "..."]
+  nhq-brief list   [--date YYYY-MM-DD] [--for yash|julian]   # rows in the store
+  nhq-brief render --for yash|julian [--date YYYY-MM-DD]     # print the markdown body
+  nhq-brief sync   [--date YYYY-MM-DD] [--dry-run]           # create/update both issues
+  nhq-brief pull   [--date YYYY-MM-DD]                       # read ticked boxes back in
+  nhq-brief done <id>                    # tick a row
+  nhq-brief open <id>                    # untick it again
+  nhq-brief rm   <id>                    # delete the row
+  nhq-brief rollover --to YYYY-MM-DD [--from YYYY-MM-DD]     # carry unchecked items forward
+  nhq-brief close  --date YYYY-MM-DD     # close both issues for that date
+  nhq-brief labels [--date YYYY-MM-DD]   # create the label set if missing
+Sections: needs (actionable by them) · waiting (on someone else) · decided · landed.
+Rollover copies every unchecked needs/waiting row to the next day keeping its
+original --since, so age keeps counting up and old items get visibly older.
+Actionable sections render as tick-in-GitHub task lists; the record sections
+render as phone-width tables. Ticks survive a re-sync via `pull`.
+"""
+import sys, os, json, re, signal, datetime, uuid, subprocess, tempfile
+
+# `nhq-brief list | head` must not traceback on the closed pipe.
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+HOME = os.path.expanduser("~")
+STORE = os.path.join(HOME, ".nhq", "briefs.jsonl")
+ISSUES = os.path.join(HOME, ".nhq", "briefs-issues.json")
+REPO = "yashyadav711/heydaddy"
+PROCEDURE_URL = "https://github.com/yashyadav711/netrunners-status/blob/main/PROCEDURES.md"
+os.makedirs(os.path.dirname(STORE), exist_ok=True)
+
+PEOPLE = ("yash", "julian")
+ADDABLE = ("needs", "waiting", "decided", "landed")
+SECTIONS = ADDABLE + ("rolled",)
+STALE_DAYS = 3  # older than this and the age cell gets flagged
+
+# Label -> (hex colour, description). `day/<date>` is created on demand.
+LABELS = {
+    "brief":      ("4C1D95", "Daily brief index — one issue per person per day"),
+    "for/yash":   ("F2B705", "This day's brief, for Yash (English)"),
+    "for/julian": ("7C873E", "El brief del día, para Julián (español)"),
+    "procedure":  ("0B7285", "How we work — written procedure, not a task"),
+}
+DAY_COLOR = "EDEDED"
+
+# Locale tables: strftime is locale-dependent, these are not.
+DAYS = {
+    "en": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+    "es": ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"],
+}
+MONTHS = {
+    "en": ["January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December"],
+    "es": ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+           "agosto", "septiembre", "octubre", "noviembre", "diciembre"],
+}
+
+L10N = {
+    "yash": {
+        "lang": "en", "name": "Yash", "other": "julian", "other_name": "Julián",
+        "heads": {
+            "needs":   "✅ Needs you",
+            "waiting": "⏳ Waiting on someone else",
+            "decided": "🧭 Decided today",
+            "landed":  "🚀 Landed today",
+            "rolled":  "🔁 Rolled over",
+        },
+        "cols": {
+            "waiting": ("Who", "What", "Since", "Age"),
+            "decided": ("Decision", "Who", "Why"),
+            "landed":  ("What", "Where"),
+        },
+        "empty": "_Nothing here today._",
+        "state": "**{needs} need you · {waiting} waiting on others · {decided} decided · {landed} landed{roll}.**",
+        "roll": " · {n} rolled over",
+        "oldest": " Oldest thing still open: {link}, {age} days.",
+        "was": "was",
+        "short": {"needs": "needs you", "waiting": "waiting on someone"},
+        "footer": ("📎 [Julián's brief for today]({other}) · [How this works]({proc}) · "
+                   "[Yesterday's brief]({yday}) · **index only — reply on the linked issue, not here.**"),
+    },
+    "julian": {
+        "lang": "es", "name": "Julián", "other": "yash", "other_name": "Yash",
+        "heads": {
+            "needs":   "✅ Te toca a ti",
+            "waiting": "⏳ A la espera de otros",
+            "decided": "🧭 Decidido hoy",
+            "landed":  "🚀 Entregado hoy",
+            "rolled":  "🔁 Viene de días anteriores",
+        },
+        "cols": {
+            "waiting": ("Quién", "Qué", "Desde", "Días"),
+            "decided": ("Decisión", "Quién", "Por qué"),
+            "landed":  ("Qué", "Dónde"),
+        },
+        "empty": "_Hoy no hay nada aquí._",
+        "state": "**{needs} te tocan a ti · {waiting} en manos de otros · {decided} decisiones · {landed} entregas{roll}.**",
+        "roll": " · {n} vienen de antes",
+        "oldest": " Lo más antiguo que sigue abierto: {link}, {age} días.",
+        "was": "venía de",
+        "short": {"needs": "te toca a ti", "waiting": "a la espera de otros"},
+        "footer": ("📎 [El brief de Yash de hoy]({other}) · [Cómo funciona esto]({proc}) · "
+                   "[El brief de ayer]({yday}) · **esto es solo un índice — comenta en la issue enlazada, no aquí.**"),
+    },
+}
+
+
+# ── dates ────────────────────────────────────────────────────────────────
+
+def _today():
+    return datetime.date.today().isoformat()
+
+
+def _resolve_date(s):
+    """'today'/'tomorrow'/'yesterday' or YYYY-MM-DD. None passes through."""
+    if not s:
+        return None
+    s = s.strip().lower()
+    t = datetime.date.today()
+    if s == "today":
+        return t.isoformat()
+    if s == "tomorrow":
+        return (t + datetime.timedelta(days=1)).isoformat()
+    if s == "yesterday":
+        return (t - datetime.timedelta(days=1)).isoformat()
+    datetime.date.fromisoformat(s)  # validate (raises on bad input)
+    return s
+
+
+def _resolve_since(s):
+    """Like _resolve_date but also accepts 'YYYY-MM' (month precision)."""
+    if not s:
+        return None
+    s = s.strip().lower()
+    if re.fullmatch(r"\d{4}-\d{2}", s):
+        datetime.date.fromisoformat(s + "-01")
+        return s
+    return _resolve_date(s)
+
+
+def _shift(date, days):
+    return (datetime.date.fromisoformat(date) + datetime.timedelta(days=days)).isoformat()
+
+
+def _age(since, on):
+    """(days, approx). 'YYYY-MM' counts from the 1st and is marked approximate."""
+    if not since:
+        return None, False
+    approx = bool(re.fullmatch(r"\d{4}-\d{2}", since))
+    start = datetime.date.fromisoformat(since + "-01" if approx else since)
+    return max((datetime.date.fromisoformat(on) - start).days, 0), approx
+
+
+def _age_cell(since, on, unit=""):
+    """Plain day count; anything past STALE_DAYS gets bolded and flagged."""
+    n, approx = _age(since, on)
+    if n is None:
+        return "—"
+    txt = ("~" if approx else "") + f"{n}{unit}"
+    return f"**{txt}** ⚠️" if n > STALE_DAYS else txt
+
+
+def _long_date(date, lang):
+    d = datetime.date.fromisoformat(date)
+    day, month = DAYS[lang][d.weekday()], MONTHS[lang][d.month - 1]
+    if lang == "es":
+        return f"{day}, {d.day} de {month} de {d.year}"
+    return f"{day}, {d.day} {month} {d.year}"
+
+
+# ── store ────────────────────────────────────────────────────────────────
+
+def _load():
+    if not os.path.exists(STORE):
+        return []
+    out = []
+    for line in open(STORE):
+        line = line.strip()
+        if line:
+            out.append(json.loads(line))
+    return out
+
+
+def _save(rows):
+    with open(STORE, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def _load_issues():
+    if not os.path.exists(ISSUES):
+        return {}
+    return json.load(open(ISSUES))
+
+
+def _save_issues(m):
+    json.dump(m, open(ISSUES, "w"), indent=2, sort_keys=True)
+
+
+def _rows(date=None, person=None, section=None):
+    out = _load()
+    if date:
+        out = [r for r in out if r["date"] == date]
+    if person:
+        out = [r for r in out if r["person"] == person]
+    if section:
+        out = [r for r in out if r["section"] == section]
+    return out
+
+
+def _fmt(r):
+    iss = ",".join(f"#{n}" for n in r.get("issue") or []) or "—"
+    mark = {"open": " ", "done": "x", "rolled": "»"}[r["state"]]
+    who = f" {r['who']} →" if r.get("who") else ""
+    note = f"  — {r['note']}" if r.get("note") else ""
+    return (f"[{r['id']}] [{mark}] {r['date']} {r['person']:<6} {r['section']:<7} "
+            f"{iss:<10}{who} {r['text']}{note}")
+
+
+# ── markdown ─────────────────────────────────────────────────────────────
+
+def _iurl(n, repo):
+    return f"https://github.com/{repo}/issues/{n}"
+
+
+def _links(r, repo):
+    ns = r.get("issue") or []
+    return ", ".join(f"[#{n}]({_iurl(n, repo)})" for n in ns) or "—"
+
+
+def _cell(s):
+    """Pipes would break the table; newlines would break the row."""
+    return (s or "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _search_url(date, person, repo):
+    q = f"is:issue label:brief label:day/{date} label:for/{person}"
+    return f"https://github.com/{repo}/issues?q=" + q.replace(":", "%3A").replace(" ", "+").replace("/", "%2F")
+
+
+def _brief_url(date, person, repo, known):
+    n = (known.get(date) or {}).get(person)
+    return _iurl(n, repo) if n else _search_url(date, person, repo)
+
+
+def _task_line(r, date, repo, t):
+    """One tick-in-GitHub row. The trailing comment lets `pull` find the row."""
+    box = "x" if r["state"] == "done" else " "
+    head = f"**{_cell(r['text'])}**"
+    if r.get("who"):
+        head = f"`{_cell(r['who'])}` → " + head
+    bits = [head]
+    if r.get("note"):
+        bits.append(_cell(r["note"]))
+    tail = []
+    links = _links(r, repo)
+    if links != "—":
+        tail.append(links)
+    age = _age_cell(r.get("since"), date, "d")
+    if age != "—":
+        tail.append(age)
+    if r["section"] == "rolled" and r.get("origin"):
+        tail.append(f"_{t['was']} {t['short'].get(r['origin'], r['origin'])}_")
+    line = " — ".join(bits) + ("" if not tail else " · " + " · ".join(tail))
+    return f"- [{box}] {line} <!--{r['id']}-->"
+
+
+def _topic(r, repo):
+    """Bold topic with its issue link inline — keeps the table to few columns,
+    which is what makes it readable on a phone."""
+    links = _links(r, repo)
+    return f"**{_cell(r['text'])}**" + ("" if links == "—" else f" {links}")
+
+
+def _table(rows, cols, date, repo, kind):
+    L = ["| " + " | ".join(cols) + " |", "|" + "|".join(["---"] * len(cols)) + "|"]
+    for r in rows:
+        if kind == "waiting":
+            what = _topic(r, repo) + (f" — {_cell(r['note'])}" if r.get("note") else "")
+            c = [_cell(r.get("who")) or "—", what,
+                 r.get("since") or "—", _age_cell(r.get("since"), date)]
+        elif kind == "decided":
+            c = [_topic(r, repo), _cell(r.get("who")) or "—", _cell(r.get("note")) or "—"]
+        else:  # landed
+            c = [_topic(r, repo), _cell(r.get("note")) or "—"]
+        L.append("| " + " | ".join(c) + " |")
+    return L
+
+
+def render(person, date, repo=REPO):
+    t = L10N[person]
+    lang = t["lang"]
+    known = _load_issues()
+    mine = _rows(date=date, person=person)
+    by = {s: [r for r in mine if r["section"] == s] for s in SECTIONS}
+    n = {s: len(by[s]) for s in SECTIONS}
+
+    # state of play — counts, plus the oldest thing still open. Both derived.
+    roll = t["roll"].format(n=n["rolled"]) if n["rolled"] else ""
+    state = t["state"].format(needs=n["needs"], waiting=n["waiting"],
+                              decided=n["decided"], landed=n["landed"], roll=roll)
+    openish = [r for r in mine if r["section"] in ("needs", "waiting", "rolled")
+               and r["state"] != "done" and r.get("since")]
+    if openish:
+        old = max(openish, key=lambda r: _age(r["since"], date)[0])
+        days, approx = _age(old["since"], date)
+        link = _links(old, repo)
+        if link != "—":
+            state += t["oldest"].format(link=link, age=("~" + str(days)) if approx else days)
+
+    L = [f"# 🗓️ {_long_date(date, lang)} — {t['name']}", "",
+         "> [!NOTE]", "> " + state, ""]
+
+    for s in SECTIONS:
+        L.append(f"## {t['heads'][s]} ({n[s]})")
+        L.append("")
+        if not by[s]:
+            L += [t["empty"], ""]
+            continue
+        if s in ("needs", "rolled"):
+            for r in sorted(by[s], key=lambda r: (r["state"] == "done", r.get("since") or date)):
+                L.append(_task_line(r, date, repo, t))
+        else:
+            L += _table(by[s], t["cols"][s], date, repo, s)
+        L.append("")
+
+    L += ["---", "",
+          "<sub>" + t["footer"].format(
+              other=_brief_url(date, t["other"], repo, known),
+              proc=PROCEDURE_URL,
+              yday=_brief_url(_shift(date, -1), person, repo, known)) + "</sub>"]
+    return "\n".join(L) + "\n"
+
+
+# ── gh ───────────────────────────────────────────────────────────────────
+
+def _gh(args, check=True):
+    try:
+        p = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        print("gh CLI not found — install GitHub CLI (https://cli.github.com) "
+              "and run `gh auth login`."); sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("gh timed out:", " ".join(args)); sys.exit(1)
+    if check and p.returncode != 0:
+        err = (p.stderr or p.stdout).strip().splitlines()
+        print(f"gh failed: {err[0] if err else p.returncode}"); sys.exit(1)
+    return p
+
+
+def _ensure_labels(date, repo):
+    want = dict(LABELS)
+    if date:
+        want[f"day/{date}"] = (DAY_COLOR, f"Brief for {date}")
+    have = {l["name"] for l in json.loads(
+        _gh(["label", "list", "--repo", repo, "--limit", "300", "--json", "name"]).stdout or "[]")}
+    made = []
+    for name, (color, desc) in want.items():
+        if name in have:
+            continue
+        _gh(["label", "create", name, "--repo", repo, "--color", color, "--description", desc])
+        made.append(name)
+    return made
+
+
+def _find_issue(date, person, repo):
+    out = _gh(["issue", "list", "--repo", repo, "--state", "all", "--limit", "50",
+               "--label", "brief", "--label", f"day/{date}", "--label", f"for/{person}",
+               "--json", "number,title,state"]).stdout
+    hits = json.loads(out or "[]")
+    return hits[0] if hits else None
+
+
+def _body_file(body):
+    f = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8")
+    f.write(body); f.close()
+    return f.name
+
+
+# ── commands ─────────────────────────────────────────────────────────────
+
+def _parse_opts(args):
+    o = {}
+    pos, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--for", "--section", "--issue", "--since", "--who", "--note",
+                 "--date", "--to", "--from", "--repo"):
+            if i + 1 >= len(args):
+                print(f"{a} needs a value"); sys.exit(1)
+            o[a[2:]] = args[i + 1]; i += 2
+        elif a in ("--dry-run", "--force"):
+            o[a[2:].replace("-", "_")] = True; i += 1
+        else:
+            pos.append(a); i += 1
+    return pos, o
+
+
+def _person(o, required=True):
+    p = (o.get("for") or "").strip().lower()
+    if p in ("julián", "julian"):
+        return "julian"
+    if p == "yash":
+        return "yash"
+    if required:
+        print("--for must be yash or julian"); sys.exit(1)
+    return None
+
+
+def _issues(s):
+    if not s:
+        return []
+    return [int(x.strip().lstrip("#")) for x in s.split(",") if x.strip().strip("-")]
+
+
+def cmd_add(args):
+    pos, o = _parse_opts(args)
+    if not pos:
+        print('usage: nhq-brief add "<text>" --for yash|julian --section '
+              'needs|waiting|decided|landed [--issue N[,N]] [--since ..] [--who ..] [--note ..]')
+        sys.exit(1)
+    person = _person(o)
+    section = (o.get("section") or "").strip().lower()
+    if section not in ADDABLE:
+        print("--section must be one of:", " ".join(ADDABLE)); sys.exit(1)
+    date = _resolve_date(o.get("date")) or _today()
+    r = {
+        "id": uuid.uuid4().hex[:6],
+        "date": date,
+        "person": person,
+        "section": section,
+        "text": pos[0],
+        "issue": _issues(o.get("issue")),
+        "since": _resolve_since(o.get("since")) or date,
+        "state": "open",
+        "who": o.get("who"),
+        "note": o.get("note"),
+        "created": _today(),
+    }
+    rows = _load(); rows.append(r); _save(rows)
+    print("added:", _fmt(r))
+
+
+def cmd_list(args):
+    _, o = _parse_opts(args)
+    rows = _rows(date=_resolve_date(o.get("date")), person=_person(o, required=False))
+    if not rows:
+        print("(no brief rows)"); return
+    order = {s: i for i, s in enumerate(SECTIONS)}
+    for r in sorted(rows, key=lambda r: (r["date"], r["person"], order[r["section"]])):
+        print(_fmt(r))
+
+
+def cmd_render(args):
+    _, o = _parse_opts(args)
+    sys.stdout.write(render(_person(o), _resolve_date(o.get("date")) or _today(),
+                            o.get("repo") or REPO))
+
+
+def cmd_sync(args):
+    _, o = _parse_opts(args)
+    date = _resolve_date(o.get("date")) or _today()
+    repo = o.get("repo") or REPO
+    if not _rows(date=date) and not o.get("force"):
+        print(f"no rows for {date} — nothing to sync (use --force to publish empty briefs)")
+        sys.exit(1)
+    if o.get("dry_run"):
+        for person in PEOPLE:
+            print(f"── Brief {date} · {L10N[person]['name']} " + "─" * 30)
+            sys.stdout.write(render(person, date, repo))
+        return
+    made = _ensure_labels(date, repo)
+    if made:
+        print("labels created:", ", ".join(made))
+    known = _load_issues()
+    # First pass creates/finds both issues so the footer cross-links resolve,
+    # second pass rewrites the bodies now that both numbers are known.
+    for person in PEOPLE:
+        hit = _find_issue(date, person, repo)
+        if hit:
+            known.setdefault(date, {})[person] = hit["number"]
+    _save_issues(known)
+    for person in PEOPLE:
+        title = f"Brief {date} · {L10N[person]['name']}"
+        labels = ["brief", f"day/{date}", f"for/{person}"]
+        bf = _body_file(render(person, date, repo))
+        hit = (known.get(date) or {}).get(person)
+        if hit:
+            _gh(["issue", "edit", str(hit), "--repo", repo, "--title", title,
+                 "--body-file", bf] + sum((["--add-label", l] for l in labels), []))
+            print(f"updated: #{hit}  {title}")
+        else:
+            out = _gh(["issue", "create", "--repo", repo, "--title", title,
+                       "--body-file", bf] + sum((["--label", l] for l in labels), [])).stdout
+            num = int(out.strip().rstrip("/").rsplit("/", 1)[-1])
+            known.setdefault(date, {})[person] = num
+            _save_issues(known)
+            print(f"created: #{num}  {title}")
+        os.unlink(bf)
+    # Re-render once both numbers exist so "the other person's brief" is a
+    # direct link rather than a label search.
+    for person in PEOPLE:
+        num = known[date][person]
+        bf = _body_file(render(person, date, repo))
+        _gh(["issue", "edit", str(num), "--repo", repo, "--body-file", bf])
+        os.unlink(bf)
+        print(f"  https://github.com/{repo}/issues/{num}")
+
+
+TICK_RE = re.compile(r"^- \[([ xX])\].*<!--([0-9a-f]{6})-->\s*$", re.M)
+
+
+def cmd_pull(args):
+    _, o = _parse_opts(args)
+    date = _resolve_date(o.get("date")) or _today()
+    repo = o.get("repo") or REPO
+    known = _load_issues().get(date) or {}
+    if not known:
+        print(f"no synced issues for {date}"); sys.exit(1)
+    ticked = set()
+    for person, num in known.items():
+        body = json.loads(_gh(["issue", "view", str(num), "--repo", repo,
+                               "--json", "body"]).stdout)["body"] or ""
+        ticked |= {i for box, i in TICK_RE.findall(body) if box.lower() == "x"}
+    rows, n = _load(), 0
+    for r in rows:
+        if r["id"] in ticked and r["state"] != "done":
+            r["state"] = "done"; n += 1
+    _save(rows)
+    print(f"pulled {date}: {n} row(s) ticked in GitHub marked done")
+
+
+def _set_state(id_, state):
+    rows = _load()
+    hit = False
+    for r in rows:
+        if r["id"] == id_:
+            r["state"] = state; hit = True
+    if not hit:
+        print("no such id:", id_); sys.exit(1)
+    _save(rows)
+    print(f"{state}:", id_)
+
+
+def cmd_done(args):
+    if not args:
+        print("usage: nhq-brief done <id>"); sys.exit(1)
+    _set_state(args[0], "done")
+
+
+def cmd_open(args):
+    if not args:
+        print("usage: nhq-brief open <id>"); sys.exit(1)
+    _set_state(args[0], "open")
+
+
+def cmd_rm(args):
+    if not args:
+        print("usage: nhq-brief rm <id>"); sys.exit(1)
+    rows = _load()
+    new = [r for r in rows if r["id"] != args[0]]
+    if len(new) == len(rows):
+        print("no such id:", args[0]); sys.exit(1)
+    _save(new)
+    print("removed:", args[0])
+
+
+def cmd_rollover(args):
+    _, o = _parse_opts(args)
+    to = _resolve_date(o.get("to"))
+    if not to:
+        print("usage: nhq-brief rollover --to YYYY-MM-DD [--from YYYY-MM-DD]"); sys.exit(1)
+    src = _resolve_date(o.get("from")) or _shift(to, -1)
+    rows = _load()
+    # already there? match on person+text so a repeat run is a no-op
+    seen = {(r["person"], r["text"]) for r in rows if r["date"] == to}
+    carried = []
+    for r in rows:
+        if r["date"] != src or r["state"] == "done":
+            continue
+        if r["section"] not in ("needs", "waiting", "rolled"):
+            continue
+        if (r["person"], r["text"]) in seen:
+            continue
+        c = dict(r)
+        c["id"] = uuid.uuid4().hex[:6]
+        c["date"] = to
+        c["state"] = "rolled"
+        c["origin"] = r.get("origin") or r["section"]
+        c["section"] = "rolled"
+        c["created"] = _today()
+        carried.append(c)
+    if not carried:
+        print(f"nothing to roll from {src} to {to}"); return
+    _save(rows + carried)
+    print(f"rolled {len(carried)} row(s) {src} -> {to} (source day untouched)")
+    for c in carried:
+        print("  " + _fmt(c))
+
+
+def cmd_close(args):
+    _, o = _parse_opts(args)
+    date = _resolve_date(o.get("date"))
+    if not date:
+        print("usage: nhq-brief close --date YYYY-MM-DD"); sys.exit(1)
+    repo = o.get("repo") or REPO
+    known = _load_issues().get(date) or {}
+    if not known:
+        print(f"no synced issues for {date}"); sys.exit(1)
+    for person, num in sorted(known.items()):
+        _gh(["issue", "close", str(num), "--repo", repo])
+        print(f"closed: #{num}  Brief {date} · {L10N[person]['name']}")
+
+
+def cmd_labels(args):
+    _, o = _parse_opts(args)
+    made = _ensure_labels(_resolve_date(o.get("date")), o.get("repo") or REPO)
+    print("created:", ", ".join(made) if made else "(all labels already present)")
+
+
+CMDS = {"add": cmd_add, "list": cmd_list, "render": cmd_render, "sync": cmd_sync,
+        "pull": cmd_pull, "done": cmd_done, "open": cmd_open, "rm": cmd_rm,
+        "rollover": cmd_rollover, "close": cmd_close, "labels": cmd_labels}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in CMDS:
+        print(__doc__); sys.exit(0 if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h", "help") else 1)
+    CMDS[sys.argv[1]](sys.argv[2:])
