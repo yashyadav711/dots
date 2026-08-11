@@ -45,6 +45,8 @@ def scan(path: pathlib.Path) -> dict:
     stops: list[str] = []
     errors: list[str] = []
     turns = 0
+    recovered_after_error = False
+    seen_error = False
     try:
         text = path.read_text()
     except OSError:
@@ -60,25 +62,42 @@ def scan(path: pathlib.Path) -> dict:
         if not isinstance(m, dict) or m.get("role") != "assistant":
             continue
         turns += 1
-        tokens += (m.get("usage") or {}).get("totalTokens") or 0
+        tok = (m.get("usage") or {}).get("totalTokens") or 0
+        tokens += tok
         if m.get("stopReason"):
             stops.append(m["stopReason"])
         if m.get("errorMessage"):
             errors.append(m["errorMessage"][:80])
+            seen_error = True
+        elif seen_error and tok > 0:
+            # It errored, then produced real turns afterwards — that is the
+            # fallback chain doing its job, not a corpse. Judging on "any
+            # error ever seen" reports a healthy agent as dead.
+            recovered_after_error = True
     return {
         "name": path.stem,
         "tokens": tokens,
         "turns": turns,
         "stop": stops[-1] if stops else "-",
         "error": errors[-1] if errors else "",
+        "recovered": recovered_after_error,
         "age_min": (time.time() - path.stat().st_mtime) / 60,
     }
 
 
 def verdict(r: dict) -> tuple[str, str]:
     err = r["error"].lower()
-    if "exhausted" in err or "no available account" in err or "no capacity" in err:
-        return "DEAD", "provider exhausted — it never reached a model"
+    exhausted = ("exhausted" in err or "no available account" in err
+                 or "no capacity" in err)
+
+    # An exhaustion error followed by real turns is the FALLBACK CHAIN WORKING.
+    # Verified 2026-08-11: agy 503'd, the agent fell through to
+    # anthropic/claude-sonnet-4-6 and ran 12 more tool-use turns. Judging on
+    # "any error ever seen" reported that healthy agent as dead.
+    if r.get("recovered"):
+        return "RECOVERED", f"fell back after a provider error · {r['tokens']:,} tokens"
+    if exhausted:
+        return "DEAD", "provider exhausted and never recovered"
     if r["tokens"] == 0 and r["age_min"] > 2:
         return "DEAD", "zero tokens — no model was ever called"
     if r["stop"] == "toolUse":
