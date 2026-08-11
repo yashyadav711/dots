@@ -1,3 +1,11 @@
+# ⚠️ DEAD MAIN SEAT (2026-08-11) — the z.ai subscription is CANCELLED, so `default` + `vision`
+# below route to a provider that answers `[1113] Insufficient balance or no resource package`
+# (verified by live round-trip 2026-08-11). The agy roles still serve. Kept, not deleted: a FREE
+# z.ai tier is acceptable IF one works, so verify the lane answers before using this overlay —
+#   bash ~/Github/nhq-agentic-os/scripts/nhq-engine-selftest.sh
+# There is currently NO reliable zero-Anthropic CODE lane. See
+# nhq-agentic-os/docs/references/agy-capabilities.md and read `omp usage` for real headroom.
+#
 # nhq-glm-agy overlay — balances z.ai GLM + agy (rotator: Claude + Gemini) so
 # the session is NOT GLM-only. Loaded via `omp --config <this-file>` (merges
 # per-key over the base ~/.omp/agent/config.yml modelRoles).
