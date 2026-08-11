@@ -56,17 +56,32 @@ link bin/agy-snapshot   "$HOME/.local/bin/agy-snapshot"
 link bin/agy-usage      "$HOME/.local/bin/agy-usage"
 
 # NHQ Fleet Kit + P4 safety + P5 econ/ctx — per-file symlinks into ~/.local/bin.
-# NOTE: nhq-lib.sh, fleet-registry.json, p3-paths.json, routing-policy.json are NOT
-# linked — the scripts resolve them as siblings in dots/bin via `readlink -f`, so
-# they must stay beside the binaries.
-for cmd in nhq nhq-agent-name nhq-await nhq-blocked nhq-cost nhq-done nhq-fleet \
-           nhq-fleet-selftest nhq-kill nhq-meta nhq-notify nhq-reap nhq-spawn \
-           nhq-status nhq-tell nhq-warden \
-           nhq-audit nhq-audit-verify nhq-ctx nhq-econ nhq-handoff nhq-p3-guard \
-           nhq-prep nhq-okf \
-           mcp-write-guard; do
+#
+# GLOB, not a hand-kept list (fixed 2026-08-11). This used to be a hardcoded
+# `for cmd in nhq nhq-agent-name ...` allowlist, so every tool added to dots/bin
+# was silently never installed. `nhq-agent-alive` — the tool the subagent-stall
+# playbook tells you to run — sat unlinked for a day and `command not found`
+# during a live overnight run, while docs and a session handoff both cited it.
+# A new tool in dots/bin is now installed by existing, not by remembering.
+#
+# EXCLUDED, deliberately:
+#   *.sh / *.yml / *.json / *.jsonl / *.md — libs + data. nhq-lib.sh and the
+#     registries are resolved as siblings in dots/bin via `readlink -f`, so they
+#     must stay beside the binaries and must NOT be linked.
+#   nhq-heydaddy-deploy — a dispatcher that picks its behaviour from argv[0].
+#     It is installed under its four face names (dev/prod × be/fe), which are
+#     symlinks to it inside dots/bin and are matched by the glob. Linking the
+#     dispatcher under its own name would give it no face to dispatch to.
+for path in "$DOTS"/bin/nhq-*; do
+  cmd=$(basename "$path")
+  case "$cmd" in
+    *.sh|*.yml|*.json|*.jsonl|*.md) continue ;;
+    nhq-heydaddy-deploy)            continue ;;
+  esac
+  [ -x "$path" ] || continue
   link "bin/$cmd" "$HOME/.local/bin/$cmd"
 done
+link bin/mcp-write-guard "$HOME/.local/bin/mcp-write-guard"
 
 
 echo "==> [4/4] System config (apply manually with sudo or per-user as noted)"
