@@ -144,7 +144,7 @@ def main() -> int:
         print(f"{r['name'][:22]:22} {v:10} {r['tokens']:>10,}  {r['turns']:>5}  "
               f"{r['age_min']:>5.1f}m  {why}")
 
-    print("\nDEAD    → cancel and do it by hand; waiting changes nothing")
+    print("\nDEAD      → cancel and do it by hand; waiting changes nothing")
     print("WORKING   → leave it alone, even with an empty worktree")
     print("RECOVERED → the fallback chain caught a provider failure; it is fine")
     return 0
