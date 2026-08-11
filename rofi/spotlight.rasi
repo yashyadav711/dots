@@ -1,9 +1,8 @@
 /* iOS Spotlight — rofi-wayland. Hyprland blur is active on namespace `rofi`
    (windowrules.conf:97-98); the low window alpha below is what makes it frosted. */
 configuration {
-    display-combi:        "🔍";
+    display-drun:         "🔍";
     drun-display-format:  "{name}";
-    combi-display-format: "{text}";
 }
 
 * {
@@ -62,7 +61,7 @@ listview {
     columns:             1;
     scrollbar:           false;
     dynamic:             true;
-    require-input:       true;
+    require-input:       false;   /* show apps on open (no blank box); typing filters */
 }
 
 element {

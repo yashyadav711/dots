@@ -1,0 +1,7 @@
+# Open/edit files in Neovim (overrides the default $EDITOR opener, which is vim here).
+# The default open rules already route text/code (incl. .md) to the `edit` opener,
+# so overriding `edit` is all that's needed.
+[opener]
+edit = [
+	{ run = 'nvim "$@"', block = true, for = "unix" },
+]

@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# nhq-open — smart opener. Picks the right app for a path/URL and REUSES a
+# running instance where it makes sense, then raises it to the front (Hyprland).
+#
+#   nhq open <path|url> [--app NAME] [--new] [--dry]
+#
+# Auto-routing (override with --app firefox|subl|obsidian|dolphin|xdg):
+#   http(s)://…, *.html *.htm *.pdf *.svg   -> firefox   (new tab, reuse window)
+#   a directory                             -> dolphin   (file manager)
+#   *.md *.markdown  inside an Obsidian vault -> obsidian (obsidian:// URI)
+#                    not in a vault           -> subl
+#   *.png *.jpg *.jpeg *.gif *.webp          -> xdg      (default image viewer)
+#   anything else (code/text)                -> subl     (reuse window; -n = new)
+#
+# Flags:
+#   --new   force a NEW window/tab instead of reusing (firefox --new-window, subl -n)
+#   --dry   print what it WOULD do, launch nothing
+#
+# Reuse model: firefox --new-tab and obsidian:// and subl all attach to an
+# already-running instance by design; on Hyprland we also focuswindow so it
+# actually comes to the front. Consistent with the `nhq <sub>` dispatcher.
+set -uo pipefail
+
+TARGET="${1:-}"
+if [ -z "$TARGET" ] || [ "$TARGET" = "-h" ] || [ "$TARGET" = "--help" ]; then
+  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+shift || true
+
+APP=""; NEW=0; DRY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --app) APP="${2:-}"; shift 2 ;;
+    --new) NEW=1; shift ;;
+    --dry|--dry-run) DRY=1; shift ;;
+    *) echo "nhq-open: unknown flag '$1'" >&2; exit 2 ;;
+  esac
+done
+
+is_url()  { [[ "$TARGET" =~ ^https?:// ]]; }
+running() { pgrep -x "$1" >/dev/null 2>&1 || pgrep -fi "$1" >/dev/null 2>&1; }
+urlenc()  { python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
+
+# Resolve filesystem paths to absolute; validate existence.
+if ! is_url; then
+  RESOLVED="$(readlink -f -- "$TARGET" 2>/dev/null || true)"
+  [ -n "$RESOLVED" ] && TARGET="$RESOLVED"
+  if [ ! -e "$TARGET" ]; then echo "nhq-open: not found: $TARGET" >&2; exit 1; fi
+fi
+
+# Auto-pick the app when not forced.
+if [ -z "$APP" ]; then
+  if is_url; then APP=firefox
+  elif [ -d "$TARGET" ]; then APP=dolphin
+  else
+    case "${TARGET,,}" in
+      *.html|*.htm|*.pdf|*.svg)             APP=firefox ;;
+      *.md|*.markdown)                      APP=obsidian ;;
+      *.png|*.jpg|*.jpeg|*.gif|*.webp|*.bmp) APP=xdg ;;
+      *)                                    APP=subl ;;
+    esac
+  fi
+fi
+
+# Hyprland: bring an app's window to the front (best-effort, silent).
+raise() {
+  command -v hyprctl >/dev/null 2>&1 || return 0
+  local cls="$1"
+  ( sleep 0.4; hyprctl dispatch focuswindow "class:^(${cls})$" >/dev/null 2>&1 ) &
+}
+
+launch() {  # launch "<desc>" cmd args…   (respects --dry)
+  local desc="$1"; shift
+  echo "→ $desc"
+  [ "$DRY" = 1 ] && { echo "   (dry-run: $*)"; return 0; }
+  setsid "$@" >/dev/null 2>&1 &
+}
+
+case "$APP" in
+  firefox)
+    url="$TARGET"; is_url || url="file://$TARGET"
+    if [ "$NEW" = 1 ]; then
+      launch "firefox — new window" firefox --new-window "$url"
+    else
+      launch "firefox — new tab (reuse if running)" firefox --new-tab "$url"
+    fi
+    raise firefox ;;
+
+  subl)
+    if [ "$NEW" = 1 ]; then launch "sublime — new window" subl -n "$TARGET"
+    else launch "sublime — reuse window" subl "$TARGET"; fi
+    raise "[Ss]ublime_text|sublime_text" ;;
+
+  dolphin)
+    launch "dolphin — file manager" dolphin "$TARGET"
+    raise "dolphin|org.kde.dolphin" ;;
+
+  obsidian)
+    # Find the enclosing vault (dir containing .obsidian), map to obsidian:// URI.
+    vault=""; d="$(dirname "$TARGET")"
+    while [ "$d" != "/" ] && [ -n "$d" ]; do
+      [ -d "$d/.obsidian" ] && { vault="$d"; break; }
+      d="$(dirname "$d")"
+    done
+    if [ -n "$vault" ]; then
+      rel="${TARGET#"$vault"/}"; rel="${rel%.md}"; rel="${rel%.markdown}"
+      uri="obsidian://open?vault=$(urlenc "$(basename "$vault")")&file=$(urlenc "$rel")"
+      launch "obsidian — $(basename "$vault") :: $rel" xdg-open "$uri"
+      raise obsidian
+    else
+      echo "   (not inside an Obsidian vault → sublime)"
+      launch "sublime — reuse window" subl "$TARGET"
+      raise "sublime_text"
+    fi ;;
+
+  xdg)
+    launch "xdg-open — default app" xdg-open "$TARGET" ;;
+
+  *) echo "nhq-open: unknown --app '$APP' (firefox|subl|obsidian|dolphin|xdg)" >&2; exit 2 ;;
+esac

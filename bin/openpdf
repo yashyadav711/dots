@@ -1,0 +1,13 @@
+#!/bin/sh
+# openpdf — open a PDF in zathura.
+# Default: the dataset/AI master guide (EN). Pass a path to open any PDF.
+# Works from any context (fish, sh, rofi/walker, Hyprland exec) — it's a real
+# executable in PATH, not a shell function.
+f="${1:-$HOME/Documents/tmp/master_guide_dataset_ai_chatting_EN.pdf}"
+# expand a leading ~ if the caller didn't
+case "$f" in '~'*) f="$HOME${f#?}";; esac
+if [ ! -f "$f" ]; then
+    printf 'openpdf: not found: %s\n' "$f" >&2
+    exit 1
+fi
+setsid -f zathura "$f" >/dev/null 2>&1

@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""mdtable-html — render the first Markdown table in a .md file into a single,
+self-contained, responsive HTML page (dark theme, sticky header + first columns,
+click-to-sort, live search, and a persistent "watched" checkbox column that dims
+ticked rows and remembers state in the browser). For wide data tables (many
+columns) that Obsidian crushes — open the .html in a browser instead.
+
+Usage: mdtable-html <input.md> [output.html]   (default output: <input>.html)
+"""
+import re, os, sys, html
+
+LINK_RE = re.compile(r'(https?://\S+)')
+
+
+def parse_md_table(text):
+    rows = [l for l in text.splitlines() if l.strip().startswith('|')]
+    if len(rows) < 2:
+        return None, None
+    def cells(l):
+        return [c.strip() for c in l.strip().strip('|').split('|')]
+    header = cells(rows[0])
+    data = [cells(r) for r in rows[2:] if r.strip()]   # rows[1] = separator
+    n = len(header)
+    data = [(r + [''] * n)[:n] for r in data]
+    return header, data
+
+
+def render_cell(c):
+    m = re.match(r'\[(.+?)\]\((https?://\S+?)\)$', c)
+    if m:
+        return f'<a href="{html.escape(m.group(2))}" target="_blank">{html.escape(m.group(1))}</a>'
+    if LINK_RE.fullmatch(c):
+        return f'<a href="{html.escape(c)}" target="_blank">\u2197 link</a>'
+    return html.escape(c).replace('\n', '<br>')
+
+
+def build_html(title, header, data):
+    ths = ''.join(f'<th onclick="sortT({i+1})">{html.escape(h)}</th>' for i, h in enumerate(header))
+    trs = ''
+    for r in data:
+        key = html.escape(r[0], quote=True)
+        cells = ''.join(f'<td>{render_cell(c)}</td>' for c in r)
+        trs += (f'<tr data-k="{key}"><td class=wcol>'
+                f'<input type=checkbox onchange="tog(this)"></td>{cells}</tr>\n')
+    return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>{html.escape(title)}</title>
+<style>
+:root{{--bg:#0e0e10;--panel:#17171b;--head:#1e1e24;--line:#2a2a32;--txt:#e6e6ea;--mut:#9a9aa6;--acc:#D0BCFF;--stripe:#131318;}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:var(--bg);color:var(--txt);font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}}
+header{{padding:16px 20px;position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);z-index:6;display:flex;gap:14px;align-items:center;flex-wrap:wrap}}
+h1{{margin:0;font-size:20px;font-weight:650;letter-spacing:.3px}}
+.count{{color:var(--mut);font-size:13px}}
+input[type=text],.f{{margin-left:auto;background:var(--panel);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:8px 12px;font-size:14px;min-width:200px;flex:1 1 200px;max-width:340px}}
+.f:focus{{outline:none;border-color:var(--acc)}}
+.wrap{{overflow:auto;max-height:calc(100vh - 60px)}}
+table{{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%}}
+th,td{{padding:10px 14px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line);white-space:nowrap}}
+td:nth-child(n+10){{white-space:normal;max-width:280px}}
+thead th{{position:sticky;top:0;background:var(--head);cursor:pointer;user-select:none;font-weight:600;color:var(--acc);border-bottom:2px solid var(--line);z-index:3}}
+thead th:hover{{background:#26262e}}
+/* col 1 = watched checkbox, col 2 = name — both sticky-left */
+.wcol{{width:46px;min-width:46px;text-align:center;padding:10px 8px}}
+th:nth-child(1),td:nth-child(1){{position:sticky;left:0;background:var(--panel);z-index:2}}
+th:nth-child(2),td:nth-child(2){{position:sticky;left:46px;background:var(--panel);font-weight:600;z-index:2;min-width:160px}}
+thead th:nth-child(1){{z-index:4;background:var(--head);cursor:default}}
+thead th:nth-child(2){{z-index:4;background:var(--head)}}
+tbody tr:nth-child(even) td{{background:var(--stripe)}}
+tbody tr:nth-child(even) td:nth-child(1),tbody tr:nth-child(even) td:nth-child(2){{background:#101015}}
+tbody tr:hover td{{background:#20202a}}
+tbody tr:hover td:nth-child(1),tbody tr:hover td:nth-child(2){{background:#24242f}}
+input[type=checkbox]{{width:17px;height:17px;accent-color:var(--acc);cursor:pointer;vertical-align:middle}}
+/* watched -> dim the whole row, keep the checkbox crisp */
+tr.watched td{{opacity:.4}}
+tr.watched td:nth-child(1){{opacity:1}}
+a{{color:var(--acc);text-decoration:none}} a:hover{{text-decoration:underline}}
+.hidden{{display:none}}
+@media(max-width:600px){{h1{{font-size:17px}} th,td{{padding:8px 10px}}}}
+</style></head><body>
+<header><h1>{html.escape(title)}</h1><span class=count id=count></span>
+<input type=text class=f id=q placeholder="Filter\u2026" oninput="filt()"></header>
+<div class=wrap><table><thead><tr><th class=wcol title="Watched">\u2713</th>{ths}</tr></thead><tbody id=tb>
+{trs}</tbody></table></div>
+<script>
+const tb=document.getElementById('tb'),q=document.getElementById('q'),cnt=document.getElementById('count');
+const KEY='watched:'+document.title;
+let W=JSON.parse(localStorage.getItem(KEY)||'{{}}');
+let dir={{}};const TOTAL={len(data)};
+// restore watched state
+for(const r of tb.rows){{const k=r.dataset.k;const cb=r.cells[0].querySelector('input');if(W[k]){{cb.checked=true;r.classList.add('watched');}}}}
+function tog(cb){{const r=cb.closest('tr'),k=r.dataset.k;r.classList.toggle('watched',cb.checked);if(cb.checked)W[k]=1;else delete W[k];localStorage.setItem(KEY,JSON.stringify(W));upd();}}
+function upd(){{let vis=[...tb.rows].filter(r=>!r.classList.contains('hidden'));cnt.textContent=vis.length+' of '+TOTAL+' \u00b7 '+Object.keys(W).length+' watched';}}
+function filt(){{let s=q.value.toLowerCase();for(const r of tb.rows)r.classList.toggle('hidden',s&&!r.innerText.toLowerCase().includes(s));upd();}}
+function sortT(i){{dir[i]=!dir[i];const rows=[...tb.rows];const num=rows.every(r=>{{let t=r.cells[i].innerText.trim();return t===''||!isNaN(parseFloat(t));}});
+rows.sort((a,b)=>{{let x=a.cells[i].innerText.trim(),y=b.cells[i].innerText.trim();if(num){{x=parseFloat(x)||-1e9;y=parseFloat(y)||-1e9;return dir[i]?x-y:y-x;}}return dir[i]?x.localeCompare(y):y.localeCompare(x);}});
+rows.forEach(r=>tb.appendChild(r));}}
+upd();
+</script></body></html>"""
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__.strip()); return 2
+    inp = os.path.expanduser(sys.argv[1])
+    out = os.path.expanduser(sys.argv[2]) if len(sys.argv) > 2 else os.path.splitext(inp)[0] + ".html"
+    header, data = parse_md_table(open(inp, encoding="utf-8").read())
+    if not header:
+        print(f"mdtable-html: no markdown table found in {inp}", file=sys.stderr); return 1
+    title = os.path.splitext(os.path.basename(inp))[0].replace('-', ' ').replace('_', ' ').title()
+    open(out, "w", encoding="utf-8").write(build_html(title, header, data))
+    print(f"mdtable-html: {os.path.basename(inp)} -> {out} ({len(header)} cols x {len(data)} rows)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -56,10 +56,11 @@ if modes:
 ' "$mon" "$json"
 }
 
-# swww doesn't propagate an already-set wallpaper to outputs that appear
-# later — a newly enabled monitor shows a solid black fallback until told.
-# Re-apply the wallpaper from any monitor that already has one to any
-# monitor still on the "color:" fallback.
+# swww doesn't reliably propagate an already-set wallpaper to outputs that
+# appear later — a newly enabled monitor shows a solid black fallback until
+# told. Push the current image to EVERY enabled monitor (not just ones swww
+# reports on the "color:" fallback — a freshly re-registered output may be
+# missing from `swww query` entirely).
 sync_wallpaper() {
   command -v swww >/dev/null 2>&1 || return 0
   local ref_img="" line mon
@@ -67,13 +68,10 @@ sync_wallpaper() {
     [[ "$line" == *"currently displaying: image:"* ]] && ref_img="${line##*image: }"
   done < <(swww query 2>/dev/null)
   [[ -z "$ref_img" ]] && return 0
-  while IFS= read -r line; do
-    if [[ "$line" == *"currently displaying: color:"* ]]; then
-      mon=${line#*: }
-      mon=${mon%%:*}
-      swww img "$ref_img" -o "$mon" >/dev/null 2>&1 || true
-    fi
-  done < <(swww query 2>/dev/null)
+  while IFS= read -r mon; do
+    [[ -n "$mon" ]] || continue
+    swww img "$ref_img" -o "$mon" >/dev/null 2>&1 || true
+  done < <(monitors_json | jq -r '.[] | select(.disabled == false) | .name')
 }
 
 rehome_workspaces_to_laptop() {
@@ -96,6 +94,18 @@ apply_laptop_only() {
   save_profile "laptop-only"
 }
 
+# Poll until a monitor reports enabled. A cold external (coming up from a
+# disabled state) takes ~1-2s to finish link-training before Hyprland flips
+# disabled=false; a fixed sleep races that and swww/focus then skip the output.
+wait_enabled() {
+  local mon="$1" i
+  for i in $(seq 1 30); do
+    [[ "$(monitors_json | jq -r --arg m "$mon" 'first(.[]|select(.name==$m))|.disabled')" == "false" ]] && return 0
+    sleep 0.2
+  done
+  return 0
+}
+
 apply_dual() {  # $1 = right|left — which side the external monitor sits on
   local side="$1" ext width mode ext_width ext_x
   ext=$(first_external_any)
@@ -111,7 +121,15 @@ apply_dual() {  # $1 = right|left — which side the external monitor sits on
     *) echo "apply_dual: side must be right|left" >&2; exit 2 ;;
   esac
   hyprctl keyword monitor "$LAPTOP_MONITOR,preferred,0x0,1" >/dev/null
+  # A live mode/position change on an already-enabled external can leave the
+  # output present in `hyprctl monitors` yet invisible to Wayland clients
+  # (swww/grim see nothing, panel stays black). Force a disable -> settle ->
+  # enable cycle so the compositor tears down and re-advertises a fresh
+  # wl_output that clients actually bind to.
+  hyprctl keyword monitor "$ext,disable" >/dev/null
+  sleep 1
   hyprctl keyword monitor "$ext,$mode,${ext_x}x0,1" >/dev/null
+  wait_enabled "$ext"
   hyprctl dispatch focusmonitor "$LAPTOP_MONITOR" >/dev/null
   sync_wallpaper
   save_profile "dual-$side"
@@ -221,12 +239,27 @@ reapply() {
   esac
 }
 
+# One-key toggle for the F4 monitor key: if an external monitor is currently
+# ENABLED, collapse to laptop-only; otherwise bring the external up in the
+# correct dual layout (external on the LEFT, per monitors.conf).
+toggle() {
+  local ext_on
+  ext_on=$(monitors_json | jq -r --arg lp "$LAPTOP_MONITOR" \
+    'first(.[] | select(.name != $lp and .disabled == false)) | .name // empty')
+  if [[ -n "$ext_on" ]]; then
+    apply_laptop_only
+  else
+    apply_dual_left
+  fi
+}
+
 cmd=${1:-status}
 case "$cmd" in
   laptop-only) apply_laptop_only ;;
   dual-right)  apply_dual_right ;;
   dual-left)   apply_dual_left ;;
   mirror)      apply_mirror ;;
+  toggle)      toggle ;;
   reapply)     reapply ;;
   focus-right) focus_right ;;
   focus-left)  focus_left ;;
@@ -236,7 +269,7 @@ case "$cmd" in
   window-left)  move_window_left ;;
   status)      status ;;
   *)
-    echo "Usage: $0 {laptop-only|dual-right|dual-left|mirror|reapply|focus-right|focus-left|move-right|move-left|window-right|window-left|status}" >&2
+    echo "Usage: $0 {laptop-only|dual-right|dual-left|mirror|toggle|reapply|focus-right|focus-left|move-right|move-left|window-right|window-left|status}" >&2
     exit 2
     ;;
 esac

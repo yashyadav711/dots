@@ -1,6 +1,7 @@
 antigravity-appimage
 elephant-bin
 hyprvoice-bin
+mdcat-bin
 notion-app-electron
 otf-san-francisco
 xfce4-datetime-plugin

@@ -205,9 +205,22 @@ check_dangerous() {
     fi
 
     # Railway infra mutation: up / deploy / down / delete / remove.
+    # Yash 2026-07-19: ONLY the HeyDaddy PRODUCTION environment is gated.
+    # Dev/staging deploys and every other project are autonomous — no prompt.
     if echo "$cmd" | grep -qiE '(^|[;&|(])[[:space:]]*railway[[:space:]]+(up|deploy|down|delete|remove)([[:space:]]|$)'; then
-        echo "mutate Railway infrastructure (railway up/deploy/down)"
-        return 0
+        local _rw_dir="${JCODE_HOOK_CWD:-$PWD}"
+        local _rw_proj _rw_env
+        _rw_proj="$(jq -r --arg p "$_rw_dir" '.projects[$p].name // empty' "$HOME/.railway/config.json" 2>/dev/null)"
+        _rw_env="$(jq -r --arg p "$_rw_dir" '.projects[$p].environmentName // empty' "$HOME/.railway/config.json" 2>/dev/null)"
+        if echo "$cmd" | grep -qiE '(-e|--environment)[[:space:]=]+prod' && [[ "${_rw_proj,,}" == *heydaddy* || "$_rw_dir" == *heydaddy* ]]; then
+            echo "deploy to HeyDaddy PRODUCTION (explicit -e production)"
+            return 0
+        fi
+        if [[ ( "${_rw_proj,,}" == *heydaddy* || "$_rw_dir" == *heydaddy* ) && "${_rw_env,,}" == production* ]]; then
+            echo "mutate HeyDaddy PRODUCTION Railway infrastructure"
+            return 0
+        fi
+        # Non-heydaddy project, or heydaddy dev/staging: allowed, no prompt.
     fi
 
     # Supabase destructive DB ops: db push / db reset.

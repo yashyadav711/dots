@@ -1,0 +1,694 @@
+#!/usr/bin/env python3
+"""nhq-issues — keyboard-navigable TUI for GitHub issues across NHQ projects.
+
+Standalone sibling of `nhq-threads`. Browse open issues for every project in
+PROJECT_REPOS (single-sourced from nhq-threads), navigate by keyboard, preview
+bodies + comment threads, open in browser, filter / search / sort.
+
+  nhq-issues                         # full TUI (master-detail)
+  nhq-issues --heydaddy              # only heydaddy's issues
+  nhq-issues --label bug             # filter by label (repeatable)
+  nhq-issues --search payment        # title/label search
+  nhq-issues --status all            # open | closed | all
+  nhq-issues --no-tui                # grouped ansi table (paste-and-go)
+  nhq-issues --no-tui --web          # web-safe markdown dump
+  nhq-issues --repo owner/repo       # ad-hoc repo outside the map
+  nhq-issues --refresh 60            # auto-refresh every 60s
+  nhq-issues --verify                # self-test: rendered == fetched count
+
+Keys: j/k move · ⏎/l open · b/Esc back · o browser · y copy url · / search ·
+      p project · g label · s sort · r refresh · q / Ctrl-C quit.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+
+# ── reuse nhq-threads (single source: PROJECT_REPOS, palette, dump renderers) ──
+_THREADS_PATH = os.path.expanduser("~/Github/dots/bin/nhq-threads")
+
+
+def _load_threads():
+    if not os.path.exists(_THREADS_PATH):
+        return None
+    from importlib.machinery import SourceFileLoader
+    loader = SourceFileLoader("nhq_threads", _THREADS_PATH)
+    spec = importlib.util.spec_from_loader("nhq_threads", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)  # safe: nhq-threads guards __main__
+    return mod
+
+
+_t = _load_threads()
+PROJECT_REPOS: dict[str, str] = (_t.PROJECT_REPOS if _t else {})
+CAT_THEME: dict = (_t.CAT_THEME if _t else {})
+IssuesError = getattr(_t, "IssuesError", Exception) if _t else Exception
+
+LIST_FIELDS = "number,title,labels,state,author,updatedAt"
+DETAIL_FIELDS = "number,title,body,state,labels,author,createdAt,updatedAt,url,comments"
+
+# Project glyph (cosmetic; falls back to the repo's first letter).
+PROJ_GLYPH = {"heydaddy": "❤", "mirror": "◧", "nhq-agentic-os": "✦"}
+
+
+# ── data layer ───────────────────────────────────────────────────────────
+
+def _gh_json(args: list[str], timeout: int = 30):
+    """Run a gh subcommand, return parsed JSON. Raises IssuesError on failure."""
+    try:
+        proc = subprocess.run(["gh", *args], capture_output=True, text=True,
+                              timeout=timeout)
+    except FileNotFoundError:
+        raise IssuesError("gh CLI not found — install it (https://cli.github.com) "
+                          "and run `gh auth login`.")
+    except subprocess.TimeoutExpired:
+        raise IssuesError("gh timed out.")
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout).strip().splitlines()
+        raise IssuesError(msg[0] if msg else f"gh exited {proc.returncode}")
+    try:
+        return json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as e:
+        raise IssuesError(f"could not parse gh output: {e}")
+
+
+def fetch_list(repo: str, state: str = "open"):
+    return _gh_json(["issue", "list", "--repo", repo, "--state", state,
+                     "--json", LIST_FIELDS, "--limit", "200"])
+
+
+def fetch_detail(repo: str, number):
+    return _gh_json(["issue", "view", str(number), "--repo", repo,
+                     "--json", DETAIL_FIELDS])
+
+
+def collect_all(projects: list[str] | None = None,
+                extra_repos: list[str] | None = None,
+                state: str = "open"):
+    """Return [(project, repo, issues_or_errstr)] over mapped + ad-hoc repos,
+    fetched in parallel."""
+    work_items: list[tuple[str, str]] = []
+    for proj, repo in PROJECT_REPOS.items():
+        if projects and proj not in projects:
+            continue
+        work_items.append((proj, repo))
+    for repo in (extra_repos or []):
+        proj = repo.split("/")[-1]
+        work_items.append((proj, repo))
+
+    out: dict[str, tuple[str, str, object]] = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(fetch_list, repo, state): (proj, repo)
+                for proj, repo in work_items}
+        for fut in as_completed(futs):
+            proj, repo = futs[fut]
+            try:
+                out[repo] = (proj, repo, fut.result())
+            except IssuesError as e:
+                out[repo] = (proj, repo, str(e))
+    return [out[r] for r in [r for _, r in work_items]]  # preserve input order
+
+
+# ── helpers ──────────────────────────────────────────────────────────────
+
+def _age(iso: str) -> str:
+    """ISO-8601 (gh, UTC 'Z') → compact relative ('2h', '5d', 'now')."""
+    if not iso:
+        return ""
+    s = iso.replace("Z", "+00:00")
+    try:
+        then = datetime.fromisoformat(s).astimezone(timezone.utc).timestamp()
+    except ValueError:
+        return ""
+    secs = max(0, time.time() - then)
+    for unit, div in (("y", 31_536_000), ("d", 86_400),
+                      ("h", 3_600), ("m", 60)):
+        if secs >= div:
+            return f"{int(secs // div)}{unit}"
+    return "now"
+
+
+def _labels(it: dict) -> list[str]:
+    return [l.get("name", "") for l in (it.get("labels") or []) if l.get("name")]
+
+
+def chip_for(labels: list[str]) -> str:
+    """Small NHQ-flavoured status chip derived from labels."""
+    s = " ".join(labels).lower()
+    if "parked" in s:
+        return "🅿️"
+    if "bug" in s or "p2" in s:
+        return "🔴"
+    if "protocol-3" in s:
+        return "🔒"
+    if "on-dev" in s:
+        return "🟡"
+    if "enhancement" in s:
+        return "✦"
+    return ""
+
+
+def _truncate(text: str, limit: int = 64) -> str:
+    text = (text or "").strip().replace("\n", " ")
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+
+def filter_grouped(grouped, search="", labels=None):
+    """Apply --search (title+label substring) and --label (all must match)
+    filters to a grouped structure. Used by --no-tui so the dump respects the
+    same filters the TUI does. Errors (str entries) are passed through."""
+    sq = (search or "").lower()
+    want = [l.lower() for l in (labels or [])]
+    out = []
+    for proj, repo, x in grouped:
+        if isinstance(x, str):
+            out.append((proj, repo, x))
+            continue
+        kept = []
+        for it in x:
+            hay = (it.get("title", "") + " " + " ".join(_labels(it))).lower()
+            if sq and sq not in hay:
+                continue
+            if want:
+                have = {l.lower() for l in _labels(it)}
+                if not all(w in have for w in want):
+                    continue
+            kept.append(it)
+        out.append((proj, repo, kept))
+    return out
+# ── TUI ──────────────────────────────────────────────────────────────────
+
+def _build_tui():
+    # imported lazily so --no-tui/--verify don't require textual
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Horizontal, Vertical, Container
+    from textual.widgets import (Header, Footer, Input, OptionList, Markdown,
+                                 Static, Button)
+    from textual.widgets.option_list import Option
+    from textual.screen import Screen
+    from textual import on, work
+    from textual.message import Message
+    from rich.text import Text
+
+    class IssueList(OptionList):
+        # vim-style nav alongside native arrows/enter. Extend (not replace) so
+        # native up/down/home/end/paging stay bound.
+        BINDINGS = OptionList.BINDINGS + [
+            Binding("k", "cursor_up", "up", show=False),
+            Binding("j", "cursor_down", "down", show=False),
+            Binding("l", "open_current", "open", show=False),
+        ]
+
+        def _is_header(self, idx) -> bool:
+            if idx is None:
+                return True
+            opt = self.get_option_at_index(idx) if 0 <= idx < self.option_count else None
+            return opt is None or str(opt.id).startswith(("hdr:", "det:"))
+
+        def _skip_headers(self, direction: int) -> None:
+            """Advance past any header rows the cursor landed on."""
+            i = self.highlighted
+            n = self.option_count
+            while i is not None and 0 <= i < n and self._is_header(i):
+                i += direction
+            if i is not None and 0 <= i < n:
+                self.highlighted = i
+
+        def action_cursor_down(self) -> None:
+            super().action_cursor_down()
+            self._skip_headers(1)
+
+        def action_cursor_up(self) -> None:
+            super().action_cursor_up()
+            self._skip_headers(-1)
+
+        def action_open_current(self) -> None:
+            """Post a custom OpenIssue message for the highlighted row."""
+            if self.highlighted is None or self._is_header(self.highlighted):
+                return
+            opt = self.get_option_at_index(self.highlighted)
+            repo, num = str(opt.id).split(":", 1)
+            self.post_message(OpenIssue(repo, num))
+
+
+
+    CSS = """
+    Screen { layout: vertical; background: $surface; }
+    #topbar { dock: top; height: auto; padding: 0 1; border-bottom: solid $primary; }
+    #counts { color: $text; }
+    #search { height: 1; margin: 0; border: none; }
+    IssueList { height: 1fr; scrollbar-size: 1 1; }
+    """
+
+    class DetailLoaded(Message):
+        def __init__(self, repo, number, md):
+            super().__init__()
+            self.repo, self.number, self.md = repo, number, md
+
+    class OpenIssue(Message):
+        """Posted by IssueList when the user presses l/enter to open a row."""
+        def __init__(self, repo: str, number) -> None:
+            super().__init__()
+            self.repo, self.number = repo, number
+
+    class NhqIssuesApp(App):
+        # CSS assigned below the class (class bodies can't read enclosing locals)
+        HORIZONTAL_BREAKPOINTS = [
+            (0, "-compact"),
+            (95, "-normal"),
+            (130, "-wide"),
+        ]
+        TITLE = "nhq-issues"
+        BINDINGS = [
+            ("q", "quit", "Quit"),
+            ("ctrl+c", "quit", "Quit"),
+            ("o", "open_browser", "Browser"),
+            ("y", "yank", "Copy URL"),
+            ("/", "focus_search", "Search"),
+            ("r", "refresh", "Refresh"),
+            ("b,escape", "back", "Back"),
+            ("p", "cycle_project", "Project"),
+            ("g", "cycle_label", "Label"),
+            ("s", "cycle_sort", "Sort"),
+        ]
+
+        def __init__(self, grouped, state="open", search="", labels=None,
+                     sort="updated", refresh=0):
+            super().__init__()
+            self.grouped = grouped
+            self.state = state
+            self.search_q = (search or "").lower()
+            self.label_filter = [l.lower() for l in (labels or [])]
+            self.sort = sort
+            self.project_filter = None     # None = all projects; `p` cycles this
+            self.expanded = None     # (repo, num) currently inline-expanded
+            self.refresh_secs = refresh
+            self.all: list[tuple[str, str, dict]] = []  # (proj, repo, issue)
+            self.detail_cache: dict[tuple, dict] = {}
+            self._fetched_total = 0
+
+        # ── filtering / sorting (pure; unit-testable via the helpers above) ──
+        def _visible(self):
+            def ok(it):
+                if self.search_q:
+                    hay = (it.get("title", "") + " " + " ".join(_labels(it))).lower()
+                    if self.search_q not in hay:
+                        return False
+                if self.label_filter:
+                    have = {l.lower() for l in _labels(it)}
+                    if not all(want in have for want in self.label_filter):
+                        return False
+                return True
+            items = [(p, r, it) for p, r, x in self.grouped
+                     if isinstance(x, list)
+                     and (not self.project_filter or p == self.project_filter)
+                     for it in x
+                     if isinstance(it, dict)
+                     for p, r in [(p, r)] if ok(it)]
+            # de-dup (extra_repos may overlap mapped) preserving order
+            seen, uniq = set(), []
+            for p, r, it in items:
+                k = (r, it.get("number"))
+                if k in seen:
+                    continue
+                seen.add(k); uniq.append((p, r, it))
+            if self.sort == "number":
+                uniq.sort(key=lambda t: (t[0], t[2].get("number", 0)))
+            else:
+                field = {"updated": "updatedAt", "created": "createdAt"}[self.sort]
+                # newest-first within project; stable two-pass keeps groups intact
+                uniq.sort(key=lambda t: (t[2].get(field) or ""), reverse=True)
+                uniq.sort(key=lambda t: t[0])
+            return uniq
+
+        # ── compose ──
+        def compose(self) -> ComposeResult:
+            with Container(id="topbar"):
+                yield Static(self._counts_line(), id="counts")
+                yield Input(placeholder="/ filter — type to search title & labels",
+                            id="search")
+            yield IssueList(id="list")
+            yield Footer()
+
+        def _counts_line(self) -> str:
+            total = sum(len(x) for _, _, x in self.grouped if isinstance(x, list))
+            parts = []
+            for proj, repo, x in self.grouped:
+                if isinstance(x, list):
+                    glyph = PROJ_GLYPH.get(proj, "·")
+                    parts.append(f"{glyph} {proj}({len(x)})")
+                else:
+                    parts.append(f"⚠ {proj}")
+            line = f"🐛 nhq-issues · {total} open  " + "  ".join(parts)
+            active = []
+            if self.project_filter:
+                active.append(f"project:{self.project_filter}")
+            if self.label_filter:
+                active.append("label:" + "+".join(self.label_filter))
+            if self.search_q:
+                active.append(f'"/{self.search_q}"')
+            if active:
+                line += "   ▸ " + "  ".join(active)
+            return line
+
+        def on_mount(self) -> None:
+            self.all = self._visible()
+            self._render_list()
+            self.query_one("#list", IssueList).focus()
+            if self.refresh_secs > 0:
+                self.set_interval(self.refresh_secs, self.action_refresh)
+
+        def _render_list(self) -> None:
+            ol = self.query_one("#list", IssueList)
+            w = ol.size.width or (self.size.width or 80)
+            prev_id = None
+            if ol.highlighted is not None:
+                try:
+                    prev_id = str(ol.get_option_at_index(ol.highlighted).id)
+                except Exception:
+                    prev_id = None
+            ol.clear_options()
+            grouped: dict[str, list] = {}
+            for proj, repo, it in self.all:
+                grouped.setdefault(proj, []).append((repo, it))
+
+            def add_issue(proj, repo, it):
+                opts.append(Option(self._prompt(proj, it, w),
+                                   id=f"{repo}:{it.get('number')}"))
+                # inline-expand the detail block under the highlighted issue
+                if self.expanded == (repo, str(it.get("number"))):
+                    opts.append(Option(self._detail_block(repo, it.get("number")),
+                                       id=f"det:{repo}:{it.get('number')}",
+                                       disabled=True))
+
+            opts = []
+            for proj in PROJECT_REPOS:
+                rows = grouped.get(proj, [])
+                if not rows:
+                    continue
+                color = CAT_THEME.get(proj.upper(), ("#BDB8AC",))[0]
+                hdr = Text(f"{PROJ_GLYPH.get(proj, '·')} {proj} · {len(rows)}",
+                           style=f"bold {color}")
+                opts.append(Option(hdr, id=f"hdr:{proj}", disabled=True))
+                for repo, it in rows:
+                    add_issue(proj, repo, it)
+            for proj, rows in grouped.items():     # ad-hoc --repo projects
+                if proj in PROJECT_REPOS or not rows:
+                    continue
+                opts.append(Option(Text(f"· {proj} · {len(rows)}",
+                                        style="bold #BDB8AC"),
+                                   id=f"hdr:{proj}", disabled=True))
+                for repo, it in rows:
+                    add_issue(proj, repo, it)
+            if opts:
+                ol.add_options(opts)
+            # restore highlight to the same issue if still present, else first
+            want = prev_id or (f"{self.expanded[0]}:{self.expanded[1]}"
+                                if self.expanded else None)
+            first_issue = match = None
+            for idx in range(ol.option_count):
+                oid = str(ol.get_option_at_index(idx).id)
+                if oid.startswith(("hdr:", "det:")):
+                    continue
+                if first_issue is None:
+                    first_issue = idx
+                if want and oid == want:
+                    match = idx
+                    break
+            ol.highlighted = match if match is not None else first_issue
+
+        def _prompt(self, proj, it, width: int = 60) -> Text:
+            color = CAT_THEME.get(proj.upper(), ("#BDB8AC",))[0]
+            t = Text()
+            t.append(f"#{str(it.get('number', '')):<5}  ", style="bold #F2B705")
+            chip = chip_for(_labels(it))
+            if chip:
+                t.append(f"{chip} ")
+            labs = ",".join(_labels(it))
+            if labs:
+                t.append(f"[{labs}] ", style="dim")
+            age = _age(it.get("updatedAt", ""))
+            # width-aware truncation so a row never wraps to a 2nd line
+            used = 8 + (len(chip) + 1 if chip else 0) \
+                   + (len(labs) + 3 if labs else 0) \
+                   + (len(age) + 2 if age else 0)
+            titlelim = max(12, min(74, width - used))
+            t.append(_truncate(it.get("title", ""), titlelim))
+            if age:
+                t.append(f"  {age}", style="italic dim")
+            return t
+
+        # ── selection → inline expand-on-enter ──
+        @on(OpenIssue)
+        def _open_issue(self, ev: OpenIssue) -> None:
+            self._toggle_expand(ev.repo, ev.number)
+
+        @on(OptionList.OptionSelected)
+        def _selected(self, ev: OptionList.OptionSelected) -> None:
+            # native enter also toggles (belt + suspenders with `l`)
+            if not ev.option or str(ev.option.id).startswith(("hdr:", "det:")):
+                return
+            repo, num = str(ev.option.id).split(":", 1)
+            self._toggle_expand(repo, num)
+
+        def _toggle_expand(self, repo, number) -> None:
+            key = (repo, str(number))
+            self.expanded = None if self.expanded == key else key
+            self._render_list()
+            if self.expanded == key and key not in self.detail_cache:
+                self._fetch_detail(repo, number)
+
+        @work(thread=True)
+        def _fetch_detail(self, repo, number) -> None:
+            key = (repo, str(number))
+            try:
+                det = fetch_detail(repo, number)
+            except IssuesError as e:
+                det = {"number": number, "title": "(fetch failed)", "body": str(e),
+                       "state": "?", "labels": [], "comments": [], "author": {},
+                       "createdAt": "", "updatedAt": "", "url": ""}
+            self.detail_cache[key] = det
+            self.call_from_thread(self._render_list)
+
+        def _detail_block(self, repo, num) -> Text:
+            det = self.detail_cache.get((repo, str(num)))
+            if det is None:
+                return Text("   ⏳ loading…", style="dim italic")
+            return self._detail_text(det)
+
+        def _detail_text(self, det) -> Text:
+            author = (det.get("author") or {}).get("login", "?")
+            labels = ", ".join(_labels(det)) or "—"
+            t = Text()
+            t.append(f"   state:{det.get('state', 'open')} · {author} · "
+                     f"opened {_age(det.get('createdAt', ''))} · labels:{labels}\n",
+                     style="dim")
+            body = (det.get("body") or "(no body)").strip()
+            for ln in body.splitlines()[:12]:
+                t.append(f"   {ln}\n")
+            if len(body.splitlines()) > 12:
+                t.append("   … (press o to open full in browser)\n",
+                         style="dim italic")
+            comments = det.get("comments") or []
+            if comments:
+                t.append(f"   💬 {len(comments)} comments\n", style="dim")
+                for c in comments[:4]:
+                    ca = (c.get("author") or {}).get("login", "?")
+                    raw = (c.get("body") or "").strip().splitlines()
+                    first = raw[0][:90] if raw else ""
+                    t.append(f"     {ca}: {first}\n", style="dim")
+            return t
+
+        # ── actions ──
+        def _current_key(self):
+            ol = self.query_one("#list", IssueList)
+            opt = ol.get_option_at_index(ol.highlighted) if ol.highlighted is not None else None
+            return str(opt.id) if opt else None
+
+        def action_open_browser(self) -> None:
+            key = self._current_key()
+            if not key or key.startswith("hdr:"):
+                self.notify("no issue selected", timeout=2)
+                return
+            repo, num = key.split(":", 1)
+            det = self.detail_cache.get((repo, num), {})
+            url = det.get("url") or f"https://github.com/{repo}/issues/{num}"
+            import webbrowser
+            webbrowser.open(url)
+            self.notify(f"opened {repo}#{num}", timeout=2)
+
+        def action_yank(self) -> None:
+            key = self._current_key()
+            if not key or key.startswith("hdr:"):
+                return
+            repo, num = key.split(":", 1)
+            det = self.detail_cache.get((repo, num), {})
+            url = det.get("url") or f"https://github.com/{repo}/issues/{num}"
+            try:
+                import pyperclip
+                pyperclip.copy(url)
+                self.notify("URL copied", timeout=2)
+            except Exception:
+                # fallback: OSC52 (terminal clipboard) via stdout
+                sys.stdout.write(f"\033]52;c;{url}\x07"); sys.stdout.flush()
+                self.notify("URL copied (OSC52)", timeout=2)
+
+        def action_focus_search(self) -> None:
+            self.query_one("#search", Input).focus()
+
+        @on(Input.Changed, "#search")
+        def _search_changed(self, ev: Input.Changed) -> None:
+            self.search_q = (ev.value or "").lower()
+            self.all = self._visible()
+            self._render_list()
+
+        def action_back(self) -> None:
+            if len(self.screen_stack) > 1:
+                self.pop_screen()
+            else:
+                self.query_one("#list", IssueList).focus()
+
+
+        @work(thread=True)
+        def action_refresh(self) -> None:
+            grouped = collect_all(state=self.state)
+            self.grouped = grouped
+            self.all = self._visible()
+            self.detail_cache.clear()
+            self.call_from_thread(self._after_refresh)
+
+        def _after_refresh(self) -> None:
+            self.query_one("#counts", Static).update(self._counts_line())
+            self._render_list()
+            self.notify("refreshed", timeout=2)
+
+        # ── in-TUI filter cycling (p / g / s) ───────────────────────────
+        def _apply_filters(self) -> None:
+            """Recompute visible set, re-render list, refresh counts line."""
+            self.all = self._visible()
+            self._render_list()
+            self.query_one("#counts", Static).update(self._counts_line())
+
+        def _distinct_labels(self) -> list[str]:
+            seen: dict[str, bool] = {}
+            for _, _, x in self.grouped:
+                if isinstance(x, list):
+                    for it in x:
+                        for lab in _labels(it):
+                            seen.setdefault(lab.lower(), True)
+            return list(seen.keys())
+
+        def action_cycle_sort(self) -> None:
+            order = ["updated", "created", "number"]
+            self.sort = order[(order.index(self.sort) + 1) % len(order)]
+            self._apply_filters()
+            self.notify(f"sort: {self.sort}", timeout=2)
+
+        def action_cycle_project(self) -> None:
+            chain = [None, *PROJECT_REPOS.keys()]
+            cur = self.project_filter
+            idx = chain.index(cur) if cur in chain else 0
+            self.project_filter = chain[(idx + 1) % len(chain)]
+            self._apply_filters()
+            self.notify(f"project: {self.project_filter or 'all'}", timeout=2)
+
+        def action_cycle_label(self) -> None:
+            chain = [None, *self._distinct_labels()]
+            cur = self.label_filter[0] if self.label_filter else None
+            idx = chain.index(cur) if cur in chain else 0
+            nxt = chain[(idx + 1) % len(chain)]
+            self.label_filter = [nxt] if nxt else []
+            self._apply_filters()
+            self.notify(f"label: {nxt or 'all'}", timeout=2)
+
+    NhqIssuesApp.CSS = CSS
+    return NhqIssuesApp
+
+
+# ── --no-tui dump (reuses nhq-threads renderers) ──────────────────────────
+
+def dump_no_tui(grouped, mode="ansi") -> int:
+    if _t is None:
+        print("nhq-issues: nhq-threads not found; cannot render --no-tui dump.",
+              file=sys.stderr)
+        return 2
+    if mode == "ansi":
+        print(_t.render_issues_ansi(grouped))
+    else:
+        print(_t.render_issues(grouped, mode))
+    return 0
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+def _verify(grouped) -> int:
+    fetched = sum(len(x) for _, _, x in grouped if isinstance(x, list))
+    errs = sum(1 for _, _, x in grouped if isinstance(x, str))
+    print(f"nhq-issues: fetched {fetched} issues across "
+          f"{len(grouped)} repos ({errs} fetch errors)", file=sys.stderr)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="nhq-issues", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    proj = ap.add_argument_group("project scope")
+    for p in PROJECT_REPOS:
+        proj.add_argument(f"--{p}", action="store_true", help=f"only {p}")
+    ap.add_argument("--repo", action="append", metavar="owner/repo",
+                    help="ad-hoc repo outside the map (repeatable)")
+    ap.add_argument("--label", action="append", metavar="LABEL",
+                    help="only issues with this label (repeatable)")
+    ap.add_argument("--search", metavar="QUERY", help="title/label substring")
+    ap.add_argument("--status", choices=["open", "closed", "all"], default="open")
+    ap.add_argument("--sort", choices=["updated", "created", "number"],
+                    default="updated")
+    ap.add_argument("--refresh", type=int, metavar="SEC", default=0,
+                    help="auto-refresh every SEC seconds")
+    ap.add_argument("--no-tui", action="store_true",
+                    help="dump grouped table to stdout (no TUI)")
+    grp = ap.add_mutually_exclusive_group()
+    grp.add_argument("--ansi", action="store_true", help="(with --no-tui) ansi")
+    grp.add_argument("--web", action="store_true", help="(with --no-tui) markdown")
+    grp.add_argument("--latex", action="store_true", help="(with --no-tui) latex")
+    ap.add_argument("--verify", action="store_true",
+                    help="self-test: print fetch stats, exit 0")
+    args = ap.parse_args(argv)
+
+    if not PROJECT_REPOS and not args.repo:
+        print("nhq-issues: no projects mapped (PROJECT_REPOS empty) and no "
+              "--repo given.", file=sys.stderr)
+        return 2
+
+    sel = [p for p in PROJECT_REPOS if getattr(args, p.replace("-", "_"), False)]
+    grouped = collect_all(projects=(sel or None), extra_repos=args.repo,
+                          state=args.status)
+
+    if args.verify:
+        return _verify(grouped)
+
+    if args.no_tui:
+        grouped = filter_grouped(grouped, args.search, args.label)
+        mode = "latex" if args.latex else "web" if args.web else "ansi"
+        return dump_no_tui(grouped, mode)
+
+    mode = "latex" if args.latex else "web" if args.web else "ansi"  # unused in TUI
+
+    App = _build_tui()
+    app = App(grouped, state=args.status, search=args.search or "",
+              labels=args.label, sort=args.sort, refresh=args.refresh)
+    app.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

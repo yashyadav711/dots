@@ -287,6 +287,8 @@ alias iso="cat /etc/dev-rel | awk -F '=' '/ISO/ {print $2}'"
 alias isoo="cat /etc/dev-rel"
 alias merge="xrdb -merge ~/.Xresources"
 alias stopwatch="~/.local/bin/stopwatch"  # Terminal stopwatch (lap/quit keys)
+alias catmd="mdcat --theme nord"            # Render markdown inline (mdcat: no pager, full width, kitty images)
+alias tuifilemanager="yazi"                 # TUI file manager (yazi: theme=tokyo-night, opens files in nvim)
 
 # Process monitoring, sorting, reboot/shutdown
 alias psa="ps auxf"

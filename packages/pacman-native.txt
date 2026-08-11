@@ -89,6 +89,7 @@ glances
 glow
 gnome-text-editor
 google-cloud-cli
+gpick
 grim
 grub
 grub-btrfs-support
@@ -299,5 +300,6 @@ xfsprogs
 xfwm4
 xl2tpd
 xorg-xwayland
+yazi
 zathura
 zathura-pdf-mupdf

@@ -41,10 +41,11 @@ end
 set -e fish_user_paths
 set -U fish_user_paths $HOME/.bin $HOME/.local/bin $HOME/Applications $fish_user_paths
 
+# NHQ: Starship disabled 2026-07-28 — using OMF budspencer-NHQ theme. Revert: uncomment below.
 # Starship prompt initializer
-if command -sq starship
-    starship init fish | source
-end
+#if command -sq starship
+#    starship init fish | source
+#end
 
 # Environment variables for editors
 set -x EDITOR vim

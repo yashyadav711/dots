@@ -1,0 +1,771 @@
+#!/usr/bin/env python3
+"""nhq-quota — unified view of all AI provider quotas (native Claude, agy, GLM, OpenRouter).
+
+Usage:
+  nhq-quota              human-readable quota table
+  nhq-quota --segment    compact status bar line
+  nhq-quota --json       machine-readable json summary
+"""
+import sys
+import os
+import json
+import csv
+import subprocess
+import sqlite3
+import urllib.request
+import base64
+from datetime import datetime, timezone
+
+# Constants
+CSV_PATH = os.path.expanduser("~/.pi-antigravity-rotator/usage-history.csv")
+DB_PATH = os.path.expanduser("~/.omp/agent/agent.db")
+
+# Colors
+GRN = "\033[32m"
+YLW = "\033[33m"
+RED = "\033[31m"
+DIM = "\033[2m"
+RST = "\033[0m"
+BOLD = "\033[1m"
+
+def get_native_claude_usage(timeout=20) -> dict or None:
+    """Shells out to nhq-usage --json to parse official Claude usage."""
+    try:
+        res = subprocess.run(
+            ["nhq-usage", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        if res.returncode == 0:
+            return json.loads(res.stdout)
+    except Exception:
+        pass
+    return None
+
+def _rem(block: dict or None) -> float or None:
+    if not block or block.get("utilization") is None:
+        return None
+    return round(100.0 - float(block["utilization"]))
+
+def _reset_in(block: dict or None) -> str:
+    if not block or not block.get("resets_at"):
+        return ""
+    try:
+        resets_at = block["resets_at"]
+        if resets_at.endswith("Z"):
+            resets_at = resets_at[:-1] + "+00:00"
+        t = datetime.fromisoformat(resets_at)
+        delta = t - datetime.now(timezone.utc)
+        secs = int(delta.total_seconds())
+        if secs <= 0:
+            return "now"
+        h, m = divmod(secs // 60, 60)
+        d, h = divmod(h, 24)
+        if d:
+            return f"{d}d {h}h"
+        if h:
+            return f"{h}h {m}m"
+        return f"{m}m"
+    except Exception:
+        return ""
+
+def calculate_median(values):
+    if not values:
+        return None
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    if n % 2 == 1:
+        return sorted_vals[n // 2]
+    else:
+        return (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2.0
+
+def safe_float(v):
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+def get_agy_rotator_usage() -> dict or None:
+    """Reads usage-history.csv to extract the latest snapshot per account."""
+    if not os.path.exists(CSV_PATH):
+        return None
+    
+    rows = []
+    try:
+        with open(CSV_PATH, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append(row)
+    except Exception:
+        return None
+        
+    if not rows:
+        return {}
+        
+    last_by = {}
+    for row in rows:
+        email = row.get("email")
+        if email:
+            last_by[email] = row
+            
+    # Calculate statistics across all accounts
+    claude_pcts = [safe_float(r.get("quota_claude")) for r in last_by.values()]
+    pro_pcts = [safe_float(r.get("quota_gemini_pro")) for r in last_by.values()]
+    flash_pcts = [safe_float(r.get("quota_gemini_flash")) for r in last_by.values()]
+
+    claude_pcts = [v for v in claude_pcts if v is not None]
+    pro_pcts = [v for v in pro_pcts if v is not None]
+    flash_pcts = [v for v in flash_pcts if v is not None]
+
+    return {
+        "accounts": last_by,
+        "stats": {
+            "claude": {
+                "min": min(claude_pcts) if claude_pcts else None,
+                "median": calculate_median(claude_pcts)
+            },
+            "gemini_pro": {
+                "min": min(pro_pcts) if pro_pcts else None,
+                "median": calculate_median(pro_pcts)
+            },
+            "gemini_flash": {
+                "min": min(flash_pcts) if flash_pcts else None,
+                "median": calculate_median(flash_pcts)
+            }
+        }
+    }
+
+def get_glm_usage() -> dict or None:
+    """Reads GLM / Zai usage from omp local SQLite DB, falling back to cache file scan."""
+    # 1. Try querying the sqlite database first
+    if os.path.exists(DB_PATH):
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+            cursor = conn.cursor()
+            query = """
+                SELECT limit_id, label, window_label, used_fraction, resets_at, recorded_at
+                FROM usage_history
+                WHERE provider = 'zai' AND id IN (
+                    SELECT MAX(id) FROM usage_history WHERE provider = 'zai' GROUP BY limit_id
+                )
+            """
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            if rows:
+                results = {}
+                for row in rows:
+                    limit_id, label, window_label, used_fraction, resets_at, recorded_at = row
+                    rem_pct = round(100.0 * (1.0 - used_fraction)) if used_fraction is not None else None
+                    results[limit_id] = {
+                        "label": label,
+                        "window": window_label,
+                        "remaining_pct": rem_pct,
+                        "resets_at_ms": resets_at,
+                        "recorded_at": recorded_at
+                    }
+                return results
+        except Exception:
+            pass
+        finally:
+            if conn:
+                conn.close()
+                
+    # 2. Fall back to best-effort search for a local rate-limit/state file
+    exclusions = ["uv", "pnpm", "codex-runtimes", "ms-playwright", "node-gyp", "mozilla", "flatpak", "BraveSoftware", "git", "puppeteer", ".git"]
+    for base in [os.path.expanduser("~/.cache"), os.path.expanduser("~/.pi-antigravity-rotator"), os.path.expanduser("~/.omp")]:
+        if not os.path.exists(base):
+            continue
+        try:
+            for root, dirs, files in os.walk(base):
+                dirs[:] = [d for d in dirs if not any(x in d for x in exclusions)]
+                for f in files:
+                    lf = f.lower()
+                    if ("glm" in lf or "zai" in lf) and ("rate" in lf or "limit" in lf or "429" in lf):
+                        full_path = os.path.join(root, f)
+                        try:
+                            with open(full_path, "r", encoding="utf-8") as fh:
+                                content = fh.read().strip()
+                            try:
+                                data = json.loads(content)
+                                resets_at = data.get("resets_at") or data.get("reset_time") or data.get("reset")
+                                remaining = data.get("remaining") or data.get("remaining_pct")
+                                if resets_at or remaining is not None:
+                                    return {
+                                        "file_marker": {
+                                            "path": full_path,
+                                            "remaining_pct": remaining,
+                                            "resets_at": resets_at,
+                                            "raw": data
+                                        }
+                                    }
+                            except json.JSONDecodeError:
+                                return {
+                                    "file_marker": {
+                                        "path": full_path,
+                                        "raw_text": content[:200]
+                                    }
+                                }
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+            
+    return None
+
+def _format_seconds(secs) -> str:
+    if secs is None:
+        return ""
+    try:
+        secs = int(secs)
+        if secs <= 0:
+            return "now"
+        h, m = divmod(secs // 60, 60)
+        d, h = divmod(h, 24)
+        if d:
+            return f"{d}d {h}h"
+        if h:
+            return f"{h}h {m}m"
+        return f"{m}m"
+    except Exception:
+        return ""
+
+def _window_label(limit_window_seconds) -> str:
+    if limit_window_seconds is None:
+        return "window"
+    try:
+        limit_window_seconds = int(limit_window_seconds)
+        if limit_window_seconds == 18000:
+            return "5-hour window"
+        elif limit_window_seconds == 604800:
+            return "weekly (7-day)"
+        else:
+            hours = limit_window_seconds // 3600
+            if hours >= 24:
+                days = hours // 24
+                return f"{days}-day window"
+            return f"{hours}-hour window"
+    except Exception:
+        return "window"
+
+def _get_codex_fallback_usage() -> dict or None:
+    state_path = os.path.expanduser("~/.codex/.codex-global-state.json")
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                state_data = json.load(f)
+        except Exception:
+            pass
+            
+    log_db = os.path.expanduser("~/.codex/logs_2.sqlite")
+    if os.path.exists(log_db):
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{log_db}?mode=ro", uri=True)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT ts, feedback_log_body FROM logs 
+                WHERE feedback_log_body LIKE '%remaining%' 
+                   OR feedback_log_body LIKE '%used_percent%'
+                ORDER BY id DESC LIMIT 5
+            """)
+            rows = cur.fetchall()
+        except Exception:
+            pass
+        finally:
+            if conn:
+                conn.close()
+    return None
+
+def get_codex_usage(timeout=8) -> dict:
+    auth_path = os.path.expanduser("~/.codex/auth.json")
+    inst_path = os.path.expanduser("~/.codex/installation_id")
+    
+    if not os.path.exists(auth_path):
+        return {"account_present": False, "email": None, "rate_limits": None}
+        
+    email = None
+    token = None
+    try:
+        with open(auth_path, "r", encoding="utf-8") as f:
+            auth_data = json.load(f)
+        
+        tokens = auth_data.get("tokens", {})
+        token = tokens.get("access_token")
+        
+        if token:
+            try:
+                parts = token.split(".")
+                if len(parts) >= 2:
+                    payload = parts[1]
+                    payload += "=" * ((4 - len(payload) % 4) % 4)
+                    decoded = json.loads(base64.b64decode(payload).decode("utf-8"))
+                    email = decoded.get("https://api.openai.com/profile", {}).get("email")
+            except Exception:
+                pass
+    except Exception:
+        pass
+        
+    if not token:
+        return {"account_present": True, "email": email, "rate_limits": None}
+        
+    try:
+        inst_id = ""
+        if os.path.exists(inst_path):
+            try:
+                with open(inst_path, "r", encoding="utf-8") as f:
+                    inst_id = f.read().strip()
+            except Exception:
+                pass
+                
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "Codex/0.144.5",
+        }
+        if inst_id:
+            headers["x-codex-installation-id"] = inst_id
+            
+        url = "https://chatgpt.com/backend-api/codex/usage"
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if r.status == 200:
+                data = json.loads(r.read().decode())
+                
+                rate_limit = data.get("rate_limit", {})
+                primary = rate_limit.get("primary_window")
+                secondary = rate_limit.get("secondary_window")
+                
+                rate_limits = {}
+                if primary:
+                    rate_limits["primary_window"] = {
+                        "remaining_pct": round(100.0 - float(primary.get("used_percent", 0.0))),
+                        "limit_window_seconds": primary.get("limit_window_seconds"),
+                        "reset_after_seconds": primary.get("reset_after_seconds"),
+                        "reset_at": primary.get("reset_at")
+                    }
+                if secondary:
+                    rate_limits["secondary_window"] = {
+                        "remaining_pct": round(100.0 - float(secondary.get("used_percent", 0.0))),
+                        "limit_window_seconds": secondary.get("limit_window_seconds"),
+                        "reset_after_seconds": secondary.get("reset_after_seconds"),
+                        "reset_at": secondary.get("reset_at")
+                    }
+                    
+                api_email = data.get("email") or email
+                return {
+                    "account_present": True,
+                    "email": api_email,
+                    "rate_limits": rate_limits or None
+                }
+    except Exception:
+        fallback = _get_codex_fallback_usage()
+        if fallback:
+            return fallback
+            
+        return {
+            "account_present": True,
+            "email": email,
+            "rate_limits": None
+        }
+        
+    return {"account_present": True, "email": email, "rate_limits": None}
+
+def get_codex_segment_str(codex_data):
+    if not codex_data or not codex_data.get("account_present"):
+        return "codex n/a"
+        
+    rate_limits = codex_data.get("rate_limits")
+    if not rate_limits:
+        return "codex n/a"
+        
+    primary = rate_limits.get("primary_window")
+    secondary = rate_limits.get("secondary_window")
+    
+    parts = []
+    if primary and primary.get("remaining_pct") is not None:
+        p_dur = primary.get("limit_window_seconds")
+        p_lbl = "5h" if p_dur == 18000 else ("7d" if p_dur == 604800 else "")
+        pct = primary["remaining_pct"]
+        if p_lbl:
+            parts.append(f"{p_lbl} {pct:.0f}%")
+        else:
+            parts.append(f"{pct:.0f}%")
+            
+    if secondary and secondary.get("remaining_pct") is not None:
+        s_dur = secondary.get("limit_window_seconds")
+        s_lbl = "5h" if s_dur == 18000 else ("7d" if s_dur == 604800 else "")
+        pct = secondary["remaining_pct"]
+        if s_lbl:
+            parts.append(f"{s_lbl} {pct:.0f}%")
+        else:
+            parts.append(f"{pct:.0f}%")
+            
+    if parts:
+        return "codex " + " · ".join(parts)
+    return "codex n/a"
+
+def format_pct(val, colorize_output=True):
+    if val is None:
+        return f"{DIM}   n/a{RST}" if colorize_output else "   n/a"
+    text = f"{val:5.0f}%"
+    if colorize_output:
+        color = GRN if val >= 80 else (YLW if val >= 50 else RED)
+        return f"{color}{text}{RST}"
+    else:
+        return text
+
+def format_claude_pct(val, colorize_output=True):
+    if val is None:
+        return f"{DIM}n/a{RST}" if colorize_output else "n/a"
+    text = f"{val:.0f}%"
+    if colorize_output:
+        color = GRN if val >= 80 else (YLW if val >= 50 else RED)
+        return f"{color}{text}{RST}"
+    else:
+        return text
+
+def format_ms_reset(resets_at_ms):
+    if not resets_at_ms:
+        return ""
+    try:
+        t = datetime.fromtimestamp(resets_at_ms / 1000.0, tz=timezone.utc)
+        delta = t - datetime.now(timezone.utc)
+        secs = int(delta.total_seconds())
+        if secs <= 0:
+            return "now"
+        h, m = divmod(secs // 60, 60)
+        d, h = divmod(h, 24)
+        if d:
+            return f"{d}d {h}h"
+        if h:
+            return f"{h}h {m}m"
+        return f"{m}m"
+    except Exception:
+        return ""
+
+def get_glm_segment_str(glm_data):
+    if not glm_data:
+        return "glm n/a"
+        
+    if "file_marker" in glm_data:
+        fm = glm_data["file_marker"]
+        if fm.get("remaining_pct") is not None:
+            return f"glm {fm['remaining_pct']:.0f}%"
+        return "glm n/a"
+        
+    # Check for exhausted tokens to report reset time
+    exhausted_limits = [v for k, v in glm_data.items() if v.get("remaining_pct") == 0 and "tokens" in k]
+    if exhausted_limits:
+        exhausted_limits.sort(key=lambda x: x.get("resets_at_ms") or 0, reverse=True)
+        reset_ms = exhausted_limits[0].get("resets_at_ms")
+        if reset_ms:
+            try:
+                dt = datetime.fromtimestamp(reset_ms / 1000.0)
+                return f"glm rl→{dt.strftime('%H:%M')}"
+            except Exception:
+                pass
+                
+    tokens_5h = glm_data.get("zai:tokens:5h")
+    tokens_1w = glm_data.get("zai:tokens:1w")
+    if tokens_5h and tokens_5h.get("remaining_pct") is not None:
+        return f"glm 5h {tokens_5h['remaining_pct']:.0f}%"
+    elif tokens_1w and tokens_1w.get("remaining_pct") is not None:
+        return f"glm 7d {tokens_1w['remaining_pct']:.0f}%"
+        
+    return "glm n/a"
+
+def print_glm_human(glm_data):
+    if not glm_data:
+        print(f"  {DIM}GLM: no local usage source (429 reset time only visible on rate-limit){RST}")
+        return
+        
+    if "file_marker" in glm_data:
+        fm = glm_data["file_marker"]
+        print(f"  File marker: {fm.get('path')}")
+        if "remaining_pct" in fm:
+            print(f"    Remaining: {format_claude_pct(fm['remaining_pct'])}")
+        if "resets_at" in fm:
+            print(f"    Resets at: {fm['resets_at']}")
+        if "raw_text" in fm:
+            print(f"    Raw text : {fm['raw_text']}")
+        return
+
+    # Database records
+    tokens_5h = glm_data.get("zai:tokens:5h")
+    tokens_1w = glm_data.get("zai:tokens:1w")
+    
+    if tokens_5h:
+        rem = tokens_5h["remaining_pct"]
+        reset = format_ms_reset(tokens_5h["resets_at_ms"])
+        reset_str = f" (resets in {reset})" if reset else ""
+        print(f"  5-hour window : {format_claude_pct(rem)} left{reset_str}")
+        
+    if tokens_1w:
+        rem = tokens_1w["remaining_pct"]
+        reset = format_ms_reset(tokens_1w["resets_at_ms"])
+        reset_str = f" (resets in {reset})" if reset else ""
+        print(f"  weekly (7-day): {format_claude_pct(rem)} left{reset_str}")
+        
+    if not tokens_5h and not tokens_1w:
+        print(f"  {DIM}GLM: no local usage source (429 reset time only visible on rate-limit){RST}")
+
+def human_view(native_claude, agy_rotator, glm_data, codex_data):
+    current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n{BOLD}nhq quota{RST}  ·  {current_time_str}\n")
+    
+    # 1. Native Claude
+    print(f"{BOLD}NATIVE CLAUDE (Anthropic Max Plan){RST}")
+    print("─" * 46)
+    if native_claude:
+        fh = native_claude.get("five_hour")
+        sd = native_claude.get("seven_day")
+        op = native_claude.get("seven_day_opus")
+        so = native_claude.get("seven_day_sonnet")
+        
+        fr_pct = _rem(fh)
+        fr_reset = _reset_in(fh)
+        fr_reset_str = f" (resets in {fr_reset})" if fr_reset else ""
+        print(f"  5-hour window : {format_claude_pct(fr_pct)} left{fr_reset_str}")
+        
+        wr_pct = _rem(sd)
+        wr_reset = _reset_in(sd)
+        wr_reset_str = f" (resets in {wr_reset})" if wr_reset else ""
+        print(f"  weekly (7-day): {format_claude_pct(wr_pct)} left{wr_reset_str}")
+        
+        if op and op.get("utilization") is not None:
+            op_pct = _rem(op)
+            op_reset = _reset_in(op)
+            op_reset_str = f" (resets in {op_reset})" if op_reset else ""
+            print(f"  weekly Opus   : {format_claude_pct(op_pct)} left{op_reset_str}")
+            
+        if so and so.get("utilization") is not None:
+            so_pct = _rem(so)
+            so_reset = _reset_in(so)
+            so_reset_str = f" (resets in {so_reset})" if so_reset else ""
+            print(f"  weekly Sonnet : {format_claude_pct(so_pct)} left{so_reset_str}")
+    else:
+        print(f"  5-hour window : {DIM}  n/a{RST}")
+        print(f"  weekly (7-day): {DIM}  n/a{RST}")
+    print()
+    
+    # 2. agy rotator
+    print(f"{BOLD}AGY ROTATOR (Antigravity accounts){RST}")
+    print("─" * 46)
+    if agy_rotator is None:
+        print(f"  {DIM}agy rotator: no history yet (history file missing){RST}")
+    elif not agy_rotator.get("accounts"):
+        print(f"  {DIM}agy rotator: history file is empty{RST}")
+    else:
+        last_by = agy_rotator["accounts"]
+        stats = agy_rotator["stats"]
+        
+        print(f"  {'Account':<20}  {'Claude':>6}  {'G3Pro':>6}  {'G3Flash':>6}")
+        print("  " + "─" * 44)
+        for email in sorted(last_by):
+            label = email.split("@")[0]
+            c = safe_float(last_by[email].get("quota_claude"))
+            g1 = safe_float(last_by[email].get("quota_gemini_pro"))
+            gf = safe_float(last_by[email].get("quota_gemini_flash"))
+            print(f"  {label:<20}  {format_pct(c)}  {format_pct(g1)}  {format_pct(gf)}")
+        print("  " + "─" * 44)
+        
+        min_c = stats["claude"]["min"]
+        med_c = stats["claude"]["median"]
+        min_p = stats["gemini_pro"]["min"]
+        med_p = stats["gemini_pro"]["median"]
+        min_f = stats["gemini_flash"]["min"]
+        med_f = stats["gemini_flash"]["median"]
+        
+        print(f"  {'Min':<20}  {format_pct(min_c)}  {format_pct(min_p)}  {format_pct(min_f)}")
+        print(f"  {'Median':<20}  {format_pct(med_c)}  {format_pct(med_p)}  {format_pct(med_f)}")
+    print()
+    
+    # 3. GLM
+    print(f"{BOLD}GLM (Z.ai via nhq-glm){RST}")
+    print("─" * 46)
+    print_glm_human(glm_data)
+    print()
+    
+    # 4. OpenAI Codex
+    print(f"{BOLD}OPENAI CODEX (1 account){RST}")
+    print("─" * 46)
+    if codex_data and codex_data.get("account_present"):
+        rate_limits = codex_data.get("rate_limits")
+        if rate_limits:
+            primary = rate_limits.get("primary_window")
+            secondary = rate_limits.get("secondary_window")
+            if primary:
+                lbl = _window_label(primary.get("limit_window_seconds"))
+                rem = primary.get("remaining_pct")
+                secs = primary.get("reset_after_seconds")
+                reset_hint = _format_seconds(secs)
+                reset_str = f" (resets in {reset_hint})" if reset_hint else ""
+                print(f"  {lbl:<15}: {format_claude_pct(rem)} left{reset_str}")
+            if secondary:
+                lbl = _window_label(secondary.get("limit_window_seconds"))
+                rem = secondary.get("remaining_pct")
+                secs = secondary.get("reset_after_seconds")
+                reset_hint = _format_seconds(secs)
+                reset_str = f" (resets in {reset_hint})" if reset_hint else ""
+                print(f"  {lbl:<15}: {format_claude_pct(rem)} left{reset_str}")
+        else:
+            print(f"  {DIM}OpenAI Codex: 1 account, no local usage source{RST}")
+    else:
+        print(f"  {DIM}OpenAI Codex: no accounts configured{RST}")
+    print()
+    
+    # 5. OpenRouter
+    # TODO(omni-router): Wire OpenRouter check here when configured.
+    print(f"{BOLD}OPENROUTER / OMNI-ROUTER{RST}")
+    print("─" * 46)
+    print(f"  {DIM}OpenRouter: not configured yet (pending setup){RST}")
+    print()
+
+def json_view(native_claude, agy_rotator, glm_data, codex_data):
+    claude_dict = {}
+    if native_claude:
+        fh = native_claude.get("five_hour")
+        sd = native_claude.get("seven_day")
+        op = native_claude.get("seven_day_opus")
+        so = native_claude.get("seven_day_sonnet")
+        
+        claude_dict["five_hour"] = {
+            "remaining_pct": _rem(fh),
+            "resets_in": _reset_in(fh),
+            "resets_at": fh.get("resets_at") if fh else None
+        }
+        claude_dict["seven_day"] = {
+            "remaining_pct": _rem(sd),
+            "resets_in": _reset_in(sd),
+            "resets_at": sd.get("resets_at") if sd else None
+        }
+        if op:
+            claude_dict["seven_day_opus"] = {
+                "remaining_pct": _rem(op),
+                "resets_in": _reset_in(op),
+                "resets_at": op.get("resets_at")
+            }
+        if so:
+            claude_dict["seven_day_sonnet"] = {
+                "remaining_pct": _rem(so),
+                "resets_in": _reset_in(so),
+                "resets_at": so.get("resets_at")
+            }
+            
+    rotator_dict = {}
+    if agy_rotator:
+        rotator_dict["accounts"] = []
+        for email, r in agy_rotator["accounts"].items():
+            rotator_dict["accounts"].append({
+                "email": email,
+                "claude_remaining_pct": safe_float(r.get("quota_claude")),
+                "gemini_pro_remaining_pct": safe_float(r.get("quota_gemini_pro")),
+                "gemini_flash_remaining_pct": safe_float(r.get("quota_gemini_flash"))
+            })
+        rotator_dict["summary"] = agy_rotator["stats"]
+        
+    glm_dict = {}
+    if glm_data:
+        if "file_marker" in glm_data:
+            glm_dict["file_marker"] = glm_data["file_marker"]
+        else:
+            for k, v in glm_data.items():
+                glm_dict[k] = v
+    else:
+        glm_dict["state"] = "no local usage source (429 reset time only visible on rate-limit)"
+        
+    codex_dict = {}
+    if codex_data:
+        codex_dict["account_present"] = codex_data.get("account_present", False)
+        codex_dict["email"] = codex_data.get("email")
+        rate_limits = codex_data.get("rate_limits")
+        if rate_limits:
+            codex_dict["primary_window"] = rate_limits.get("primary_window")
+            codex_dict["secondary_window"] = rate_limits.get("secondary_window")
+        else:
+            codex_dict["primary_window"] = None
+            codex_dict["secondary_window"] = None
+            if codex_data.get("account_present"):
+                codex_dict["state"] = "1 account, no local usage source"
+                
+    or_dict = {
+        "state": "not configured yet (pending setup)",
+        "stub": True
+    }
+    
+    output = {
+        "native_claude": claude_dict or None,
+        "agy_rotator": rotator_dict or None,
+        "glm": glm_dict or None,
+        "openai_codex": codex_dict or None,
+        "openrouter": or_dict
+    }
+    print(json.dumps(output, indent=2))
+
+def segment_view(native_claude, agy_rotator, glm_data, codex_data):
+    claude_parts = []
+    if native_claude:
+        fh_pct = _rem(native_claude.get("five_hour"))
+        sd_pct = _rem(native_claude.get("seven_day"))
+        if fh_pct is not None:
+            claude_parts.append(f"5h {fh_pct:.0f}%")
+        if sd_pct is not None:
+            claude_parts.append(f"7d {sd_pct:.0f}%")
+            
+    claude_str = "claude " + " · ".join(claude_parts) if claude_parts else "claude n/a"
+    
+    agy_claude_str = "agy-claude n/a"
+    if agy_rotator and "stats" in agy_rotator:
+        median_c = agy_rotator["stats"]["claude"]["median"]
+        if median_c is not None:
+            agy_claude_str = f"agy-claude {median_c:.0f}%"
+            
+    glm_str = get_glm_segment_str(glm_data)
+    codex_str = get_codex_segment_str(codex_data)
+    or_str = "or n/a"
+    
+    print(f"{claude_str} | {agy_claude_str} | {glm_str} | {codex_str} | {or_str}")
+
+def main():
+    mode = ""
+    if len(sys.argv) > 1:
+        mode = sys.argv[1]
+        
+    native_claude = None
+    try:
+        native_claude = get_native_claude_usage(timeout=20)
+    except Exception:
+        pass
+        
+    agy_rotator = None
+    try:
+        agy_rotator = get_agy_rotator_usage()
+    except Exception:
+        pass
+        
+    glm_data = None
+    try:
+        glm_data = get_glm_usage()
+    except Exception:
+        pass
+        
+    codex_data = None
+    try:
+        codex_data = get_codex_usage()
+    except Exception:
+        pass
+        
+    if mode == "--json":
+        json_view(native_claude, agy_rotator, glm_data, codex_data)
+    elif mode == "--segment":
+        segment_view(native_claude, agy_rotator, glm_data, codex_data)
+    else:
+        human_view(native_claude, agy_rotator, glm_data, codex_data)
+
+if __name__ == "__main__":
+    main()
