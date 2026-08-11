@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""nhq-agent-alive — is a subagent working, or dead?
+
+Written 2026-08-11 after getting this wrong in both directions in one night.
+
+## Why the obvious check is wrong
+
+The first rule was "no bytes in the worktree after 15 minutes means dead". It
+caught a real failure (five batches that were genuinely dead) and then, four
+hours later, killed three agents that were **280,000 tokens deep into correct
+work** — they were reading specs and page objects first, exactly as instructed,
+and had not reached the edit yet.
+
+Worktree bytes measure PROGRESS. They do not measure LIFE. A task whose first
+phase is legitimately reading looks identical to a corpse for its first twenty
+minutes.
+
+## The signal that actually separates the two
+
+**Token consumption.** It is unambiguous:
+
+    dead batch (5x on 2026-08-10):  0 tokens, stopReason=error, 503 from agy
+    live batch (2026-08-11 05:53):  279k / 209k / 126k tokens, stopReason=toolUse
+
+An agent that has consumed tokens is alive. An agent at zero after two minutes
+never reached a model at all, and no amount of waiting will change that.
+
+Usage:
+    nhq-agent-alive                 # every subagent session touched in the last hour
+    nhq-agent-alive AgeGate2 ...    # named agents
+    nhq-agent-alive --since 30      # minutes back to consider (default 60)
+"""
+from __future__ import annotations
+
+import json
+import pathlib
+import sys
+import time
+
+SESSIONS = pathlib.Path.home() / ".omp/agent/sessions"
+
+
+def scan(path: pathlib.Path) -> dict:
+    tokens = 0
+    stops: list[str] = []
+    errors: list[str] = []
+    turns = 0
+    try:
+        text = path.read_text()
+    except OSError:
+        return {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        m = d.get("message")
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        turns += 1
+        tokens += (m.get("usage") or {}).get("totalTokens") or 0
+        if m.get("stopReason"):
+            stops.append(m["stopReason"])
+        if m.get("errorMessage"):
+            errors.append(m["errorMessage"][:80])
+    return {
+        "name": path.stem,
+        "tokens": tokens,
+        "turns": turns,
+        "stop": stops[-1] if stops else "-",
+        "error": errors[-1] if errors else "",
+        "age_min": (time.time() - path.stat().st_mtime) / 60,
+    }
+
+
+def verdict(r: dict) -> tuple[str, str]:
+    err = r["error"].lower()
+    if "exhausted" in err or "no available account" in err or "no capacity" in err:
+        return "DEAD", "provider exhausted — it never reached a model"
+    if r["tokens"] == 0 and r["age_min"] > 2:
+        return "DEAD", "zero tokens — no model was ever called"
+    if r["stop"] == "toolUse":
+        return "WORKING", "mid tool call"
+    if r["tokens"] > 0 and r["stop"] in ("aborted", "cancelled"):
+        return "CANCELLED", "was alive when it was stopped"
+    if r["tokens"] > 0:
+        return "ALIVE", f"{r['tokens']:,} tokens consumed"
+    return "UNKNOWN", ""
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    since = 60
+    if "--since" in argv:
+        i = argv.index("--since")
+        since = int(argv[i + 1])
+        # drop the flag AND its value, or the value is read as an agent name
+        argv = argv[:i] + argv[i + 2:]
+    args = [a for a in argv if not a.startswith("--")]
+
+    files = sorted(SESSIONS.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    rows = []
+    seen: set[str] = set()
+    for f in files:
+        if (time.time() - f.stat().st_mtime) / 60 > since:
+            break
+        if args and f.stem not in args:
+            continue
+        if f.stem in seen:
+            continue
+        seen.add(f.stem)
+        r = scan(f)
+        if r and r["turns"]:
+            rows.append(r)
+
+    if not rows:
+        print("no subagent sessions in the window")
+        return 0
+
+    print(f"{'agent':22} {'verdict':10} {'tokens':>10}  {'turns':>5}  {'age':>6}  why")
+    for r in rows[:25]:
+        v, why = verdict(r)
+        print(f"{r['name'][:22]:22} {v:10} {r['tokens']:>10,}  {r['turns']:>5}  "
+              f"{r['age_min']:>5.1f}m  {why}")
+
+    print("\nDEAD    → cancel and do it by hand; waiting changes nothing")
+    print("WORKING → leave it alone, even with an empty worktree")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
