@@ -107,6 +107,12 @@ DEFAULTS: dict = {
     "whisper_port": 8127,
     "vad_model": str(SHARE_DIR / "models/silero_vad.onnx"),
     "vad_threshold": 0.4,
+    # Second pass — see class Polish for the measurements behind these numbers.
+    "polish": True,
+    "polish_min_sec": 25.0,
+    "polish_model": "gemini-3-flash",
+    "polish_url": "http://127.0.0.1:51200/v1/chat/completions",
+    "polish_timeout_sec": 25.0,
     "modifier_english": "Ctrl",
 }
 
@@ -322,6 +328,81 @@ class KeyWatcher(threading.Thread):
             if time.monotonic() - last_scan > 3.0:      # hotplug
                 self._sync_devices()
                 last_scan = time.monotonic()
+
+
+POLISH_SYSTEM = """You clean up raw Hinglish speech-to-text. Rules, strictly:
+1. KEEP Hinglish exactly as spoken. Romanised Hindi stays romanised. NEVER translate to English, NEVER convert to Devanagari.
+2. Fix ONLY what the transcriber got wrong: punctuation, capitalisation, and obvious mis-hearings that are clear from context.
+3. Break the text into paragraphs where the topic changes.
+4. Do not add, remove, summarise or reword anything the speaker actually said.
+Return only the cleaned text, nothing else."""
+
+
+class Polish:
+    """Second pass: hand the transcript to a small model to punctuate and paragraph it.
+
+    WHY IT EXISTS: whisper writes one long run-on line. On a two-minute dictation
+    that is a wall of text, and the mis-hearings that survive the vocabulary are
+    exactly the ones only context can catch — "mic bilkul mere munh se" came back
+    as "main ek bilkul mere munh se", which no literal rule could ever fix.
+
+    WHY ONLY ON LONG ONES: measured 2026-08-13 against the local agy rotator, the
+    round trip is ~2.5 s of transport plus ~4 s of generation, and it is FLAT —
+    350 characters and 1050 characters both land around 6-8 s. Against 14 days of
+    real usage (41 dictations, median 10.6 s, p90 53.5 s, max 135.5 s) that means:
+
+        10 s dictation ->  4 s becomes 11 s   (2.7x, not worth it)
+        53 s dictation -> 20 s becomes 27 s   (1.35x, clearly worth it)
+
+    So it runs only past `polish_min_sec`. Short commands stay instant; long
+    dictations — the ones that actually need paragraphs — pay proportionally
+    least for them.
+
+    WHY THE LOCAL ROTATOR: `localhost:51200` is the agy router already running on
+    this box. Zero quota across 8 accounts, no auth, and no process to start.
+    Going through the `agy` CLI instead costs 14-16 s of startup alone — measured
+    — which would have doubled the wait for nothing.
+
+    IT FAILS OPEN, ALWAYS. Any error, any timeout, any empty reply and the raw
+    transcript is delivered unchanged. A dictation must never be lost to a
+    cleanup step that is, by definition, optional.
+    """
+
+    def __init__(self, cfg: dict):
+        self.enabled = bool(cfg.get("polish", True))
+        self.min_sec = float(cfg.get("polish_min_sec", 25.0))
+        self.model = str(cfg.get("polish_model", "gemini-3-flash"))
+        self.url = str(cfg.get("polish_url", "http://127.0.0.1:51200/v1/chat/completions"))
+        self.timeout = float(cfg.get("polish_timeout_sec", 25.0))
+
+    def wanted(self, audio_s: float) -> bool:
+        return self.enabled and audio_s >= self.min_sec
+
+    def run(self, text: str) -> str:
+        import urllib.request  # noqa: PLC0415
+        body = json.dumps({
+            "model": self.model,
+            "messages": [{"role": "system", "content": POLISH_SYSTEM},
+                         {"role": "user", "content": text}],
+            "stream": False,
+        }).encode()
+        req = urllib.request.Request(self.url, data=body,
+                                     headers={"Content-Type": "application/json"})
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            data = json.loads(resp.read())
+        out = (data["choices"][0]["message"]["content"] or "").strip()
+        took = time.time() - t0
+
+        # Guard against a model that decides to answer instead of clean. A reply
+        # under half the input length is not a cleanup, it is a summary — and a
+        # summary silently replacing his words is worse than no polish at all.
+        if not out or len(out) < len(text) * 0.5:
+            log(f"polish rejected in {took:.1f}s "
+                f"({len(text)} chars in, {len(out)} out) — keeping raw")
+            return text
+        log(f"polished in {took:.1f}s ({len(text)} -> {len(out)} chars)")
+        return out
 
 
 class SpeechDetector:
@@ -912,6 +993,7 @@ class Vox:
         self.desktop = Desktop(cfg)
         self.overlay = OverlayProc(bool(cfg["overlay"]))
         self.vocab = Vocabulary()
+        self.polish = Polish(self.cfg)
         self.vad = SpeechDetector(cfg)
         # Both engines stay available; each gesture picks one. Neither loads a
         # model until it is actually used, and both unload on the idle timer.
@@ -1262,7 +1344,7 @@ class Vox:
             t0 = time.time()
             text = self.vocab.apply(self.engine.transcribe(samples))
             took = time.time() - t0
-            log(f"transcribed {audio_s:.1f}s in {took:.2f}s "
+            log(f"decoded {audio_s:.1f}s in {took:.2f}s "
                 f"(rtf {took / max(audio_s, .01):.2f}): {text!r}")
 
             if not text:
@@ -1271,6 +1353,26 @@ class Vox:
                     f"VAD found nothing to transcribe")
                 self.desktop.notify("🔇 Kuch samajh nahi aaya", f"{audio_s:.0f}s audio", ms=2500)
                 return
+
+            if self.polish.wanted(audio_s):
+                # Stay red and keep the light travelling: this is still work,
+                # and going green then freezing would read as a hang.
+                self.overlay.send(busy=True)
+                try:
+                    text = self.vocab.apply(self.polish.run(text))
+                except Exception as exc:
+                    log(f"polish failed ({exc}) — delivering the raw transcript")
+                finally:
+                    self.overlay.send(busy=False)
+
+            # `transcribed` is logged HERE, after the polish, not after the
+            # decode — it is the line everything else keys off as "this
+            # dictation is finished". Logged before the polish it lied for the
+            # 6-8 s the second pass takes, and the selftest's `wait_for
+            # transcribed` returned into the middle of it, so the next scenario
+            # started while this one was still working. Caught 2026-08-13 by the
+            # cancel test failing for a reason that had nothing to do with cancel.
+            log(f"transcribed {audio_s:.1f}s: {text!r}")
 
             # The overlay carries no words any more (the caption strip was
             # removed 2026-08-13), so `done` is purely the capture beat.

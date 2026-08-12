@@ -443,7 +443,13 @@ def test_end_to_end() -> None:
         loop.play(BENCH / "long43.wav")
         time.sleep(0.3)
         sock_cmd("stop")
-        wait_for(stamp, "transcribed", 45)
+        # 45 s was enough until the polish pass landed. long43.wav is 43 s of
+        # speech, so it decodes in ~17 s and then polishes for another ~7 s —
+        # and `transcribed` is now logged only once BOTH are done. At 45 s this
+        # wait started returning early, and scenario 4 below then found this
+        # scenario's `transcribed` line inside its own window and failed for a
+        # reason that had nothing to do with cancel. Measured 2026-08-13.
+        wait_for(stamp, "transcribed", 120)
         logs = journal_since(stamp)
         # Two checks lived here — "live caption updates while speaking" and
         # "live caption grows" — counting `preview +Ns Nch` lines in the log.

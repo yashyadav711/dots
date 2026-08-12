@@ -76,3 +76,29 @@ vad_model     = "~/.local/share/vox/models/silero_vad.onnx"
 vad_threshold = 0.4             # raise toward 0.6 if noise still gets through
 
 parakeet_dir  = "~/.config/orca/speech-models/parakeet-tdt-0.6b-v3-int8"
+
+# ── second pass: punctuate and paragraph a long dictation ────────────────────
+# whisper writes one run-on line. On a two-minute dictation that is a wall of
+# text, and the mis-hearings the vocabulary cannot reach are exactly the ones
+# only context catches — "mic bilkul mere munh se" came back as "main ek bilkul
+# mere munh se", which no literal rule could ever fix.
+#
+# Runs through the agy rotator ALREADY RUNNING on this box at localhost:51200 —
+# zero quota across 8 accounts, no auth, nothing to start. Going through the
+# `agy` CLI instead costs 14-16 s of startup alone (measured), which would have
+# doubled the wait for nothing.
+#
+# Only past polish_min_sec, because the round trip is FLAT at ~6-8 s whatever
+# the length (measured: 350 chars 6.0 s, 1050 chars 7.8 s). Against 14 days of
+# real use — 41 dictations, median 10.6 s, p90 53.5 s — that means a 10 s
+# dictation would go 4 s -> 11 s (not worth it) while a 53 s one goes
+# 20 s -> 27 s (clearly worth it).
+#
+# Fails open: any error, timeout, or a reply shorter than half the input (which
+# would be a summary, not a cleanup) and the raw transcript is delivered
+# unchanged. Set polish = false to turn the whole thing off.
+polish             = true
+polish_min_sec     = 25.0       # shorter than this stays instant
+polish_model       = "gemini-3-flash"
+polish_url         = "http://127.0.0.1:51200/v1/chat/completions"
+polish_timeout_sec = 25.0
