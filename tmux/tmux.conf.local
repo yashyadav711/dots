@@ -429,6 +429,50 @@ bind , previous-window
 bind . next-window
 bind R source-file ~/.tmux.conf \; display-message "tmux config reloaded"   # reload moved to prefix R
 
+# Ctrl+Up -> scroll the REAL pane back to your previous message ---------------
+# omp already wraps every user message in OSC 133 prompt marks (verified in the
+# binary: UserMessageComponent emits \e]133;A\a / \e]133;B\a), and tmux >= 3.4
+# can jump between those marks. So the pane genuinely scrolls — no popup, no
+# menu, the actual conversation moves.
+#
+# Root binding fires from the live prompt: entering copy-mode leaves the cursor
+# on the current prompt mark, so the FIRST previous-prompt is a no-op and the
+# second lands on the last message. Measured: scroll_position 0 -> 39 with
+# "QUESTION-12" (the last user message) at the top of the pane. Each further
+# Ctrl+Up inside copy-mode steps one message further up (49, 59, 69...).
+#
+# Escape / a plain click leaves copy-mode and returns to the input box (see
+# copy-mode-type-exit.sh). Ctrl+Down is deliberately left alone.
+bind -n C-Up copy-mode \; send-keys -X previous-prompt \; send-keys -X previous-prompt
+bind -T copy-mode-vi C-Up send-keys -X previous-prompt
+
+# Ctrl+Enter (and every other modified key) only survives the trip through tmux when
+# extended keys are on. With it off, tmux flattens Ctrl+Enter to a bare CR, so omp's
+# `app.message.followUp` never fires — the message just submits. Regression from moving
+# omp INTO tmux: in bare kitty, omp and the terminal speak the kitty keyboard protocol
+# to each other directly and the chord arrives intact.
+#
+# `always`, not `on`, and this is the whole trick. `on` forwards extended keys only to
+# apps that ASK for them, but the two ends speak different dialects: omp requests with
+# `CSI > 1 u` (kitty keyboard protocol) while tmux 3.7b only recognises `CSI > 4 ; 2 m`
+# (xterm modifyOtherKeys) — verified by scanning both binaries 2026-08-12. tmux never
+# hears the request, so `on` stays silently off forever. `always` skips the handshake.
+#
+# `csi-u` format because that is the encoding omp's kitty-protocol parser expects.
+# Measured through a raw-key probe inside this session, extended-keys=always + csi-u:
+#   Ctrl+Enter -> \e[13;5u   Shift+Enter -> \e[13;2u   (both now distinct)
+#   Enter -> \r   Ctrl+C -> \x03   Ctrl+A -> \x01   Escape -> \e   (all unchanged)
+# So legacy control chars are untouched and vim/shell/less keep working; only the
+# chords that previously had NO encoding at all gain one.
+#
+# `extkeys` tells tmux the outer terminal can carry these (kitty 0.47 implements
+# modifyOtherKeys - `screen_modify_other_keys`). Terminal features are computed when a
+# client ATTACHES, so after changing this line you must detach and re-attach; a live
+# client keeps the feature set it was born with and the fix will look like it failed.
+set -s extended-keys always
+set -s extended-keys-format csi-u
+set -as terminal-features 'xterm*:extkeys'
+
 # Bell -> ring + 🔔 on the window tab. omp/Claude ring BEL on completion / needs-you.
 # `any` = ring for EVERY window incl. the active one, so omp's done-bell plays even in the
 # pane you're watching. Switch-noise is NOT from this (it was monitor-activity, now off) —
