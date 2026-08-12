@@ -193,44 +193,55 @@ class WaveStrip(Gtk.ApplicationWindow):
         if s.alpha < 0.01:
             return
 
-        cx, base = w / 2.0, float(h)
+        base = float(h)
         colour = s.colour
 
-        # Bar count follows the screen: edge to edge, always an odd number so
-        # there is a true centre bar.
-        half = max(6, int(w / BAR_PITCH) // 2)
-        bars = half * 2 + 1
+        # One bar per slot, edge to edge. The NEWEST sample is the rightmost bar
+        # and history scrolls left, the way a voice recorder draws.
+        #
+        # It was mirrored around the centre until 2026-08-13 — newest in the
+        # middle, older rippling outward both ways under a cosine height fade.
+        # It looked good and it was lying. Yash: "wo beech mein se chaalu hota
+        # hai, badhta badhta hai aur aakhiri tak chala jaata hai… ye mere voice
+        # ke hisaab se nahi chal raha hai." He was right: the cosine decided the
+        # silhouette, so the shape you saw was the fade, not him. Mirroring also
+        # showed every moment twice, which is why continuous speech read as one
+        # solid block.
+        bars = max(12, int(w / BAR_PITCH))
         pitch = w / bars
-        if s.levels.maxlen < half + 1:
-            s.levels = deque(s.levels, maxlen=half + 1)
+        if s.levels.maxlen < bars:
+            s.levels = deque(s.levels, maxlen=bars)
 
-        glow = cairo.RadialGradient(cx, base, 0, cx, base, w / 2.0)
-        glow.add_color_stop_rgba(0.0, *colour, (0.18 + 0.22 * s.flash) * s.alpha)
-        glow.add_color_stop_rgba(0.45, *colour, (0.07 + 0.10 * s.flash) * s.alpha)
+        glow = cairo.LinearGradient(0, base, 0, base - WAVE_H * 1.6)
+        glow.add_color_stop_rgba(0.0, *colour, (0.16 + 0.22 * s.flash) * s.alpha)
         glow.add_color_stop_rgba(1.0, *colour, 0.0)
         cr.set_source(glow)
         cr.rectangle(0, 0, w, h)
         cr.fill()
 
-        # Bars mirrored around the centre: the newest sample is the middle bar,
-        # older ones ripple outward and fade into nothing at the rim.
         levels = list(s.levels)
-        for i in range(-half, half + 1):
-            d = abs(i)
-            level = levels[d] if d < len(levels) else 0.0
-            fade = math.cos((d / half) * (math.pi / 2)) ** 1.6
-            a = fade * s.alpha
+        for slot in range(bars):
+            age = bars - 1 - slot                 # 0 at the right edge = newest
+            level = levels[age] if age < len(levels) else 0.0
+
+            # Height is the level and NOTHING else, so a bar's tip is where his
+            # voice actually was at that instant. Only the far-left tail fades,
+            # and only in alpha, so old history dissolves without bending the
+            # silhouette.
+            a = s.alpha
+            tail = slot / (bars * 0.28)
+            if tail < 1.0:
+                a *= 0.15 + 0.85 * tail
             if s.shimmer:
-                # distance of this bar from the travelling highlight, wrapped
-                pos = (i + half) / (2 * half)
-                gap = abs(((pos - s.shimmer + 0.5) % 1.0) - 0.5)
+                gap = abs((((slot / bars) - s.shimmer + 0.5) % 1.0) - 0.5)
                 a *= 0.55 + 0.85 * math.exp(-(gap * 9.0) ** 2)
             if a <= 0.004:
                 continue
-            bar_h = max(2.0, level * WAVE_H * (0.45 + 0.55 * fade))
+
+            bar_h = max(2.0, level * WAVE_H)
             cr.set_source_rgba(*colour, a)
             # Rounded on top, running off the bottom of the screen.
-            rounded(cr, cx + i * pitch - BAR_W / 2.0, base - bar_h,
+            rounded(cr, slot * pitch + (pitch - BAR_W) / 2.0, base - bar_h,
                     BAR_W, bar_h + BAR_W, BAR_W / 2.0)
             cr.fill()
 

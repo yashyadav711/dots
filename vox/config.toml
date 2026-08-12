@@ -108,7 +108,11 @@ parakeet_dir  = "~/.config/orca/speech-models/parakeet-tdt-0.6b-v3-int8"
 # would be a summary, not a cleanup) and the raw transcript is delivered
 # unchanged. Set polish = false to turn the whole thing off.
 polish             = true
-polish_min_sec     = 25.0       # shorter than this stays instant
+# 1.5 s, i.e. effectively everything — only misfires are skipped. It was 25 s
+# on the reasoning that a short command should stay instant, and Yash overruled
+# that from experience: "mere ko koi dikkat nahi, tees second bhi wait karna pad
+# jaaye, lekin badhiya tarike se output aaye."
+polish_min_sec     = 1.5
 polish_model       = "gemini-3-flash"
 polish_url         = "http://127.0.0.1:51200/v1/chat/completions"
 polish_timeout_sec = 25.0

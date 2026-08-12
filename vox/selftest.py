@@ -20,6 +20,7 @@ import json
 import math
 import os
 import shutil
+import re
 import subprocess
 import sys
 import time
@@ -334,9 +335,23 @@ class Loopback:
                                       "sink_name=voxselftest"],
                                      capture_output=True, text=True).stdout.strip()
         subprocess.run(["pactl", "suspend-sink", "voxselftest", "0"], capture_output=True)
-        text = self.saved_config
-        text = text.replace('source         = ""', 'source         = "voxselftest.monitor"')
+        # Match whatever the source line currently says, not one literal value.
+        # It was `text.replace('source         = ""', ...)`, which silently
+        # stopped matching on 2026-08-13 when the real config moved to
+        # `source = "rnnoise_source"` — the rewrite became a no-op, the daemon
+        # kept listening to the live denoised mic, and every end-to-end scenario
+        # failed with "abort: no speech" while looking like a dictation bug.
+        text = re.sub(r'^source\s*=\s*"[^"]*"', 'source = "voxselftest.monitor"',
+                      self.saved_config, count=1, flags=re.M)
         text = text.replace('output            = "paste"', 'output            = "clipboard"')
+        # Polish OFF for the end-to-end scenarios. They assert the exact words
+        # that came out of whisper; the polish pass legitimately rewrites
+        # punctuation and adds Markdown (`**Bharat**`), so leaving it on made
+        # them compare a formatted paragraph against a raw transcript and fail
+        # on the formatting. The core path — capture, decode, vocabulary,
+        # deliver — is what these scenarios exist to protect. Polish gets its
+        # own check below, against a fixed string, where it is deterministic.
+        text = re.sub(r'^polish\s*=\s*true', 'polish = false', text, count=1, flags=re.M)
         CONFIG.write_text(text)
         subprocess.run(["systemctl", "--user", "restart", "vox"], capture_output=True)
         time.sleep(3)
@@ -355,8 +370,21 @@ class Loopback:
         time.sleep(2)
 
 
-def clipboard() -> str:
-    return subprocess.run(["wl-paste", "-n"], capture_output=True, text=True, timeout=10).stdout
+def clipboard(expect_not: str = "", tries: int = 20) -> str:
+    """Read the clipboard, waiting briefly for it to actually change.
+
+    `transcribed` is logged a beat before the text is delivered, so a test that
+    waits for that line and reads the clipboard on the next statement can beat
+    `wl-copy` to it — which showed up as the sentinel string still being there
+    and read like a delivery failure. Poll instead of sleeping a fixed amount.
+    """
+    for _ in range(tries):
+        out = subprocess.run(["wl-paste", "-n"], capture_output=True,
+                             text=True, timeout=10).stdout
+        if not expect_not or out.strip() != expect_not:
+            return out
+        time.sleep(0.25)
+    return out
 
 
 def set_clipboard(text: str) -> None:
@@ -418,7 +446,7 @@ def test_end_to_end() -> None:
         check("end-to-end", "vocabulary applied to the result",
               "achchha" not in text and "svaad" not in text,
               "book spellings normalised")
-        delivered = clipboard()
+        delivered = clipboard(expect_not="VOX-SELFTEST-SENTINEL")
         check("end-to-end", "result reaches the clipboard", similar(delivered, EXPECT_HI) >= 0.8,
               repr(delivered.strip()[:48]))
         check("end-to-end", "trailing space added", delivered.endswith(" "),
@@ -526,6 +554,33 @@ def test_system(vd) -> None:
     check("system", "daemon idles small", 0 < rss < 120, f"{rss:.0f} MB")
 
 
+def test_polish() -> None:
+    # The polish pass, checked against a fixed string rather than through a
+    # dictation — the scenarios above run with it off so their assertions
+    # stay about the words, not the formatting. This is the part that can
+    # actually break silently: the local agy rotator not running, the model
+    # name going stale, or the prompt drifting into answering instead of
+    # cleaning.
+    try:
+        import importlib.machinery
+        vx = importlib.machinery.SourceFileLoader(
+            "voxd_polish", str(SHARE / "voxd.py")).load_module()
+        pol = vx.Polish(vx.DEFAULTS)
+        raw = ("mereko teen cheez chahiye ek to markdown format doosra point wise "
+               "aur teesra ye ki mera hinglish waisa hi rahe")
+        out = pol.run(raw)
+        check("polish", "rotator answers", out != raw and len(out) > 20, f"{len(out)} chars")
+        check("polish", "keeps Hinglish romanised",
+              "मैं" not in out and "chahiye" in out.lower(),
+              "no Devanagari, no translation")
+        check("polish", "formats a spoken list as bullets", out.count("\n-") >= 2,
+              f"{out.count(chr(10) + '-')} bullets")
+        check("polish", "never shortens into a summary", len(out) >= len(raw) * 0.5,
+              f"{len(raw)} -> {len(out)} chars")
+    except Exception as exc:
+        check("polish", "rotator answers", False, f"{type(exc).__name__}: {exc}")
+
+
 def main() -> int:
     print(f"\033[1mvox selftest\033[0m — {time.strftime('%Y-%m-%d %H:%M')}")
     if not (BENCH / "hi/mix1_16k.wav").exists():
@@ -542,6 +597,8 @@ def main() -> int:
     test_engines(vd)
     phase("end to end")
     test_end_to_end()
+    phase("polish")
+    test_polish()
     phase("system")
     test_system(vd)
 

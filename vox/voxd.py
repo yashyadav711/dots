@@ -51,12 +51,17 @@ LAYER_SHELL_SO = "/usr/lib/libgtk4-layer-shell.so"
 SAMPLE_RATE = 16000
 # Above this clip length a shortened encoder context makes the decoder loop —
 # see WhisperServerEngine._audio_ctx for the measurements.
-SHRINK_CTX_MAX_SEC = 5.0
+# 0 disables the encoder-window shrink — see WhisperServerEngine._audio_ctx
+# for the sweep that retired it on 2026-08-13.
+SHRINK_CTX_MAX_SEC = 0.0
 # Waveform meter. Bars start moving this far above the room's own noise floor,
 # and reach full height this much above that — 34 dB is roughly the range
 # between a whisper at arm's length and a normal voice at the microphone.
 FLOOR_HEADROOM_DB = 4.0
-LEVEL_SPAN_DB = 28.0
+# The scale's top is measured per-speaker now (see Vox._meter), so there is no
+# fixed span any more — only a floor under how narrow it may collapse, which is
+# what stops a silent room from turning a stray tick into a full-height bar.
+MIN_SPAN_DB = 18.0
 CHUNK_SEC = 0.05
 CHUNK_BYTES = int(SAMPLE_RATE * CHUNK_SEC) * 2   # 16-bit mono
 
@@ -109,7 +114,7 @@ DEFAULTS: dict = {
     "vad_threshold": 0.4,
     # Second pass — see class Polish for the measurements behind these numbers.
     "polish": True,
-    "polish_min_sec": 25.0,
+    "polish_min_sec": 1.5,
     "polish_model": "gemini-3-flash",
     "polish_url": "http://127.0.0.1:51200/v1/chat/completions",
     "polish_timeout_sec": 25.0,
@@ -330,12 +335,20 @@ class KeyWatcher(threading.Thread):
                 last_scan = time.monotonic()
 
 
-POLISH_SYSTEM = """You clean up raw Hinglish speech-to-text. Rules, strictly:
+POLISH_SYSTEM = """You clean up raw Hinglish speech-to-text and format it for reading.
+
+LANGUAGE — never break these:
 1. KEEP Hinglish exactly as spoken. Romanised Hindi stays romanised. NEVER translate to English, NEVER convert to Devanagari.
-2. Fix ONLY what the transcriber got wrong: punctuation, capitalisation, and obvious mis-hearings that are clear from context.
-3. Break the text into paragraphs where the topic changes.
-4. Do not add, remove, summarise or reword anything the speaker actually said.
-Return only the cleaned text, nothing else."""
+2. Fix ONLY what the transcriber got wrong: punctuation, capitalisation, proper nouns, and mis-hearings that are obvious from context.
+3. Do not add, remove, summarise, answer or reword anything the speaker actually said. Every point he made must survive.
+
+FORMAT — make it presentable Markdown:
+4. When he lists things, describes steps, or moves through separate items, write them as `-` bullet points. One idea per bullet.
+5. When he is telling a story or making a single continuous argument, leave it as prose in paragraphs. Do not force bullets onto flowing speech.
+6. Use `**bold**` for names, tools and numbers that matter. Use a `## heading` only if he clearly moved to a new topic.
+7. Keep his voice. This is his message being tidied, not rewritten into a report.
+
+Return only the formatted text, nothing else."""
 
 
 class Polish:
@@ -788,8 +801,27 @@ class WhisperServerEngine:
 
         That 25 s decode on a 9 s window is what froze the live caption for half
         a minute at a time: the model loops, and a looping decode runs to its
-        token limit. So the shrink is kept only where it is measured to be both
-        faster and correct, and everything longer pays the flat ~5 s instead.
+        token limit.
+
+        OFF ENTIRELY since 2026-08-13. The 5 s cap above assumed the shrink was
+        safe below it. Sweeping audio_ctx on one 4.7 s clip whose correct text is
+        "Kya iska svaad achchha hai?" says otherwise:
+
+            0 (full) correct 3.7s   224 correct 0.6s   512 correct
+            192 garbled             256 repeats twice  640 truncated
+            288 "K"                 320 truncated, 10.1s
+            384/448 truncated       768 correct
+
+        No rule, no monotonicity, and it changes with the input. Yash then
+        reported it from the other end without knowing any of this — "agar main
+        chhota sentence bolta hoon to uski quality zyada sahi nahi hai" — and
+        short clips are the only ones the shrink ever touched.
+
+        He also settled the trade himself: "mere ko koi dikkat nahi, tees second
+        bhi wait karna pad jaaye, lekin badhiya tarike se output aaye." So a
+        short clip now pays the flat ~4 s of a full window and is right, instead
+        of taking ~1 s and being a coin toss. Set SHRINK_CTX_MAX_SEC above 0 to
+        bring it back.
         """
         if duration > SHRINK_CTX_MAX_SEC or duration + margin >= 29.0:
             return 0                                  # 0 = full 30 s context
@@ -1129,33 +1161,43 @@ class Vox:
         return samples[start:end]
 
     def _meter(self, db: float) -> float:
-        """Map a block's loudness to a 0..1 bar height, relative to the room.
+        """Map a block's loudness to a 0..1 bar height, scaled to his own voice.
 
-        The old mapping was absolute — `(rms / 0.16) ** 0.6`. It only looked
-        alive with lips on the microphone: measured against a real recording,
-        speech from 40 cm drew 7 pixels of a 32 pixel wave and 1.5 m drew 3,
-        which is the same as the resting line. The microphone was hearing him
-        perfectly well; the display was simply lying about it.
+        The first mapping was absolute — `(rms / 0.16) ** 0.6`. It only looked
+        alive with lips on the microphone: speech from 40 cm drew 7 pixels of a
+        32 pixel wave and 1.5 m drew 3, the same as the resting line.
 
-        Loudness falls off logarithmically with distance — every doubling costs
-        about 6 dB — so the meter works in dB, and against the room's own noise
-        floor rather than a fixed number. Whatever is meaningfully louder than
-        the room reads as speech, whether it is shouted or half a metre away.
+        The second worked in dB above the room's own noise floor, which fixed
+        distance. Then the denoiser landed on 2026-08-13 and broke it the other
+        way: rnnoise takes the room down to near digital silence, so the floor
+        fell to about -70 dB, every syllable measured 50+ dB above it, and with
+        a fixed 28 dB span every bar pinned to full height. Yash: "agar main
+        bolta rehta hoon to wo poora bhara hua hi dikhata rehta hai".
+
+        So the TOP of the scale is measured too, not assumed. Floor is the tenth
+        percentile of the last ten seconds, ceiling the ninetieth — his own
+        quiet and his own loud, whatever the distance and whatever the mic. His
+        normal speech then spans the full height and the shape of it shows.
+
+        A percentile rather than a tracker on both ends, for the same reason as
+        before: an asymmetric attack/decay floor can only crawl upward from its
+        initial guess, so walking into a noisy room left it 15 dB too low and
+        the bars sat at a third height on room tone alone. A percentile has no
+        memory of a guess.
         """
         self.db_hist.append(db)
-        # The floor is the tenth-percentile block of the last ten seconds. An
-        # asymmetric attack/decay tracker was tried first and was wrong: started
-        # at a guess, it can only crawl upward, so walking into an already-noisy
-        # room left the floor 15 dB too low and the bars sat at a third height
-        # on room tone alone. A percentile has no such memory of the guess — it
-        # is simply where the quiet parts of the last ten seconds sit, and the
-        # gaps between syllables keep it honest during continuous speech.
         ordered = sorted(self.db_hist)
         floor = ordered[len(ordered) // 10]
+        ceil = ordered[min(len(ordered) - 1, (len(ordered) * 9) // 10)]
+
+        # MIN_SPAN_DB stops the scale collapsing onto silence. Without it, ten
+        # seconds of a quiet room makes floor and ceiling nearly equal and the
+        # tiniest tick of noise reads as a full-height bar.
+        span = max(ceil - (floor + FLOOR_HEADROOM_DB), MIN_SPAN_DB)
         above = db - (floor + FLOOR_HEADROOM_DB)
         if above <= 0.0:
             return 0.0
-        return min(1.0, above / LEVEL_SPAN_DB) ** 0.7
+        return min(1.0, above / span) ** 0.7
 
     def _read_audio(self) -> None:
         """Pull raw PCM off parecord, feed the level meter, keep the buffer."""
