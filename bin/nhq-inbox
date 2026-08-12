@@ -512,6 +512,20 @@ def cmd_url() -> int:
     return 0
 
 
+def qr_block(url: str) -> None:
+    """Draw the URL as a scannable code, if the terminal can carry one.
+
+    Yash asked for this on `status` too, not just `qr`: the whole point of the
+    box is that the phone reaches it, and reading an IP off one screen to type
+    it into another is the one step that made him not bother. Silent when
+    qrencode is missing or output is piped — a QR in a log file helps nobody.
+    """
+    if not shutil.which("qrencode") or not sys.stdout.isatty():
+        return
+    print()
+    subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "1", url])
+
+
 def cmd_qr() -> int:
     """A QR beats reading an IP off a screen and typing it on a phone."""
     p = port()
@@ -552,10 +566,13 @@ def cmd_status() -> int:
     p = port()
     files = [f for f in DEST.iterdir() if f.is_file()] if DEST.exists() else []
     total = sum(f.stat().st_size for f in files)
+    url = f"http://{lan_ip()}:{p}" if p else ""
     print(f"service : {active}")
-    print(f"url     : http://{lan_ip()}:{p}" if p else "url     : (no port claimed)")
+    print(f"url     : {url}" if url else "url     : (no port claimed)")
     print(f"folder  : {DEST}")
     print(f"files   : {len(files)} ({total/1048576:.1f} MB)")
+    if url and active == "active":
+        qr_block(url)
     return 0 if active == "active" else 1
 
 

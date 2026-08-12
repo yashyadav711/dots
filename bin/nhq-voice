@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""nhq-voice — record voice samples and measure what the transcriber does with them.
+
+    nhq-voice record ["label"]   record one sample; Enter stops it
+    nhq-voice record "x" --secs 8   fixed length, no keyboard needed
+    nhq-voice list               what has been recorded
+    nhq-voice play <n>           listen back
+    nhq-voice transcribe [n]     run sample(s) through the live whisper server
+    nhq-voice truth <n> "..."    record what you actually said, for accuracy
+    nhq-voice rm <n>             delete one
+
+WHY THIS EXISTS: changing anything in the dictation path — the model, the
+vocabulary, batch instead of live decoding, a rewrite pass through an external
+model — is only worth doing if it measurably improves the text. Without a fixed
+set of clips, every "this feels better" is a guess made on a fresh sentence that
+the last version never saw. Record once, re-run forever.
+
+CAPTURE IS DELIBERATELY IDENTICAL TO vox: `parecord --raw --rate=16000
+--channels=1 --format=s16le --latency-msec=50`, honouring the same `source` in
+~/.config/vox/config.toml. A sample recorded through a different mic path, rate
+or denoiser would measure that difference instead of the change under test.
+
+Samples live in ~/.local/share/vox/samples/ as plain 16 kHz mono WAV, with one
+JSON line of metadata each. Nothing here is throwaway — they are the regression
+suite for the ear.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import wave
+from array import array
+from datetime import datetime
+from pathlib import Path
+
+RATE = 16000
+HOME = Path.home()
+DIR = Path(os.environ.get("NHQ_VOICE_DIR", HOME / ".local/share/vox/samples"))
+META = DIR / "samples.jsonl"
+CFG = HOME / ".config/vox/config.toml"
+
+
+def source() -> str:
+    """The mic vox itself would use — an empty value means the system default."""
+    try:
+        for line in CFG.read_text().splitlines():
+            s = line.split("#", 1)[0].strip()
+            if s.startswith("source") and "=" in s:
+                return s.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def whisper_port() -> int:
+    try:
+        for line in CFG.read_text().splitlines():
+            s = line.split("#", 1)[0].strip()
+            if s.startswith("whisper_port") and "=" in s:
+                return int(s.split("=", 1)[1].strip())
+    except (OSError, ValueError):
+        pass
+    return 8127
+
+
+def rows() -> list[dict]:
+    if not META.exists():
+        return []
+    return [json.loads(l) for l in META.read_text().splitlines() if l.strip()]
+
+
+def save(row: dict) -> None:
+    DIR.mkdir(parents=True, exist_ok=True)
+    with META.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def rewrite(all_rows: list[dict]) -> None:
+    META.write_text("".join(json.dumps(r) + "\n" for r in all_rows))
+
+
+def bar(level: float, width: int = 44) -> str:
+    """A level meter, because a recorder with no feedback is a recorder you do
+    not trust. Same reason vox draws a waveform instead of a spinner."""
+    n = min(width, int(level * width))
+    return "█" * n + "·" * (width - n)
+
+
+def rms(chunk: bytes) -> float:
+    """Level of one 16-bit mono chunk, 0..1.
+
+    Hand-rolled because `audioop` was removed from the stdlib in Python 3.13 and
+    this box runs 3.14. `array` reads the frames natively, so a 100 ms chunk is
+    1600 samples — cheap enough to do every frame without numpy.
+    """
+    if not chunk:
+        return 0.0
+    a = array("h")
+    a.frombytes(chunk[: len(chunk) // 2 * 2])
+    if not a:
+        return 0.0
+    return (sum(s * s for s in a) / len(a)) ** 0.5 / 32768.0
+
+
+def cmd_record(label: str, secs: float = 0.0) -> int:
+    DIR.mkdir(parents=True, exist_ok=True)
+    n = len(rows()) + 1
+    label = label or f"sample-{n}"
+    slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in label.lower())[:40]
+    path = DIR / f"{n:02d}-{slug}.wav"
+
+    cmd = ["parecord", "--raw", f"--rate={RATE}", "--channels=1",
+           "--format=s16le", "--latency-msec=50"]
+    if source():
+        cmd += ["-d", source()]
+
+    try:
+        # stderr is captured, never discarded: a mic that will not open is the
+        # single most likely failure here and swallowing the reason wastes the
+        # next twenty minutes.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    except FileNotFoundError:
+        print("nhq-voice: parecord not found — install pipewire-pulse", file=sys.stderr)
+        return 2
+
+    stop = threading.Event()
+    if secs:
+        print(f"\n  ● recording  \033[2m{label}\033[0m")
+        print(f"    bolo… \033[2mstops after {secs}s\033[0m\n")
+        threading.Timer(secs, stop.set).start()
+    elif sys.stdin.isatty():
+        print(f"\n  ● recording  \033[2m{label}\033[0m")
+        print("    bolo… \033[2mEnter = stop\033[0m\n")
+        threading.Thread(target=lambda: (sys.stdin.readline(), stop.set()), daemon=True).start()
+    else:
+        # Enter-to-stop needs a keyboard. Piped or scripted, stdin is at EOF the
+        # instant we read it, which would end the recording before it began.
+        print("nhq-voice: stdin is not a terminal — pass --secs N", file=sys.stderr)
+        proc.terminate()
+        return 2
+
+    frames, started, peak = [], time.time(), 0.0
+    tty = sys.stdout.isatty()
+    try:
+        while not stop.is_set():
+            chunk = proc.stdout.read(3200)          # 100 ms at 16 kHz mono s16
+            if not chunk:
+                break
+            frames.append(chunk)
+            level = rms(chunk)
+            peak = max(peak, level)
+            if tty:
+                # \r only redraws on a terminal; down a pipe it would emit one
+                # line per 100 ms and bury the result.
+                elapsed = time.time() - started
+                sys.stdout.write(f"\r    {bar(min(1.0, level * 4))}  {elapsed:5.1f}s ")
+                sys.stdout.flush()
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    audio = b"".join(frames)
+    got = len(audio) / (RATE * 2)
+    if got < 0.4:
+        err = proc.stderr.read(400).decode("utf-8", "replace").strip()
+        print("\r    nothing recorded" + " " * 34)
+        if err:
+            print(f"    parecord: {err.splitlines()[0]}", file=sys.stderr)
+        return 1
+
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
+        w.writeframes(audio)
+
+    save({"n": n, "label": label, "file": path.name, "seconds": round(got, 2),
+          "peak": round(peak, 3), "at": datetime.now().isoformat(timespec="seconds"),
+          "truth": ""})
+    print(f"\r    \033[32m✓\033[0m saved  {path.name}  {got:.1f}s  peak {peak:.2f}" + " " * 14)
+    print(f"\n    transcribe it:  nhq-voice transcribe {n}")
+    return 0
+
+
+def cmd_list() -> int:
+    rs = rows()
+    if not rs:
+        print("no samples yet — nhq-voice record \"short one\"")
+        return 0
+    print(f"  {'#':>2}  {'secs':>5}  {'peak':>4}  label")
+    for r in rs:
+        mark = "✓" if r.get("truth") else " "
+        print(f"  {r['n']:>2}{mark} {r['seconds']:>6}  {r['peak']:>4}  {r['label']}")
+    print(f"\n  {len(rs)} sample(s) in {DIR}")
+    print("  ✓ = ground truth recorded (nhq-voice truth <n> \"...\")")
+    return 0
+
+
+def cmd_play(n: int) -> int:
+    r = next((x for x in rows() if x["n"] == n), None)
+    if not r:
+        print(f"no sample {n}", file=sys.stderr)
+        return 1
+    return subprocess.run(["paplay", str(DIR / r["file"])]).returncode
+
+
+def transcribe_one(path: Path) -> tuple[str, float]:
+    """Straight at the running whisper-server, the same endpoint voxd posts to."""
+    import urllib.request
+    boundary = "----nhqvoice"
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+            f"filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n").encode()
+    body += path.read_bytes() + b"\r\n"
+    body += (f"--{boundary}\r\nContent-Disposition: form-data; "
+             f"name=\"response_format\"\r\n\r\ntext\r\n").encode()
+    body += f"--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{whisper_port()}/inference", data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        text = resp.read().decode("utf-8", "replace")
+    return " ".join(text.split()).strip(), time.time() - t0
+
+
+def cmd_transcribe(which: int | None) -> int:
+    rs = [r for r in rows() if which is None or r["n"] == which]
+    if not rs:
+        print("nothing to transcribe", file=sys.stderr)
+        return 1
+    fails = 0
+    for r in rs:
+        path = DIR / r["file"]
+        print(f"\n  \033[1m#{r['n']} {r['label']}\033[0m  ({r['seconds']}s)")
+        try:
+            text, took = transcribe_one(path)
+        except Exception as exc:
+            # The server is started lazily by voxd, so a cold box has none.
+            print(f"    \033[31mfailed\033[0m: {exc}", file=sys.stderr)
+            print("    (the whisper server is spawned by voxd — dictate once, "
+                  "or `vox start` then stop, to bring it up)", file=sys.stderr)
+            fails += 1
+            continue
+        rtf = took / r["seconds"] if r["seconds"] else 0
+        print(f"    \033[2m{took:.1f}s  RTF {rtf:.2f}\033[0m")
+        print(f"    {text}")
+        if r.get("truth"):
+            print(f"    \033[2mtruth:\033[0m {r['truth']}")
+    return 1 if fails else 0
+
+
+def cmd_truth(n: int, text: str) -> int:
+    rs = rows()
+    hit = next((x for x in rs if x["n"] == n), None)
+    if not hit:
+        print(f"no sample {n}", file=sys.stderr)
+        return 1
+    hit["truth"] = text
+    rewrite(rs)
+    print(f"  #{n} truth recorded")
+    return 0
+
+
+def cmd_rm(n: int) -> int:
+    rs = rows()
+    hit = next((x for x in rs if x["n"] == n), None)
+    if not hit:
+        print(f"no sample {n}", file=sys.stderr)
+        return 1
+    (DIR / hit["file"]).unlink(missing_ok=True)
+    rewrite([x for x in rs if x["n"] != n])
+    print(f"  #{n} removed")
+    return 0
+
+
+def main() -> int:
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    verb, rest = a[0], a[1:]
+    try:
+        if verb == "record":
+            secs = 0.0
+            if "--secs" in rest:
+                i = rest.index("--secs")
+                secs = float(rest[i + 1])
+                rest = rest[:i] + rest[i + 2:]
+            return cmd_record(" ".join(rest), secs)
+        if verb == "list":       return cmd_list()
+        if verb == "play":       return cmd_play(int(rest[0]))
+        if verb == "transcribe": return cmd_transcribe(int(rest[0]) if rest else None)
+        if verb == "truth":      return cmd_truth(int(rest[0]), " ".join(rest[1:]))
+        if verb == "rm":         return cmd_rm(int(rest[0]))
+    except (IndexError, ValueError):
+        print(f"nhq-voice: bad arguments for `{verb}`", file=sys.stderr)
+        return 2
+    print(f"nhq-voice: unknown verb `{verb}`", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
