@@ -13,8 +13,18 @@ idle_unload_sec = 300           # drop the model from RAM after 5 min idle (0 = 
 threads         = 4             # inference threads
 
 # ── recording ─────────────────────────────────────────────────────────────────
-source         = ""             # "" = system default mic, or a name from
-                                # `pactl list short sources`
+# The DENOISED virtual mic, not the raw one. The HP Envy 13's internal mic sits
+# next to the fan, and on 2026-08-13 dictation stopped working entirely after an
+# hour of whisper benchmarking had the fan running: the room floor measured
+# rms 0.0293 / peak 0.1225 while his voice at arm's length only reached peak
+# 0.08-0.23, so speech never stood out and every session ended
+# "abort: no speech". Through rnnoise_source the same room measures rms 0.0000
+# / peak 0.0008 — a ~150x quieter floor, so normal speech towers over it.
+#
+# The source comes from dots/pipewire/99-input-denoising.conf, which had been
+# sitting symlinked as `.disabled` since hyprvoice was retired. Set to "" to go
+# back to the raw hardware mic.
+source         = "rnnoise_source"
 max_record_sec = 300            # hard stop so a forgotten session cannot run forever
 min_record_sec = 0.35           # shorter than this is treated as a misfire
 

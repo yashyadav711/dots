@@ -1,0 +1,13 @@
+[Unit]
+Description=vox — restore gain on the denoised mic
+Documentation=file://%h/Github/dots/vox/mic-gain.sh
+After=pipewire.service wireplumber.service
+PartOf=pipewire.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/Github/dots/vox/mic-gain.sh
+
+[Install]
+WantedBy=pipewire.service default.target

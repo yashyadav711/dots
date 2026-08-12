@@ -52,6 +52,16 @@ link yazi/package.toml                  "$HOME/.config/yazi/package.toml"  # the
 # new machine. Untracked until 2026-08-13, which meant 1373 lines of voxd.py —
 # and weeks of measured tuning written into its comments — existed on exactly
 # one laptop.
+# The denoised mic. The HP Envy 13's internal mic sits by the fan, and on
+# 2026-08-13 an hour of whisper benchmarking raised the room floor enough that
+# dictation stopped working entirely — every session ended "abort: no speech".
+# Through rnnoise the same room measures a ~150x quieter floor. Needs
+# `noise-suppression-for-voice` for librnnoise_ladspa.so, and the gain unit
+# below, because rnnoise strips the room but does not amplify.
+mkdir -p "$HOME/.config/pipewire/pipewire.conf.d" "$HOME/.config/systemd/user"
+link pipewire/99-input-denoising.conf   "$HOME/.config/pipewire/pipewire.conf.d/99-input-denoising.conf"
+link vox/vox-mic-gain.service           "$HOME/.config/systemd/user/vox-mic-gain.service"
+
 mkdir -p "$HOME/.local/share/vox" "$HOME/.config/vox"
 link vox/voxd.py                        "$HOME/.local/share/vox/voxd.py"
 link vox/voxbar.py                      "$HOME/.local/share/vox/voxbar.py"
