@@ -111,3 +111,12 @@ klod                     = "Claude"
 anthropic                = "Anthropic"
 "t maks"                 = "tmux"
 "t max"                  = "tmux"
+
+# From the video-watching dictation, 2026-08-13. Phrase-scoped on purpose:
+# a bare `cloud = "Claude"` rule would wreck "cloud storage" and "Cloudflare".
+"cloud models"     = "Claude models"
+"cloud model"      = "Claude model"
+"cloud code"       = "Claude Code"
+"notebook lm"      = "NotebookLM"
+"front ear"        = "frontier"
+colibri            = "Colibri"
