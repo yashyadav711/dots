@@ -16,6 +16,42 @@
 #         ompt -c           — any omp flag is passed straight through
 set -euo pipefail
 
+# The editor omp gets for Ctrl+E. SET, not inherited — and that distinction is
+# the whole bug of 2026-08-13.
+#
+# There are three places a stale value can hide, and $VISUAL passed through from
+# the caller loses to all three:
+#   - the tmux SERVER, a daemon that may have started weeks ago and hands its
+#     own frozen environment to every new pane;
+#   - the login shell under the terminal, which is older than any config change
+#     and keeps exporting what it was born with;
+#   - an omp-spawned child, which is handed VISUAL=true on purpose.
+# The first attempt here was `-e VISUAL=${VISUAL:-nhq-editor}`, which faithfully
+# carried the stale `vim` out of a fish shell that predated the config change
+# and pushed it into the new session. A default only fires when the variable is
+# unset; it cannot help when the variable is set to the wrong thing.
+#
+# omp is the only consumer, and there is exactly one right answer for it, so
+# state it. NHQ_OMP_EDITOR is the override for when there genuinely is another.
+VISUAL="${NHQ_OMP_EDITOR:-nhq-editor}"
+
+# `true` is not an editor. omp hands its own children EDITOR=true and VISUAL=true
+# so a subagent can never sit waiting on one, and if ompt is ever launched from
+# inside that environment the value would ride into the tmux session — where git
+# would take it, open nothing, and write empty commit messages without a word of
+# complaint. Anything that is not a real editor falls back to vim.
+case "${EDITOR:-}" in
+	""|true|/bin/true|/usr/bin/true) EDITOR=vim ;;
+esac
+
+# Resolve to an absolute path while we still have this shell's PATH. The tmux
+# pane will not have it: a pane runs its command with the SERVER's PATH, and
+# ~/.local/bin is on it only because an interactive shell put it there. A bare
+# name would be one more thing that works here and quietly fails on a rebuilt
+# machine, which is the exact shape of bug this file already exists to document.
+VISUAL="$(command -v "$VISUAL" 2>/dev/null || echo "$VISUAL")"
+export VISUAL EDITOR
+
 # Already inside tmux (or a plain kitty+tmux window)? Nothing to wrap.
 if [[ -n "${TMUX:-}" ]]; then
 	exec omp "$@"
@@ -24,14 +60,12 @@ fi
 # One session per directory, reattached if it already exists, so closing the
 # Orca tab and reopening it lands back in the same conversation.
 #
-# -e is not optional. A tmux pane inherits the environment of the tmux SERVER —
-# a daemon that may have started weeks ago — not of the shell you launched from.
-# On 2026-08-13 that meant $VISUAL was changed, omp was restarted repeatedly,
-# and Ctrl+E still opened vim, because the server was handing every new pane the
-# VISUAL=vim it had been born with. tmux.conf.local also puts these on
-# update-environment; passing them here as well means a fresh session is right
-# even on a server whose config predates that line.
+# -e is still needed even now that the variables are exported: a tmux pane
+# inherits the SERVER's environment, not the client's, so exporting alone does
+# not reach it. tmux.conf.local also puts both names on update-environment;
+# passing them here means a fresh session is right even on a server whose
+# config predates that line.
 slug=$(basename "$PWD" | tr -c 'A-Za-z0-9_-' '-' | sed 's/-\+$//')
 exec tmux new-session -A -s "omp-${slug:-home}" \
-	-e "VISUAL=${VISUAL:-nhq-editor}" -e "EDITOR=${EDITOR:-vim}" \
+	-e "VISUAL=$VISUAL" -e "EDITOR=$EDITOR" \
 	omp "$@"
