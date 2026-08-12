@@ -50,12 +50,15 @@ matching the rest of the NHQ tooling. Anyone on the WiFi can read the drop
 folder — it is a scratch handover point, keep nothing precious in it. Downloads
 are pinned to that one directory; `..` in a name cannot escape it.
 
-PROMPTS DO HAVE A KEY, and the difference is the point. Moving a file is one
-thing; starting an agent that can run shell commands on this laptop is another,
-and "it's only the home WiFi" is a thin wall to put in front of arbitrary
-execution. The key is generated once into ~/.config/nhq/inbox-token and travels
-in the URL that `nhq-inbox qr` prints, so the phone gets it by scanning and
-never has to see it again. A plain URL still does files and clipboard.
+PROMPTING IS OPEN TOO, by default, on the same reasoning — and note what that
+means: anyone who can reach this port can start an agent that runs shell
+commands on this laptop. It ships open because that is this box's own posture
+and because a key on the panel locked Yash out twice; a QR scanned by the
+camera app opens in that app's browser, and localStorage does not carry across
+to the one he reads in. Turn it on with one line in the unit —
+`Environment=NHQ_INBOX_LOCK=1`, or `NHQ_INBOX_LOCK=1 nhq-inbox start`, which
+writes it there — the day this port is reachable from anything but his WiFi.
+The key then lives in ~/.config/nhq/inbox-token and rides in the QR.
 """
 
 import json
@@ -238,14 +241,40 @@ def token() -> str:
 
 
 def open_mode() -> bool:
-    """NHQ_INBOX_OPEN=1 drops the key and lets anyone on the LAN prompt an agent.
+    """Prompting is open on the LAN unless NHQ_INBOX_LOCK=1 says otherwise.
 
-    Here because it is Yash's call to make, not mine. The default is locked
-    because a prompt runs commands on this laptop and the home WiFi is a thin
-    wall in front of that; but if the key ever costs more than it earns, this is
-    the one line to flip in the unit rather than a patch to the page.
+    This started the other way round and that was me overruling a decision that
+    was already made. The file's own posture is "no auth, this binds to the home
+    LAN, behind the router" — and the clipboard endpoint, which will hand any
+    passer-by whatever Yash last copied, has always sat here unauthenticated.
+    Against that, a key on the prompt box is not the line it looked like.
+
+    What settled it was the cost: it locked him out twice. A QR scanned by the
+    camera app opens in that app's own browser, and localStorage does not cross
+    to the one he actually reads in — so the key was saved somewhere he could
+    not use it, and the panel stayed grey with no way forward that did not
+    involve me telling him the token by hand.
+
+    The lock still exists and still works; it is one line in the unit:
+        Environment=NHQ_INBOX_LOCK=1
+    Worth turning on the day this port is reachable from anything but his own
+    WiFi, because a prompt does run shell commands on this laptop.
+
+    Read from the unit when the variable is not in this process's environment,
+    so `nhq-inbox qr` in a shell agrees with the server started by systemd. The
+    alternative is a QR with no key printed for a server that demands one —
+    silently, and only discovered on the phone.
     """
-    return os.environ.get("NHQ_INBOX_OPEN", "") == "1"
+    env = os.environ.get("NHQ_INBOX_LOCK")
+    if env is None and UNIT_PATH.exists():
+        try:
+            for line in UNIT_PATH.read_text().splitlines():
+                if line.startswith("Environment=NHQ_INBOX_LOCK="):
+                    env = line.split("=", 2)[2].strip()
+                    break
+        except OSError:
+            pass
+    return (env or "") != "1"
 
 
 def agent_where(key: str) -> str:
@@ -703,6 +732,7 @@ After=network-online.target
 [Service]
 Type=simple
 Environment=NHQ_INBOX_PORT={port}
+Environment=NHQ_INBOX_LOCK={lock}
 ExecStart={exe} serve
 Restart=always
 RestartSec=3
@@ -720,7 +750,13 @@ def cmd_start() -> int:
     DEST.mkdir(parents=True, exist_ok=True)
     p = port() or port(claim=True)
     UNIT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    UNIT_PATH.write_text(UNIT_TEXT.format(port=p, exe=os.path.abspath(__file__)))
+    # `NHQ_INBOX_LOCK=1 nhq-inbox start` sticks, rather than applying once and
+    # vanishing on the next restart. Re-running plain `start` keeps whatever the
+    # unit already said, so turning the lock on does not need re-arming daily.
+    UNIT_PATH.write_text(UNIT_TEXT.format(
+        port=p, exe=os.path.abspath(__file__),
+        lock="0" if open_mode() else "1",
+    ))
     sysctl("daemon-reload")
     sysctl("enable", "--now", UNIT)
     sysctl("restart", UNIT)
@@ -736,13 +772,18 @@ def cmd_stop() -> int:
 
 
 def shared_url() -> str | None:
-    """The URL to hand the phone — with the key, so prompting works after one scan.
+    """The URL to hand the phone.
 
-    Not a second URL to remember. A plain `http://ip:port` still serves files
-    and clipboard exactly as before; it just leaves the prompt panel locked.
+    Plain while prompting is open, which is the default — no key to carry, and
+    nothing in the address to leak if the URL is pasted somewhere. It only picks
+    up `?k=` when NHQ_INBOX_LOCK=1 has actually turned locking on, so scanning
+    the QR is still all a device needs in that mode.
     """
     p = port()
-    return f"http://{lan_ip()}:{p}?k={token()}" if p else None
+    if not p:
+        return None
+    base = f"http://{lan_ip()}:{p}"
+    return base if open_mode() else f"{base}?k={token()}"
 
 
 def cmd_url() -> int:
