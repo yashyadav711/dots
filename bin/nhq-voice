@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """nhq-voice — record voice samples and measure what the transcriber does with them.
 
+    nhq-voice test ["label"]     TUI bench: speak -> read -> edit -> see the diff
     nhq-voice record ["label"]   record one sample; Enter stops it
     nhq-voice record "x" --secs 8   fixed length, no keyboard needed
     nhq-voice list               what has been recorded
@@ -25,8 +26,15 @@ JSON line of metadata each. Nothing here is throwaway — they are the regressio
 suite for the ear.
 """
 
+import difflib
+import atexit
 import json
 import os
+import socket
+import re
+import tempfile
+import textwrap
+import shutil
 import subprocess
 import sys
 import threading
@@ -64,6 +72,77 @@ def whisper_port() -> int:
     except (OSError, ValueError):
         pass
     return 8127
+
+
+_OWNED = None          # a whisper-server this process started, to kill on exit
+
+
+def cfg_val(key: str, default: str = "") -> str:
+    try:
+        for line in CFG.read_text().splitlines():
+            s = line.split("#", 1)[0].strip()
+            if s.startswith(key) and "=" in s:
+                return s.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return default
+
+
+def port_open(p: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", p), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_server(say=lambda _s: None) -> int:
+    """Return a port with whisper-server listening, starting one if needed.
+
+    Prefers the daemon's own server when it happens to be up — it is already
+    warm and costs nothing. Otherwise starts a private one on a DIFFERENT port:
+    voxd spawns and owns `whisper_port`, and squatting on it would make his next
+    dictation fail to start its engine. Args are copied from voxd._spawn so the
+    bench measures the same decoder, not a differently-configured one.
+    """
+    global _OWNED
+    live = whisper_port()
+    if port_open(live):
+        return live
+    mine = live + 100
+    if port_open(mine):
+        return mine
+    model = os.path.expanduser(cfg_val("whisper_model"))
+    if not model or not Path(model).exists():
+        raise RuntimeError(f"whisper_model not found: {model!r}")
+    if shutil.which("whisper-server") is None:
+        raise RuntimeError("whisper-server not on PATH (install whisper-cpp)")
+    say("starting whisper server…")
+    args = ["whisper-server", "-m", model,
+            "-t", cfg_val("threads", "4"), "-bs", "1",
+            "-l", cfg_val("whisper_lang", "en"), "-mc", "0", "-nt",
+            "--host", "127.0.0.1", "--port", str(mine)]
+    _OWNED = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    atexit.register(stop_server)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if _OWNED.poll() is not None:
+            raise RuntimeError("whisper-server exited during startup")
+        if port_open(mine):
+            return mine
+        time.sleep(0.3)
+    raise TimeoutError("whisper-server did not come up in 60s")
+
+
+def stop_server() -> None:
+    global _OWNED
+    if _OWNED and _OWNED.poll() is None:
+        _OWNED.terminate()
+        try:
+            _OWNED.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            _OWNED.kill()
+    _OWNED = None
 
 
 def rows() -> list[dict]:
@@ -208,7 +287,7 @@ def cmd_play(n: int) -> int:
     return subprocess.run(["paplay", str(DIR / r["file"])]).returncode
 
 
-def transcribe_one(path: Path) -> tuple[str, float]:
+def transcribe_one(path: Path, port: int | None = None) -> tuple[str, float]:
     """Straight at the running whisper-server, the same endpoint voxd posts to."""
     import urllib.request
     boundary = "----nhqvoice"
@@ -219,7 +298,7 @@ def transcribe_one(path: Path) -> tuple[str, float]:
              f"name=\"response_format\"\r\n\r\ntext\r\n").encode()
     body += f"--{boundary}--\r\n".encode()
     req = urllib.request.Request(
-        f"http://127.0.0.1:{whisper_port()}/inference", data=body,
+        f"http://127.0.0.1:{port or whisper_port()}/inference", data=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=300) as resp:
@@ -237,12 +316,11 @@ def cmd_transcribe(which: int | None) -> int:
         path = DIR / r["file"]
         print(f"\n  \033[1m#{r['n']} {r['label']}\033[0m  ({r['seconds']}s)")
         try:
-            text, took = transcribe_one(path)
+            text, took = transcribe_one(path, ensure_server())
         except Exception as exc:
             # The server is started lazily by voxd, so a cold box has none.
             print(f"    \033[31mfailed\033[0m: {exc}", file=sys.stderr)
-            print("    (the whisper server is spawned by voxd — dictate once, "
-                  "or `vox start` then stop, to bring it up)", file=sys.stderr)
+            print("    (could not reach or start whisper-server)", file=sys.stderr)
             fails += 1
             continue
         rtf = took / r["seconds"] if r["seconds"] else 0
@@ -277,6 +355,326 @@ def cmd_rm(n: int) -> int:
     return 0
 
 
+# ── the test bench ───────────────────────────────────────────────────────────
+
+class Vocab:
+    """Port of voxd's Vocabulary, so the bench shows what dictation ACTUALLY
+    produces. Without the same [fix] pass the bench would judge the raw model
+    and every rule already in vocabulary.toml would read as an error."""
+
+    def __init__(self) -> None:
+        self.rules: list[tuple[re.Pattern, str]] = []
+        path = HOME / ".config/vox/vocabulary.toml"
+        if not path.exists():
+            return
+        try:
+            import tomllib
+            data = tomllib.loads(path.read_text())
+        except Exception:
+            return
+        for src, dst in sorted(data.get("fix", {}).items(), key=lambda kv: -len(kv[0])):
+            src = str(src).strip()
+            if src:
+                pat = r"\b" + r"\s+".join(re.escape(w) for w in src.split()) + r"\b"
+                self.rules.append((re.compile(pat, re.IGNORECASE), str(dst)))
+
+    def apply(self, text: str) -> str:
+        for pattern, replacement in self.rules:
+            def sub(m, r=replacement):
+                found = m.group(0)
+                if found[:1].isupper() and r[:1].islower():
+                    return r[:1].upper() + r[1:]
+                return r
+            text = pattern.sub(sub, text)
+        return text
+
+
+def word_diff(before: str, after: str) -> tuple[list, list, int]:
+    """Word-level diff. Returns (was_spans, now_spans, changed_count).
+
+    A span is (text, kind) with kind in {same, gone, new}. Word level rather
+    than character level because the thing being measured is a transcriber: it
+    gets whole words wrong, and a character diff of "yash"→"Yash" would report
+    one character when the useful unit is one word.
+    """
+    a, b = before.split(), after.split()
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    was, now, changed = [], [], 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            was.append((" ".join(a[i1:i2]), "same"))
+            now.append((" ".join(b[j1:j2]), "same"))
+        else:
+            if i2 > i1:
+                was.append((" ".join(a[i1:i2]), "gone"))
+            if j2 > j1:
+                now.append((" ".join(b[j1:j2]), "new"))
+            changed += max(i2 - i1, j2 - j1)
+    return was, now, changed
+
+
+def wer(before: str, after: str) -> float:
+    a, b = before.split(), after.split()
+    if not b:
+        return 0.0
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    edits = sum(max(i2 - i1, j2 - j1)
+                for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal")
+    return 100.0 * edits / len(b)
+
+
+def cmd_test(label: str) -> int:
+    try:
+        import curses
+    except ImportError:
+        print("nhq-voice: curses unavailable", file=sys.stderr)
+        return 2
+    return curses.wrapper(_bench, label)
+
+
+def _bench(scr, label: str) -> int:
+    import curses
+    curses.curs_set(0)
+    scr.nodelay(True)
+    curses.use_default_colors()
+    for i, fg in enumerate((curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_RED,
+                            curses.COLOR_YELLOW), start=1):
+        curses.init_pair(i, fg, -1)
+    ACCENT, GREEN, RED, AMBER = (curses.color_pair(i) for i in range(1, 5))
+    DIM = curses.A_DIM
+
+    state = {"phase": "ready", "raw": "", "edited": "", "secs": 0.0,
+             "took": 0.0, "levels": [], "path": None, "err": "", "label": label}
+    vocab = Vocab()
+
+    def draw() -> None:
+        scr.erase()
+        h, w = scr.getmaxyx()
+        if h < 12 or w < 50:
+            scr.addstr(0, 0, "terminal too small"[: max(0, w - 1)])
+            scr.refresh()
+            return
+        rule = "─" * (w - 2)
+
+        head = {"ready": "ready", "recording": "● recording",
+                "transcribing": "transcribing…", "review": "review",
+                "diff": "diff", "saved": "saved"}[state["phase"]]
+        scr.addstr(0, 1, "nhq-voice", curses.A_BOLD)
+        scr.addstr(0, 11, "· dictation test", DIM)
+        right = ""
+        if state["phase"] == "recording":
+            right = f"{state['secs']:.1f}s"
+        elif state["took"]:
+            rtf = state["took"] / state["secs"] if state["secs"] else 0
+            right = f"{state['secs']:.1f}s spoken · {state['took']:.1f}s decode · RTF {rtf:.2f}"
+        scr.addstr(0, max(12, w - len(right) - 2), right[: w - 14], DIM)
+        scr.addstr(1, 1, rule, DIM)
+
+        y = 3
+        if state["phase"] in ("ready", "recording"):
+            scr.addstr(y, 2, head, AMBER | curses.A_BOLD if state["phase"] == "recording" else DIM)
+            y += 2
+            # A scrolling waveform, not a spinner: it is the one thing that
+            # proves the mic is live before you have any text to look at.
+            blocks = " ▁▂▃▄▅▆▇█"
+            span = w - 6
+            hist = state["levels"][-span:]
+            line = "".join(blocks[min(8, int(v * 8 * 4))] for v in hist)
+            scr.addstr(y, 3, line[:span], ACCENT)
+            y += 2
+        if state["phase"] == "transcribing":
+            scr.addstr(y, 2, head, AMBER)
+            y += 2
+        if state["err"]:
+            for ln in textwrap.wrap(state["err"], w - 6)[:3]:
+                scr.addstr(y, 3, ln, RED)
+                y += 1
+            y += 1
+
+        def block(title, text, attr=0, colour=None):
+            nonlocal y
+            if y >= h - 3:
+                return
+            scr.addstr(y, 2, title, DIM | curses.A_BOLD)
+            y += 1
+            for ln in textwrap.wrap(text or "—", w - 6)[: max(1, (h - y - 4) // 2)]:
+                if y >= h - 3:
+                    break
+                scr.addstr(y, 3, ln, colour or attr)
+                y += 1
+            y += 1
+
+        if state["phase"] in ("review", "saved") and state["raw"]:
+            block("TRANSCRIPT", state["edited"] or state["raw"])
+        if state["phase"] == "diff":
+            was, now, changed = word_diff(state["raw"], state["edited"])
+            pct = wer(state["raw"], state["edited"])
+            scr.addstr(y, 2, f"{changed} word(s) changed · WER {pct:.1f}%",
+                       (GREEN if changed == 0 else AMBER) | curses.A_BOLD)
+            y += 2
+            for title, spans, bad in (("WAS", was, RED), ("NOW", now, GREEN)):
+                if y >= h - 4:
+                    break
+                scr.addstr(y, 2, title, DIM | curses.A_BOLD)
+                y += 1
+                x = 3
+                for text, kind in spans:
+                    for word in text.split():
+                        if x + len(word) + 1 > w - 3:
+                            y += 1
+                            x = 3
+                            if y >= h - 4:
+                                break
+                        scr.addstr(y, x, word, bad | curses.A_BOLD if kind != "same" else DIM)
+                        x += len(word) + 1
+                y += 2
+
+        keys = {
+            "ready": "space  start        q  quit",
+            "recording": "space  stop         q  cancel",
+            "transcribing": "",
+            "review": "e  edit        r  re-record        s  save        q  quit",
+            "diff": "e  edit again   s  save as truth     r  re-record   q  quit",
+            "saved": "r  another      q  quit",
+        }[state["phase"]]
+        scr.addstr(h - 2, 1, rule, DIM)
+        scr.addstr(h - 1, 2, keys[: w - 4], DIM)
+        scr.refresh()
+
+    def record() -> None:
+        cmd = ["parecord", "--raw", f"--rate={RATE}", "--channels=1",
+               "--format=s16le", "--latency-msec=50"]
+        if source():
+            cmd += ["-d", source()]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, bufsize=0)
+        except FileNotFoundError:
+            state["err"] = "parecord not found — install pipewire-pulse"
+            state["phase"] = "ready"
+            return
+        state.update(phase="recording", levels=[], secs=0.0, raw="", edited="",
+                     took=0.0, err="")
+        frames, t0 = [], time.time()
+        while True:
+            draw()
+            if scr.getch() in (ord(" "), ord("q"), 27):
+                break
+            chunk = proc.stdout.read(3200)
+            if not chunk:
+                break
+            frames.append(chunk)
+            state["levels"].append(rms(chunk))
+            state["secs"] = time.time() - t0
+            if state["secs"] > 300:
+                break
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+        audio = b"".join(frames)
+        state["secs"] = len(audio) / (RATE * 2)
+        if state["secs"] < 0.4:
+            err = proc.stderr.read(300).decode("utf-8", "replace").strip()
+            state["err"] = f"nothing recorded — {err.splitlines()[0] if err else 'mic gave no audio'}"
+            state["phase"] = "ready"
+            return
+
+        # Write the WAV BEFORE transcribing. The recording is the expensive,
+        # unrepeatable half; a transcriber that is down must never cost it.
+        #
+        # It lands in a temp file, not the sample library: a bench run you decide
+        # not to keep would otherwise leave a WAV that `list` never shows, since
+        # only saved runs get a metadata line. Kept until save, then moved in.
+        path = Path(tempfile.mkstemp(suffix=".wav", prefix="nhq-voice-bench-")[1])
+        with wave.open(str(path), "wb") as wv:
+            wv.setnchannels(1); wv.setsampwidth(2); wv.setframerate(RATE)
+            wv.writeframes(audio)
+        state["path"] = path
+
+        state["phase"] = "transcribing"
+        draw()
+        try:
+            def say(msg):
+                state["err"] = msg
+                draw()
+            port = ensure_server(say)
+            state["err"] = ""
+            text, took = transcribe_one(path, port)
+            state["raw"] = vocab.apply(text)
+            state["took"] = took
+            state["phase"] = "review"
+        except Exception as exc:
+            state["err"] = (f"transcribe failed: {exc} — audio is safe at "
+                            f"{path.name}. Dictate once with Alt×2 to start the "
+                            f"whisper server, then re-run.")
+            state["phase"] = "ready"
+
+    def edit() -> None:
+        base = state["edited"] or state["raw"]
+        tmp = Path(tempfile.mkstemp(suffix=".txt", prefix="nhq-voice-")[1])
+        tmp.write_text(base + "\n")
+        curses.def_prog_mode()
+        curses.endwin()
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vim"
+        subprocess.run([editor, str(tmp)])
+        curses.reset_prog_mode()
+        scr.clear()
+        state["edited"] = tmp.read_text().strip()
+        tmp.unlink(missing_ok=True)
+        state["phase"] = "diff" if state["edited"] != state["raw"] else "review"
+
+    def do_save() -> None:
+        # NOT named save(): it calls the module-level save() and would recurse.
+        n = len(rows()) + 1
+        lbl = state["label"] or f"bench-{n}"
+        slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in lbl.lower())[:40]
+        DIR.mkdir(parents=True, exist_ok=True)
+        final = DIR / f"{n:02d}-{slug}.wav"
+        shutil.move(str(state["path"]), final)
+        state["path"] = final
+        save_row = {
+            "n": n, "label": lbl,
+            "file": final.name,
+            "seconds": round(state["secs"], 2),
+            "peak": round(max(state["levels"] or [0]), 3),
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "raw": state["raw"],
+            "truth": state["edited"] or state["raw"],
+            "wer": round(wer(state["raw"], state["edited"] or state["raw"]), 2),
+        }
+        save(save_row)
+        state["phase"] = "saved"
+
+    while True:
+        draw()
+        ch = scr.getch()
+        if ch == -1:
+            time.sleep(0.05)
+            continue
+        key = chr(ch) if 32 <= ch < 127 else ""
+        if key == "q":
+            return 0
+        if state["phase"] in ("ready", "saved") and (key == " " or key == "r"):
+            record()
+        elif state["phase"] == "review":
+            if key == "e":
+                edit()
+            elif key == "r":
+                record()
+            elif key == "s":
+                do_save()
+        elif state["phase"] == "diff":
+            if key == "e":
+                edit()
+            elif key == "r":
+                record()
+            elif key == "s":
+                do_save()
+
+
 def main() -> int:
     a = sys.argv[1:]
     if not a or a[0] in ("-h", "--help"):
@@ -291,6 +689,7 @@ def main() -> int:
                 secs = float(rest[i + 1])
                 rest = rest[:i] + rest[i + 2:]
             return cmd_record(" ".join(rest), secs)
+        if verb == "test":       return cmd_test(" ".join(rest))
         if verb == "list":       return cmd_list()
         if verb == "play":       return cmd_play(int(rest[0]))
         if verb == "transcribe": return cmd_transcribe(int(rest[0]) if rest else None)
