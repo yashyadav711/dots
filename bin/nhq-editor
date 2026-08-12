@@ -7,10 +7,13 @@
 # comes back. Yash asked for it "aadhi screen inside the input box where i write
 # prompt" — the draft should open where the draft already is.
 #
-# omp runs inside tmux here (see ~/.local/bin/ompt), so the split IS the answer:
-# a pane across the bottom half, exactly where the input box sits, with the
-# conversation still readable above it. Outside tmux there is nothing to split,
-# so it just runs nvim.
+# omp runs inside tmux here (see ompt), so the split IS the answer: a pane across
+# the bottom half, exactly where the input box sits, with the conversation still
+# readable above it. Outside tmux there is nothing to split, so it just runs nvim.
+#
+# `q` to save and quit is NOT set here. It was, briefly, as a <buffer> mapping on
+# the draft — then Yash asked for it in every nvim, so it belongs in the nvim
+# config and there is no reason to say it twice. See lua/polish.lua.
 #
 # WHY IT POLLS: `tmux split-window` returns the moment the pane is created, but
 # omp must not read the file back until the editor has actually saved and quit.
@@ -23,19 +26,19 @@ EDITOR_CMD="${NHQ_EDITOR:-nvim}"
 SPLIT="${NHQ_EDITOR_SPLIT:-50}"          # percent of the window height
 
 if [ -z "${TMUX:-}" ] || ! command -v tmux >/dev/null 2>&1; then
-  exec "$EDITOR_CMD" "$@"
+	exec "$EDITOR_CMD" "$@"
 fi
 
-# -d keeps focus where it is for a beat, then we select explicitly; splitting
-# with focus already moved makes tmux occasionally report the OLD pane id.
+# -c so the editor starts in the draft's own directory; the pane id comes back
+# on stdout and is the only handle we need.
 pane=$(tmux split-window -v -l "${SPLIT}%" -P -F '#{pane_id}' \
        -c "$(dirname -- "${1:-$PWD}")" "$EDITOR_CMD" "$@" 2>/dev/null) || {
-  exec "$EDITOR_CMD" "$@"
+	exec "$EDITOR_CMD" "$@"
 }
 tmux select-pane -t "$pane" 2>/dev/null
 
 # Wait for the editor's pane to close. 0.1 s is under the eye's notice and costs
 # nothing — this process is doing nothing else.
 while tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx -- "$pane"; do
-  sleep 0.1
+	sleep 0.1
 done
