@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# nhq-editor — what $VISUAL points at, so Ctrl+E in omp opens nvim in a split.
+#
+# omp's external-editor chord writes the draft to a temp file, runs $VISUAL on
+# it, and reads it back when the editor exits. Left as plain `nvim`, that editor
+# takes the whole terminal: the conversation vanishes, you write blind, and it
+# comes back. Yash asked for it "aadhi screen inside the input box where i write
+# prompt" — the draft should open where the draft already is.
+#
+# omp runs inside tmux here (see ~/.local/bin/ompt), so the split IS the answer:
+# a pane across the bottom half, exactly where the input box sits, with the
+# conversation still readable above it. Outside tmux there is nothing to split,
+# so it just runs nvim.
+#
+# WHY IT POLLS: `tmux split-window` returns the moment the pane is created, but
+# omp must not read the file back until the editor has actually saved and quit.
+# So the pane id is captured and watched until it disappears. A fifo handshake
+# was the alternative and is worse — it leaves a file to clean up if nvim is
+# killed, whereas a pane that is gone is gone.
+set -uo pipefail
+
+EDITOR_CMD="${NHQ_EDITOR:-nvim}"
+SPLIT="${NHQ_EDITOR_SPLIT:-50}"          # percent of the window height
+
+if [ -z "${TMUX:-}" ] || ! command -v tmux >/dev/null 2>&1; then
+  exec "$EDITOR_CMD" "$@"
+fi
+
+# -d keeps focus where it is for a beat, then we select explicitly; splitting
+# with focus already moved makes tmux occasionally report the OLD pane id.
+pane=$(tmux split-window -v -l "${SPLIT}%" -P -F '#{pane_id}' \
+       -c "$(dirname -- "${1:-$PWD}")" "$EDITOR_CMD" "$@" 2>/dev/null) || {
+  exec "$EDITOR_CMD" "$@"
+}
+tmux select-pane -t "$pane" 2>/dev/null
+
+# Wait for the editor's pane to close. 0.1 s is under the eye's notice and costs
+# nothing — this process is doing nothing else.
+while tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx -- "$pane"; do
+  sleep 0.1
+done

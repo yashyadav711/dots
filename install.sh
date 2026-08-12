@@ -40,6 +40,11 @@ for f in "$DOTS"/fish/functions/*.fish; do [ -e "$f" ] && link "fish/functions/$
 for f in "$DOTS"/hypr/*;               do [ -e "$f" ] && link "hypr/$(basename "$f")"             "$HOME/.config/hypr/$(basename "$f")"; done
 link gtk-3.0/settings.ini               "$HOME/.config/gtk-3.0/settings.ini"
 link kitty/kitty.conf                 "$HOME/.config/kitty/kitty.conf"
+# The notification chime. dunst.conf points its [notify-sound] rule at the
+# script; the script and the re-cut wav both live here so a rebuilt machine does
+# not go back to the clipped, aplay-at-full-hardware-volume original.
+link dunst/notify-sound.sh              "$HOME/.config/dunst/notify-sound.sh"
+link dunst/service-login.wav            "$HOME/.config/dunst/service-login.wav"
 link vim/vimrc                        "$HOME/.vimrc"
 link nvim                             "$HOME/.config/nvim"   # AstroNvim (full IDE); vim/vi stay minimal
 link rofi/spotlight.rasi                "$HOME/.config/rofi/spotlight.rasi"

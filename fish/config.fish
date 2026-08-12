@@ -48,8 +48,18 @@ set -U fish_user_paths $HOME/.bin $HOME/.local/bin $HOME/Applications $fish_user
 #end
 
 # Environment variables for editors
+#
+# EDITOR stays plain vim: it is what git and other line-oriented tools grab, and
+# for a commit message a minimal fast editor is the right tool.
+#
+# VISUAL is the "give me a real editor" variable, and it is what omp reads first
+# for Ctrl+E. It points at nhq-editor, which opens nvim in a tmux split across
+# the bottom half of the window — where the input box already is — so the
+# conversation stays readable while you write. Outside tmux it is just nvim.
+# Yash, 2026-08-13: "vim nahi nvim khulna chahiye, aur wo bhi aadhi screen
+# inside the input box where i write prompt."
 set -x EDITOR vim
-set -x VISUAL vim
+set -x VISUAL nhq-editor
 set -x TERM kitty
 
 # Antigravity CLI — route through rotator proxy
