@@ -375,7 +375,11 @@ class Vocab:
         for src, dst in sorted(data.get("fix", {}).items(), key=lambda kv: -len(kv[0])):
             src = str(src).strip()
             if src:
-                pat = r"\b" + r"\s+".join(re.escape(w) for w in src.split()) + r"\b"
+                # Same punctuation tolerance as voxd's Vocabulary — see the note
+                # there. A bench that matched differently would grade a text the
+                # daemon never produces.
+                pat = (r"\b" + r"[\s,.;:!?\-\u2013\u2014]+".join(
+                    re.escape(w) for w in src.split()) + r"\b")
                 self.rules.append((re.compile(pat, re.IGNORECASE), str(dst)))
 
     def apply(self, text: str) -> str:

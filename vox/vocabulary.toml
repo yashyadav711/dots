@@ -78,3 +78,18 @@ url            = "URL"
 cli            = "CLI"
 mcp            = "MCP"
 qa             = "QA"
+
+# ── NHQ names, from the 2026-08-13 dictation test ────────────────────────────
+# Yash read a list of the terms he actually uses out loud. These are what came
+# back wrong. Every one is a proper noun the model has never seen — exactly what
+# this file is for, and the one thing prompt-biasing was measured to be bad at.
+"net runners"      = "Netrunners"
+"net runner"       = "Netrunners"
+netrunners         = "Netrunners"
+netrunner          = "Netrunners"
+"net runners hq"   = "NetrunnersHQ"
+"netrunners hq"    = "NetrunnersHQ"
+"h quarter"        = "HQ"
+"hq quarter"       = "HQ"
+"google analyzed"  = "Google Analytics"
+"google analytic"  = "Google Analytics"

@@ -146,7 +146,14 @@ class Vocabulary:
             src = str(src).strip()
             if not src:
                 continue
-            pattern = r"\b" + r"\s+".join(re.escape(w) for w in src.split()) + r"\b"
+            # Words are joined by whitespace OR punctuation, not whitespace
+            # alone. Whisper inserts commas and full stops wherever it hears a
+            # pause, so a two-word rule written `"hey daddy"` silently stopped
+            # matching the moment it decoded "hey, daddy" — which is most of the
+            # time. Measured 2026-08-13 on a real dictation: the HeyDaddy rule
+            # had been in this file for weeks and had never once fired on speech.
+            pattern = (r"\b" + r"[\s,.;:!?\-\u2013\u2014]+".join(
+                re.escape(w) for w in src.split()) + r"\b")
             self.rules.append((re.compile(pattern, re.IGNORECASE), str(dst)))
         log(f"vocabulary: {len(self.rules)} fixes")
 
