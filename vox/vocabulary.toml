@@ -93,3 +93,21 @@ netrunner          = "Netrunners"
 "hq quarter"       = "HQ"
 "google analyzed"  = "Google Analytics"
 "google analytic"  = "Google Analytics"
+
+# ── second dictation test, 2026-08-13 (1 m from the mic, spoken fast) ────────
+# Yash read his tool names out loud again. Everything here came back wrong and
+# is a proper noun the model has never seen — which is exactly what this file
+# is for, and the one thing initial-prompt biasing was measured to be bad at.
+"head id"                = "HeyDaddy"
+"head idea"              = "HeyDaddy"
+headquarter              = "HQ"
+headquarters             = "HQ"
+"netrunners headquarter" = "NetrunnersHQ"
+"open ai"                = "OpenAI"
+openai                   = "OpenAI"
+jamini                   = "Gemini"
+jemini                   = "Gemini"
+klod                     = "Claude"
+anthropic                = "Anthropic"
+"t maks"                 = "tmux"
+"t max"                  = "tmux"

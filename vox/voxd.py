@@ -137,7 +137,19 @@ class Vocabulary:
         try:
             data = tomllib.loads(path.read_text())
         except Exception as exc:
+            # LOUD, not just logged. One duplicate key — easy to add, since the
+            # file is grouped by topic and the same word can plausibly belong to
+            # two groups — makes tomllib refuse the whole document, and every
+            # rule in it silently stops firing. Happened while adding names on
+            # 2026-08-13: "netrunners hq" was already there, and all 85 rules
+            # went dead with one line in the journal that nobody reads.
             log(f"vocabulary error, ignoring it: {exc}")
+            try:
+                Desktop().notify("⚠️ vox vocabulary band hai",
+                                 f"{path.name} parse nahi hui — koi fix apply nahi hoga. "
+                                 f"{exc}", "critical")
+            except Exception:
+                pass
             return
 
         import re  # noqa: PLC0415
