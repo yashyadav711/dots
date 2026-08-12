@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# ompt — start omp inside tmux so Ctrl+Up genuinely scrolls the chat back to
+# your previous message.
+#
+# Why this exists: omp already marks every user message with OSC 133 prompt
+# marks, but only the thing that OWNS the scrollback can jump to them. Orca's
+# terminal cannot (xterm.js with no prompt-jump action, and `orca terminal *`
+# exposes no scroll command — checked 2026-08-11). tmux can, so running omp
+# under tmux gives Ctrl+Up real scrolling in ANY terminal, Orca included.
+#
+# The binding lives in dots/tmux/tmux.conf.local:
+#   bind -n C-Up copy-mode \; send-keys -X previous-prompt \; send-keys -X previous-prompt
+#   bind -T copy-mode-vi C-Up send-keys -X previous-prompt
+#
+# Usage:  ompt              — omp in this directory, wrapped in tmux
+#         ompt -c           — any omp flag is passed straight through
+set -euo pipefail
+
+# Already inside tmux (or a plain kitty+tmux window)? Nothing to wrap.
+if [[ -n "${TMUX:-}" ]]; then
+	exec omp "$@"
+fi
+
+# One session per directory, reattached if it already exists, so closing the
+# Orca tab and reopening it lands back in the same conversation.
+slug=$(basename "$PWD" | tr -c 'A-Za-z0-9_-' '-' | sed 's/-\+$//')
+exec tmux new-session -A -s "omp-${slug:-home}" omp "$@"

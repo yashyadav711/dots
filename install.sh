@@ -81,6 +81,10 @@ link tmux/.tmux.conf.local            "$HOME/.tmux.conf.local"
 link bin/agyq           "$HOME/.local/bin/agyq"
 link bin/agy-snapshot   "$HOME/.local/bin/agy-snapshot"
 link bin/agy-usage      "$HOME/.local/bin/agy-usage"
+# ompt — omp wrapped in tmux. The fish `omp` function calls it, and it is what
+# makes Ctrl+Up scrollback and the Ctrl+E split editor possible at all: omp owns
+# its terminal and cannot put anything beside itself, so the multiplexer has to.
+link bin/ompt           "$HOME/.local/bin/ompt"
 
 # NHQ Fleet Kit + P4 safety + P5 econ/ctx — per-file symlinks into ~/.local/bin.
 #
