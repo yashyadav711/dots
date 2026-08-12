@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# nhq-bot notify --event <blocked|failed|completed> --title <text> — Send a private Telegram terminal-state notification.
+set -uo pipefail
+
+CONFIG_PATH="${NHQ_BOT_CONFIG:-$HOME/.config/nhq/telegram-bot.env}"
+API_BASE="${NHQ_BOT_API_BASE:-https://api.telegram.org}"
+
+usage() {
+  cat <<'EOF'
+Usage: nhq-bot notify --event <blocked|failed|completed> --title <text> [options]
+       nhq-bot relay  --text <text> | --file <path>
+
+notify — send a private Telegram notification for a terminal agent state.
+relay  — send a message body VERBATIM, with no header and no markup parsing.
+         Use when the message is meant to be copied out of Telegram and pasted
+         somewhere else; notify's status header would come with it.
+
+Options:
+  --event <blocked|failed|completed>  Terminal state (required)
+  --title <text>                      Headline (required, non-empty)
+  --body <text>                       Optional detail body
+  --url <text>                        Optional reference URL
+  --agent <text>                      Optional agent name
+  --runtime <text>                    Optional runtime identifier
+  --help                              Show this help
+
+Credentials are read from ~/.config/nhq/telegram-bot.env (mode 0600 or stricter).
+
+Exit codes:
+  0  Telegram confirmed delivery (.ok == true)
+  1  Transport, invalid-response, or Telegram API failure
+  2  Usage or configuration error
+EOF
+}
+
+# Usage/config error: exit 2. Messages never include credential values.
+die_config() {
+  printf 'nhq-bot: %s\n' "$1" >&2
+  printf "Run 'nhq-bot --help' for usage.\n" >&2
+  exit 2
+}
+
+# Delivery error: exit 1. Never prints the token, chat id, URL, or raw response.
+die_delivery() {
+  printf 'nhq-bot: delivery failed: %s\n' "$1" >&2
+  exit 1
+}
+
+# Escape untrusted text for Telegram HTML parse mode (& first). The \& guards
+# against bash 5.2+ treating a bare & in the replacement as the matched text.
+html_escape() {
+  local s="$1"
+  s="${s//&/\&amp;}"
+  s="${s//</\&lt;}"
+  s="${s//>/\&gt;}"
+  s="${s//\"/\&quot;}"
+  printf '%s' "$s"
+}
+
+# Populates globals TELEGRAM_BOT_TOKEN and NHQ_TELEGRAM_CHAT_ID. Never sources
+# the file and never echoes either value.
+load_credentials() {
+  [ -f "$CONFIG_PATH" ] || die_config "missing credentials file: $CONFIG_PATH"
+
+  local perms
+  perms="$(stat -c '%a' "$CONFIG_PATH" 2>/dev/null)" \
+    || die_config "cannot read credentials file permissions"
+  # Reject any group or other permission bit (octal mask 0077); this accepts
+  # owner-only modes such as 0400, 0600, and 0700 while rejecting exposures
+  # like 0402 or 0640 that a plain numeric comparison would let through.
+  [[ "$perms" =~ ^[0-7]+$ ]] 2>/dev/null \
+    || die_config "cannot read credentials file permissions"
+  (( (0$perms & 0077) == 0 )) \
+    || die_config "credentials file must not be group- or world-accessible"
+
+  local token="" chat_id="" line seen_token=0 seen_chat=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    case "$line" in
+      \#*) continue ;;
+      TELEGRAM_BOT_TOKEN=*)
+        [ "$seen_token" -eq 1 ] && die_config "duplicate TELEGRAM_BOT_TOKEN in credentials file"
+        token="${line#TELEGRAM_BOT_TOKEN=}"
+        seen_token=1
+        ;;
+      NHQ_TELEGRAM_CHAT_ID=*)
+        [ "$seen_chat" -eq 1 ] && die_config "duplicate NHQ_TELEGRAM_CHAT_ID in credentials file"
+        chat_id="${line#NHQ_TELEGRAM_CHAT_ID=}"
+        seen_chat=1
+        ;;
+      *)
+        die_config "unexpected line in credentials file"
+        ;;
+    esac
+  done < "$CONFIG_PATH"
+
+  [ "$seen_token" -eq 1 ] || die_config "TELEGRAM_BOT_TOKEN missing from credentials file"
+  [ "$seen_chat" -eq 1 ] || die_config "NHQ_TELEGRAM_CHAT_ID missing from credentials file"
+  [ -n "$token" ] || die_config "TELEGRAM_BOT_TOKEN is empty"
+  [ -n "$chat_id" ] || die_config "NHQ_TELEGRAM_CHAT_ID is empty"
+  [[ "$chat_id" =~ ^[1-9][0-9]*$ ]] || die_config "NHQ_TELEGRAM_CHAT_ID must be a positive integer"
+
+  TELEGRAM_BOT_TOKEN="$token"
+  NHQ_TELEGRAM_CHAT_ID="$chat_id"
+}
+
+# send_plain — POST a message body to Telegram with NO CLI-owned markup.
+# `notify` wraps every message in a bold status header, which is right for an
+# agent notification and wrong for anything Yash needs to copy out and paste
+# somewhere else. `relay` exists for that second case: what goes in is exactly
+# what lands in the chat, so a long-press copy gives a clean paste.
+# Telegram hard-rejects a sendMessage body over 4096 characters with a bare
+# HTTP 400, so a long relay is split here rather than failing. Splitting is on
+# blank lines first and single newlines second, never mid-sentence, because the
+# whole point of relay is that the text is read and pasted by a human.
+send_plain() {
+  local text="$1"
+  local limit=3900          # headroom under 4096 for multi-byte characters
+  if [ "${#text}" -gt "$limit" ]; then
+    local rest="$text" chunk cut
+    while [ "${#rest}" -gt "$limit" ]; do
+      chunk="${rest:0:$limit}"
+      cut="$(printf '%s' "$chunk" | grep -bo $'\n\n' | tail -1 | cut -d: -f1)"
+      [ -z "$cut" ] && cut="$(printf '%s' "$chunk" | grep -bo $'\n' | tail -1 | cut -d: -f1)"
+      [ -z "$cut" ] && cut="$limit"
+      send_one "${rest:0:$cut}"
+      rest="${rest:$cut}"
+      # drop the leading newlines the split left behind
+      while [ "${rest:0:1}" = $'\n' ]; do rest="${rest:1}"; done
+    done
+    [ -n "$rest" ] && send_one "$rest"
+    return 0
+  fi
+  send_one "$text"
+}
+
+send_one() {
+  local text="$1"
+  load_credentials
+  command -v jq >/dev/null 2>&1 || die_delivery "jq is required"
+
+  # These are GLOBALS on purpose. The EXIT trap fires after this function has
+  # returned, so function-locals would already be out of scope and `set -u`
+  # would abort the cleanup with "unbound variable".
+  RELAY_PAYLOAD_FILE="$(mktemp)" || die_delivery "cannot create request payload"
+  RELAY_CURL_CONFIG="$(mktemp)" || die_delivery "cannot create curl config"
+  trap 'rm -f "${RELAY_PAYLOAD_FILE:-}" "${RELAY_CURL_CONFIG:-}"' EXIT
+  chmod 600 "$RELAY_PAYLOAD_FILE" "$RELAY_CURL_CONFIG"
+
+  # No parse_mode: the body is delivered verbatim, so Markdown/HTML characters
+  # in a drafted message can never be interpreted or rejected as bad markup.
+  jq -cn --arg chat_id "$NHQ_TELEGRAM_CHAT_ID" --arg text "$text" \
+    '{chat_id:$chat_id,text:$text}' \
+    >"$RELAY_PAYLOAD_FILE" || die_delivery "cannot encode request"
+
+  printf 'url = "%s"\nrequest = "POST"\n' \
+    "$API_BASE/bot${TELEGRAM_BOT_TOKEN}/sendMessage" >"$RELAY_CURL_CONFIG"
+
+  local response
+  response="$(curl --silent --show-error --fail-with-body --config "$RELAY_CURL_CONFIG" \
+    --header 'Content-Type: application/json' --data-binary "@$RELAY_PAYLOAD_FILE")" \
+    || die_delivery "Telegram request failed"
+
+  printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1 \
+    || die_delivery "Telegram API rejected the relay message"
+}
+
+main() {
+  [ $# -gt 0 ] || die_config "no command given"
+
+  # A bare --help / -h before the subcommand prints usage and exits 0.
+  case "$1" in
+    --help|-h) usage; exit 0 ;;
+    notify) shift ;;
+    relay)
+      shift
+      local relay_text="" relay_file="" seen_relay=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --help|-h) usage; exit 0 ;;
+          --text)
+            [ "$seen_relay" -eq 1 ] && die_config "pass only one of --text/--file"
+            [ $# -ge 2 ] || die_config "missing value for --text"
+            relay_text="$2"; seen_relay=1; shift 2 ;;
+          --file)
+            [ "$seen_relay" -eq 1 ] && die_config "pass only one of --text/--file"
+            [ $# -ge 2 ] || die_config "missing value for --file"
+            relay_file="$2"; seen_relay=1; shift 2 ;;
+          *) die_config "unknown relay option: $1" ;;
+        esac
+      done
+      if [ -n "$relay_file" ]; then
+        [ -r "$relay_file" ] || die_config "cannot read --file: $relay_file"
+        relay_text="$(cat "$relay_file")"
+      fi
+      [ -n "$relay_text" ] || die_config "relay needs --text or a non-empty --file"
+      send_plain "$relay_text"
+      exit 0 ;;
+    *) die_config "unknown command: $1" ;;
+  esac
+
+  local event="" title="" body="" url="" agent="" runtime=""
+  local seen_event=0 seen_title=0 seen_body=0 seen_url=0 seen_agent=0 seen_runtime=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help|-h) usage; exit 0 ;;
+      --event)
+        [ "$seen_event" -eq 1 ] && die_config "duplicate --event"
+        [ $# -ge 2 ] || die_config "missing value for --event"
+        event="$2"; seen_event=1; shift 2 ;;
+      --title)
+        [ "$seen_title" -eq 1 ] && die_config "duplicate --title"
+        [ $# -ge 2 ] || die_config "missing value for --title"
+        title="$2"; seen_title=1; shift 2 ;;
+      --body)
+        [ "$seen_body" -eq 1 ] && die_config "duplicate --body"
+        [ $# -ge 2 ] || die_config "missing value for --body"
+        body="$2"; seen_body=1; shift 2 ;;
+      --url)
+        [ "$seen_url" -eq 1 ] && die_config "duplicate --url"
+        [ $# -ge 2 ] || die_config "missing value for --url"
+        url="$2"; seen_url=1; shift 2 ;;
+      --agent)
+        [ "$seen_agent" -eq 1 ] && die_config "duplicate --agent"
+        [ $# -ge 2 ] || die_config "missing value for --agent"
+        agent="$2"; seen_agent=1; shift 2 ;;
+      --runtime)
+        [ "$seen_runtime" -eq 1 ] && die_config "duplicate --runtime"
+        [ $# -ge 2 ] || die_config "missing value for --runtime"
+        runtime="$2"; seen_runtime=1; shift 2 ;;
+      --*) die_config "unknown flag: $1" ;;
+      *) die_config "unexpected argument: $1" ;;
+    esac
+  done
+
+  [ "$seen_event" -eq 1 ] || die_config "missing required --event"
+  [ "$seen_title" -eq 1 ] || die_config "missing required --title"
+  [ -n "$title" ] || die_config "--title must not be empty"
+
+  local header
+  case "$event" in
+    blocked)   header="🛑 BLOCKED" ;;
+    failed)    header="❌ FAILED" ;;
+    completed) header="✅ COMPLETED" ;;
+    *) die_config "invalid --event: must be blocked, failed, or completed" ;;
+  esac
+
+  # Build only CLI-owned markup around HTML-escaped, caller-provided fields.
+  local message
+  message="<b>$header · $(html_escape "$title")</b>"
+
+  local meta=""
+  [ -n "$agent" ]   && meta="Agent: $(html_escape "$agent")"
+  if [ -n "$runtime" ]; then
+    [ -n "$meta" ] && meta="$meta · "
+    meta="${meta}Runtime: $(html_escape "$runtime")"
+  fi
+  [ -n "$meta" ] && message="$message"$'\n'"$meta"
+
+  [ -n "$body" ] && message="$message"$'\n\n'"$(html_escape "$body")"
+  [ -n "$url" ]  && message="$message"$'\n\n'"$(html_escape "$url")"
+
+  load_credentials
+
+  command -v jq >/dev/null 2>&1 || die_delivery "jq is required"
+
+  local payload_file curl_config
+  payload_file="$(mktemp)" || die_delivery "cannot create request payload"
+  curl_config="$(mktemp)" || die_delivery "cannot create curl config"
+  trap 'rm -f "$payload_file" "$curl_config"' EXIT
+  chmod 600 "$payload_file" "$curl_config"
+
+  jq -cn --arg chat_id "$NHQ_TELEGRAM_CHAT_ID" --arg text "$message" \
+    --arg parse_mode HTML '{chat_id:$chat_id,text:$text,parse_mode:$parse_mode}' \
+    >"$payload_file" || die_delivery "cannot encode request"
+
+  # The token-bearing endpoint lives only in a mode-600 curl config file, so it
+  # never appears in curl's process arguments.
+  printf 'url = "%s"\nrequest = "POST"\n' \
+    "$API_BASE/bot${TELEGRAM_BOT_TOKEN}/sendMessage" >"$curl_config"
+
+  local response
+  response="$(curl --silent --show-error --fail-with-body --config "$curl_config" \
+    --header 'Content-Type: application/json' --data-binary "@$payload_file")" \
+    || die_delivery "Telegram request failed"
+
+  if ! printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+    local desc
+    desc="$(printf '%s' "$response" | jq -r '.description // empty' 2>/dev/null)" || desc=""
+    # Strip any markup from the API description before surfacing it.
+    desc="$(printf '%s' "$desc" | sed 's/<[^>]*>//g')"
+    if [ -n "$desc" ]; then
+      die_delivery "Telegram API rejected the request: $desc"
+    fi
+    die_delivery "Telegram API returned an error or invalid response"
+  fi
+
+  exit 0
+}
+
+main "$@"
