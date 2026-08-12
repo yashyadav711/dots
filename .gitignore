@@ -7,3 +7,10 @@ fish/private.fish
 # firecrawl rotator key store (lives at ~/.config/firecrawl-keys — never commit a key)
 firecrawl-keys
 firecrawl-rotator-keys*
+
+# Python bytecode caches. 14 of these were tracked until 2026-08-12, so every
+# run of a Python tool in bin/ dirtied the tree and they turned up in unrelated
+# diffs. They are regenerated on import and machine-specific — nothing depends
+# on them being in the repo.
+__pycache__/
+*.pyc
