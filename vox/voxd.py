@@ -332,11 +332,27 @@ class SpeechDetector:
     by inventing words — fifteen seconds of an empty room reliably came back as
     `"Haan."`
 
-    whisper.cpp's own `--vad` was tried second and fixed the noise, but it
-    silently discards anything shorter than about three seconds — real speech
-    included, so `"theek hai"` produced nothing at all. Running the same model
-    here instead means short utterances survive and whisper is simply never
-    handed a clip with no voice in it.
+    whisper.cpp's own `--vad` was tried second and rejected. RE-MEASURED
+    2026-08-13 against this exact model, because the option is tempting every
+    time someone reads the help text — it now needs a GGML VAD model
+    (`ggml-silero-v5.1.2.bin`, kept beside the others; the ONNX one here is for
+    sherpa and whisper-server refuses it with "bad magic"):
+
+        clip                 no VAD              --vad
+        5 s of room tone     "Haan."  (invented)  ""        <- VAD wins
+        1.2 s "Kya?"         "Kya?"               ""        <- VAD LOSES
+        4.7 s sentence       correct, 2.1 s       correct, 1.8 s
+        11.7 s, mostly pad   correct, 1.8 s       correct, 1.8 s
+
+    So the original verdict holds, and now with numbers: `--vad` does kill the
+    empty-room hallucination, but it eats short utterances whole — "theek hai",
+    "haan", "next" come back as nothing. And it buys no speed, because whisper
+    processes a 30 s window either way.
+
+    Running silero here instead gets both: `has_speech` has a shape test below
+    1.5 s specifically so short commands survive, and whisper is simply never
+    handed a clip with no voice in it. Do not "simplify" this by switching to
+    `--vad`.
     """
 
     def __init__(self, cfg: dict):
