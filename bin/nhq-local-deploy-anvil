@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+# nhq-local-deploy-anvil — bring the whole Anvil stack up locally and PROVE it works,
+# then print exactly where to click and what to log in with.
+#
+#   nhq-local-deploy-anvil            # up (default)
+#   nhq-local-deploy-anvil up         # start Supabase + dashboard, verify, print the card
+#   nhq-local-deploy-anvil down       # stop the dashboard and the Supabase containers
+#   nhq-local-deploy-anvil status     # what is running right now
+#   nhq-local-deploy-anvil reset      # wipe the DB, re-apply migrations, reseed, re-verify
+#   nhq-local-deploy-anvil scan       # run the agent against THIS machine and show findings
+#   nhq-local-deploy-anvil logs       # tail the dashboard dev server log
+#   nhq-local-deploy-anvil verify     # run the full gate suite (no servers needed)
+#
+# Flags:  --no-dash    Supabase only, skip the dashboard
+#         --port N     dashboard port (default 3111; 3000 is left free for other work)
+#         --fresh      force a `supabase db reset` during up
+#
+# ── Why this script verifies instead of just starting things ─────────────────
+# On 2026-08-12 the entire dashboard was non-functional locally and every
+# automated gate was green. `custom_access_token_hook` (migration 0004) was
+# never registered in supabase/config.toml, so GoTrue never called it; and its
+# body raised Postgres 42702 on every call anyway, so it had never executed
+# successfully once. No JWT carried an `org_id` claim. Every RLS policy filters
+# on `auth.jwt() ->> 'org_id'`, so all of them evaluated false and EVERY logged
+# in user saw an empty dashboard while their rows sat in the database.
+#
+# "Supabase started" and "Next.js is listening" would both have reported success
+# the whole time. So `up` does not finish on process liveness. It finishes only
+# after it has logged in through the real password grant, decoded the token,
+# confirmed the org_id claim is present, and read actual rows back through RLS.
+# That is the check that would have caught it, so that is the check that gates.
+#
+# Ports: 54321 Supabase API · 54323 Studio · 54322 Postgres · 3111 dashboard.
+set -uo pipefail
+
+ANVIL_DIR="${ANVIL_DIR:-$HOME/Github/nHQ/anvil}"
+DASH_PORT="${ANVIL_DASH_PORT:-3111}"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/nhq-anvil"
+DASH_PID="$RUN_DIR/dashboard.pid"
+DASH_LOG="$RUN_DIR/dashboard.log"
+SEED_USER="alice@alpha.dev"
+SEED_PASS="password123"
+WANT_DASH=1
+FRESH=0
+
+# supabase/config.toml reads these for the GitHub OAuth provider. They only have
+# to be non-empty for the config to parse; local login is email+password.
+export GITHUB_CLIENT_ID="${GITHUB_CLIENT_ID:-placeholder}"
+export GITHUB_CLIENT_SECRET="${GITHUB_CLIENT_SECRET:-placeholder}"
+
+R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[1m'; D=$'\e[2m'; X=$'\e[0m'
+ok()   { printf "  ${G}✓${X} %s\n" "$1"; }
+bad()  { printf "  ${R}✗${X} %s\n" "$1"; }
+warn() { printf "  ${Y}!${X} %s\n" "$1"; }
+step() { printf "\n${B}%s${X}\n" "$1"; }
+die()  { printf "\n${R}${B}FAILED${X} %s\n" "$1" >&2; exit 1; }
+
+mkdir -p "$RUN_DIR"
+
+for a in "$@"; do
+  case "$a" in
+    --no-dash) WANT_DASH=0 ;;
+    --fresh)   FRESH=1 ;;
+    --port)    shift; DASH_PORT="${1:-3111}" ;;
+    --port=*)  DASH_PORT="${a#--port=}" ;;
+  esac
+done
+CMD="${1:-up}"; [[ "$CMD" == -* ]] && CMD="up"
+
+anon_key() { grep -m1 '^NEXT_PUBLIC_SUPABASE_ANON_KEY=' "$ANVIL_DIR/apps/dashboard/.env.local" 2>/dev/null | cut -d= -f2-; }
+sb_up()    { curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:54321/rest/v1/" -H "apikey: $(anon_key)" 2>/dev/null; }
+dash_up()  { curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:$DASH_PORT/" 2>/dev/null; }
+
+# The gate. Logs in for real, decodes the JWT, reads rows back through RLS.
+# Prints "OK <org_id> <devices> <findings>" or "FAIL <reason>".
+probe_login() {
+  local key; key="$(anon_key)"
+  ANON="$key" EMAIL="$SEED_USER" PASS="$SEED_PASS" python3 - <<'PY' 2>/dev/null || echo "FAIL probe crashed"
+import os, json, base64, urllib.request, urllib.error
+
+API, ANON = "http://127.0.0.1:54321", os.environ["ANON"]
+
+def post(path, body):
+    r = urllib.request.Request(API + path, data=json.dumps(body).encode(),
+        headers={"apikey": ANON, "Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(r, timeout=15))
+
+def get(path, tok):
+    r = urllib.request.Request(API + path, headers={"apikey": ANON, "Authorization": "Bearer " + tok})
+    return json.load(urllib.request.urlopen(r, timeout=15))
+
+try:
+    tok = post("/auth/v1/token?grant_type=password",
+               {"email": os.environ["EMAIL"], "password": os.environ["PASS"]}).get("access_token")
+except urllib.error.HTTPError as e:
+    detail = e.read().decode()[:120]
+    print("FAIL login rejected -- " + detail); raise SystemExit
+except Exception as e:
+    print("FAIL auth unreachable -- %s" % e); raise SystemExit
+
+if not tok:
+    print("FAIL no access_token returned"); raise SystemExit
+
+p = tok.split(".")[1]; p += "=" * (-len(p) % 4)
+claims = json.loads(base64.urlsafe_b64decode(p))
+org = claims.get("org_id")
+if not org:
+    print("FAIL org_id claim MISSING -- the access-token hook is not injecting it. "
+          "Check [auth.hook.custom_access_token] in supabase/config.toml and migration 0021."); raise SystemExit
+
+try:
+    d = len(get("/rest/v1/devices?select=id&limit=200", tok))
+    f = len(get("/rest/v1/findings?select=id&limit=200", tok))
+except Exception as e:
+    print("FAIL rls read failed -- %s" % e); raise SystemExit
+
+if d == 0:
+    print("FAIL claim present but 0 devices visible -- RLS is filtering everything out"); raise SystemExit
+print("OK %s %d %d" % (org, d, f))
+PY
+}
+
+wait_for() { # wait_for <fn> <expect> <seconds> <label>
+  local fn="$1" expect="$2" limit="$3" label="$4" i=0
+  while [ "$i" -lt "$limit" ]; do
+    [ "$($fn)" = "$expect" ] && return 0
+    sleep 1; i=$((i+1))
+    [ $((i % 10)) -eq 0 ] && printf "    ${D}waiting for %s (%ss)${X}\n" "$label" "$i"
+  done
+  return 1
+}
+
+stop_dash() {
+  if [ -f "$DASH_PID" ]; then
+    local p; p="$(cat "$DASH_PID")"
+    if kill -0 "$p" 2>/dev/null; then pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; sleep 1; kill -9 "$p" 2>/dev/null; fi
+    rm -f "$DASH_PID"
+  fi
+  # anything else squatting on the port (a dev server from a previous shell)
+  local squat; squat="$(ss -lptnH "sport = :$DASH_PORT" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)"
+  [ -n "$squat" ] && kill "$squat" 2>/dev/null
+  return 0
+}
+
+[ -d "$ANVIL_DIR" ] || die "no Anvil checkout at $ANVIL_DIR (set ANVIL_DIR)"
+cd "$ANVIL_DIR" || die "cannot cd to $ANVIL_DIR"
+
+case "$CMD" in
+
+status)
+  step "Anvil local stack"
+  c=$(docker ps -q --filter name=supabase --filter name=anvil 2>/dev/null | wc -l)
+  [ "$c" -gt 0 ] && ok "Supabase: $c containers up" || bad "Supabase: down"
+  [ "$(sb_up)" = "200" ] && ok "API   http://127.0.0.1:54321 responding" || bad "API   not responding"
+  if [ "$(dash_up)" = "200" ]; then ok "Dash  http://127.0.0.1:$DASH_PORT responding"; else bad "Dash  not responding on :$DASH_PORT"; fi
+  if [ "$c" -gt 0 ]; then
+    r="$(probe_login)"
+    case "$r" in
+      OK*) set -- $r; ok "Login works — org ${2:0:8}…, $3 devices, $4 findings visible" ;;
+      *)   bad "Login gate: ${r#FAIL }" ;;
+    esac
+  fi
+  ;;
+
+down)
+  step "Stopping Anvil"
+  stop_dash && ok "dashboard stopped"
+  supabase stop >/dev/null 2>&1 && ok "Supabase stopped" || warn "Supabase was not running"
+  ;;
+
+reset)
+  step "Resetting the database"
+  [ "$(sb_up)" = "200" ] || die "Supabase is not running — start it first: nhq-local-deploy-anvil up"
+  printf "    ${D}dropping, re-applying 20 migrations, reseeding${X}\n"
+  supabase db reset >/dev/null 2>&1 || die "db reset failed — run 'supabase db reset' to see the error"
+  sleep 5
+  ok "migrations applied and seed loaded"
+  step "Re-running the login gate"
+  r="$(probe_login)"
+  case "$r" in
+    OK*) set -- $r; ok "login works — $3 devices, $4 findings visible through RLS" ;;
+    *)   die "${r#FAIL }" ;;
+  esac
+  ;;
+
+logs)
+  [ -f "$DASH_LOG" ] || die "no dashboard log yet — run: nhq-local-deploy-anvil up"
+  tail -f "$DASH_LOG"
+  ;;
+
+scan)
+  BIN="$ANVIL_DIR/agent/dist/anvil-linux-amd64"
+  if [ ! -x "$BIN" ]; then
+    step "Building the agent"
+    (cd agent && make build >/dev/null 2>&1) || (cd agent && go build -o dist/anvil-linux-amd64 ./cmd/anvil) \
+      || die "agent build failed"
+    ok "built $BIN"
+  fi
+  step "Scanning this machine (offline, no account)"
+  "$BIN" scan
+  ;;
+
+verify)
+  step "Running every gate"
+  fails=0
+  run() { printf "  %-26s" "$1"; shift; if "$@" >/dev/null 2>&1; then printf "${G}PASS${X}\n"; else printf "${R}FAIL${X}\n"; fails=$((fails+1)); fi; }
+  run "agent build"     bash -c 'cd agent && go build ./...'
+  run "agent tests"     bash -c 'cd agent && go test ./...'
+  run "gateway tests"   bash -c 'cd gateway && go test ./...'
+  run "agent selftest"  bash -c 'cd agent && ./dist/anvil-linux-amd64 selftest'
+  run "pack signatures" bash infra/scripts/verify-packs.sh
+  run "pack QA"         bash -c 'cd agent && go run ./cmd/packqa'
+  if [ "$(sb_up)" = "200" ]; then
+    run "org isolation"  bash tooling/security/isolation-test.sh
+    run "V1 smoke"       bash tooling/verify/v1-smoke.sh
+    run "magic moment"   bash tooling/verify/magic-moment.sh
+    run "phase checks"   bash tooling/verify/phase-checks.sh
+  else
+    warn "Supabase down — skipped isolation / smoke / magic-moment / phase checks"
+    warn "run 'nhq-local-deploy-anvil up' first to include them"
+  fi
+  echo
+  [ "$fails" -eq 0 ] && ok "every gate green" || die "$fails gate(s) failed"
+  ;;
+
+up)
+  step "1/5  Preflight"
+  command -v docker   >/dev/null || die "docker not installed"
+  docker info >/dev/null 2>&1    || die "docker daemon is not running"
+  command -v supabase >/dev/null || die "supabase CLI not installed"
+  command -v pnpm     >/dev/null || die "pnpm not installed"
+  [ -f apps/dashboard/.env.local ] || die "apps/dashboard/.env.local missing — the dashboard cannot reach Supabase without it"
+  grep -q '^\[auth.hook.custom_access_token\]' supabase/config.toml \
+    || die "supabase/config.toml has no [auth.hook.custom_access_token] stanza.
+         Without it no JWT carries an org_id claim and every page renders empty.
+         This is the 2026-08-12 defect — see migration 0021."
+  ok "docker, supabase, pnpm, env, auth-hook stanza"
+
+  step "2/5  Supabase"
+  if [ "$(sb_up)" = "200" ] && [ "$FRESH" -eq 0 ]; then
+    ok "already running"
+  else
+    printf "    ${D}starting containers (first run pulls images — can take minutes)${X}\n"
+    supabase start >/dev/null 2>&1
+    wait_for sb_up 200 180 "the Supabase API" || die "Supabase did not come up. Try: supabase stop && supabase start"
+    ok "API up on :54321"
+  fi
+  if [ "$FRESH" -eq 1 ]; then
+    printf "    ${D}resetting database (migrations + seed)${X}\n"
+    supabase db reset >/dev/null 2>&1 || die "db reset failed — run 'supabase db reset' to see why"
+    sleep 5
+    ok "database reset and reseeded"
+  fi
+
+  step "3/5  The gate — does a real login actually work?"
+  probe=""
+  for attempt in 1 2 3; do
+    probe="$(probe_login)"
+    [[ "$probe" == OK* ]] && break
+    [ "$attempt" -lt 3 ] && { printf "    ${D}retry %s/3${X}\n" "$attempt"; sleep 5; }
+  done
+  if [[ "$probe" != OK* ]]; then
+    bad "${probe#FAIL }"
+    echo
+    printf "${Y}This is the failure mode that matters.${X} Supabase is up, but a real user\n"
+    printf "cannot see their own data — which is exactly how the dashboard looked broken\n"
+    printf "on 2026-08-12 while every gate reported green.\n\n"
+    printf "  Most likely fix:  cd %s && supabase db reset\n" "$ANVIL_DIR"
+    printf "  Then check:       migration 0021 applied, and [auth.hook.custom_access_token] enabled\n"
+    die "login gate failed — not printing a dashboard URL that would only show an empty page"
+  fi
+  set -- $probe
+  ORG="$2"; NDEV="$3"; NFIND="$4"
+  ok "logged in as $SEED_USER — org_id claim present"
+  ok "RLS returns real rows: $NDEV devices, $NFIND findings"
+
+  step "4/5  Dashboard"
+  if [ "$WANT_DASH" -eq 0 ]; then
+    warn "skipped (--no-dash)"
+  elif [ "$(dash_up)" = "200" ]; then
+    ok "already running on :$DASH_PORT"
+  else
+    stop_dash
+    # Detach properly. Three things matter here and each one bit once:
+    #   </dev/null   pnpm/next must never inherit our stdin, or a prompt hangs invisibly.
+    #   >log 2>&1    without this the child keeps our stdout open, so `cmd | tail` never
+    #                sees EOF and the caller appears to hang long after we exited.
+    #   setsid       new session, so it survives this shell and Ctrl-C on the caller.
+    # `$!` would capture setsid, not the server, so the pid is resolved from the
+    # listening socket after readiness instead — that is the process `down` must kill.
+    ( cd apps/dashboard && setsid pnpm dev --port "$DASH_PORT" </dev/null >"$DASH_LOG" 2>&1 & )
+    wait_for dash_up 200 120 "Next.js" || {
+      bad "dashboard did not respond on :$DASH_PORT"
+      printf "    ${D}last lines of %s:${X}\n" "$DASH_LOG"; tail -12 "$DASH_LOG" | sed 's/^/      /'
+      die "dashboard failed to start"
+    }
+    listener="$(ss -lptnH "sport = :$DASH_PORT" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)"
+    [ -n "$listener" ] && echo "$listener" >"$DASH_PID"
+    ok "serving on :$DASH_PORT (pid ${listener:-?}, log: $DASH_LOG)"
+  fi
+
+  step "5/5  Ready"
+  cat <<CARD
+
+  ${B}Dashboard${X}   http://127.0.0.1:$DASH_PORT
+  ${B}Login${X}       $SEED_USER  /  $SEED_PASS
+  ${B}Studio${X}      http://127.0.0.1:54323          ${D}(browse the database)${X}
+  ${B}API${X}         http://127.0.0.1:54321
+
+  ${B}Worth looking at, in order${X}
+    /fleet                 the magic moment — $NDEV devices with live compliance scores
+    /findings              $NFIND open findings, each mapped to SOC 2 / EU AI Act
+    /packs                 the 16 signed Security Packs
+    /compliance            auditor-facing evidence view
+    /policies /approvals   V3 enforcement
+    /marketplace /teams    V5 platform surfaces
+
+  ${B}The CLI, on this actual machine${X}
+    nhq-local-deploy-anvil scan       ${D}offline scan, real findings, no account${X}
+
+  ${B}Everything else${X}
+    nhq-local-deploy-anvil verify     ${D}run all the gates${X}
+    nhq-local-deploy-anvil status     ${D}what is up${X}
+    nhq-local-deploy-anvil logs       ${D}tail the dashboard${X}
+    nhq-local-deploy-anvil down       ${D}stop it all${X}
+
+CARD
+  ;;
+
+*)
+  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+  ;;
+esac

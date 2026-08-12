@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# nhq-clip — push text to Yash's system clipboard (Wayland), paste-ready anywhere.
+#
+# Usage:
+#   printf '%s' "content"  | nhq-clip      # preferred for multiline / formatted text
+#   echo "content"         | nhq-clip
+#   nhq-clip "content"                      # short single-shot
+#   nhq-clip < file.txt
+#
+# Sets the REGULAR clipboard (Ctrl+V / right-click Paste) as plain text and trims a
+# trailing newline so it pastes clean into anything (Telegram, browser, editors, forms).
+# The CALLER is responsible for formatting the text as paste-ready plain text (strip
+# markdown noise unless the paste target wants it); this tool just delivers it faithfully.
+#
+# Works from background / tmux / headless agent sessions by discovering the Wayland
+# socket when WAYLAND_DISPLAY isn't in the environment.
+set -uo pipefail
+
+# --- ensure Wayland env so wl-copy can reach the compositor ---
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+  WAYLAND_DISPLAY="$(basename "$(ls -1 "$XDG_RUNTIME_DIR"/wayland-[0-9]* 2>/dev/null \
+    | grep -E 'wayland-[0-9]+$' | head -1)" 2>/dev/null)"
+  export WAYLAND_DISPLAY
+fi
+if [ -z "${WAYLAND_DISPLAY:-}" ] || [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+  echo "nhq-clip: no Wayland display socket found (XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR)" >&2
+  exit 1
+fi
+
+# --- gather content: args win, else stdin ---
+if [ "$#" -gt 0 ]; then
+  content="$*"
+else
+  content="$(cat)"
+fi
+if [ -z "$content" ]; then
+  echo "nhq-clip: nothing to copy (empty input)" >&2
+  exit 1
+fi
+
+# --- copy as plain text, trim trailing newline for a clean paste ---
+if printf '%s' "$content" | wl-copy --type text/plain --trim-newline; then
+  echo "nhq-clip: copied ${#content} chars to clipboard — Ctrl+V to paste anywhere"
+else
+  rc=$?
+  echo "nhq-clip: wl-copy failed (rc=$rc, WAYLAND_DISPLAY=$WAYLAND_DISPLAY)" >&2
+  exit "$rc"
+fi

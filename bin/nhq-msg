@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""nhq-msg — cross-session agent message bus (durable SQLite + tmux doorbell).
+
+The problem this fixes: nhq-tell types into a live TUI (lost if the recipient is
+busy/offline) and the .done marker only says "finished". Separate omp sessions
+share no roster, so Director and ad-hoc sessions can't talk at all.
+
+The fix: one shared SQLite mailbox every agent reads/writes, plus a lightweight
+"doorbell" — a tmux nudge telling the recipient to check its inbox. The PAYLOAD
+is always durable in SQLite; the doorbell is best-effort liveness only. A missed
+doorbell still gets picked up because agents drain their inbox at each turn.
+
+DB: ~/.nhq-fleet/bus.sqlite (WAL).
+
+Commands:
+  nhq-msg send <to> "body" [--kind msg|ask|done|fyi] [--thread T]
+                           [--from NAME] [--priority high] [--no-poke]
+      Store a message for <to> (an agent id, or 'all' to broadcast), then poke.
+  nhq-msg inbox [--unread] [--as NAME] [--json] [--limit N]
+      Show messages addressed to me (+ broadcasts). Marks them read unless --peek.
+  nhq-msg peek [...]        Alias for `inbox --peek` (never marks read).
+  nhq-msg read <id|--all> [--as NAME]     Mark message(s) read.
+  nhq-msg watch [--as NAME] [--poll S]    Block, print new messages as they land.
+  nhq-msg register [--as NAME] [--tmux S] [--repo R]   Announce/refresh presence.
+  nhq-msg agents            List registered agents + last-seen.
+  nhq-msg whoami            Print the resolved identity for this context.
+
+Identity resolution (for --from / --as, most authoritative first):
+  explicit flag  →  $NHQ_AGENT env  →  `nhq-agent-name`  →  ambient tmux session.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+FLEET_DIR = os.path.expanduser("~/.nhq-fleet")
+DB_PATH = os.path.join(FLEET_DIR, "bus.sqlite")
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _tmux_env() -> dict:
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return env
+
+
+def _run(cmd: list[str], timeout: float = 5.0) -> tuple[int, str]:
+    try:
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, env=_tmux_env()
+        )
+        return p.returncode, (p.stdout or "").strip()
+    except Exception:
+        return 1, ""
+
+
+def resolve_identity(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    if os.environ.get("NHQ_AGENT"):
+        return os.environ["NHQ_AGENT"]
+    if shutil.which("nhq-agent-name"):
+        rc, out = _run(["nhq-agent-name"])
+        if rc == 0 and out:
+            return out.splitlines()[0].strip()
+    # ambient tmux session name as last resort
+    rc, out = _run(["tmux", "display-message", "-p", "#{session_name}"])
+    if rc == 0 and out:
+        return out
+    return "unknown"
+
+
+def live_tmux_sessions() -> list[str]:
+    rc, out = _run(["tmux", "list-sessions", "-F", "#{session_name}"])
+    return out.splitlines() if rc == 0 and out else []
+
+
+def resolve_tmux_for(agent: str, db: sqlite3.Connection) -> str | None:
+    """Prefer the registered tmux session; fall back to a fleet-<agent>-* match."""
+    row = db.execute(
+        "SELECT tmux FROM agents WHERE lower(id)=lower(?)", (agent,)
+    ).fetchone()
+    sessions = live_tmux_sessions()
+    if row and row[0] and row[0] in sessions:
+        return row[0]
+    al = agent.lower()
+    for s in sessions:
+        if s.lower() == al or s.lower().startswith(f"fleet-{al}-") or s.lower() == f"fleet-{al}":
+            return s
+    return None
+
+
+def connect() -> sqlite3.Connection:
+    os.makedirs(FLEET_DIR, exist_ok=True)
+    db = sqlite3.connect(DB_PATH, timeout=10.0)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=8000")
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS agents(
+            id         TEXT PRIMARY KEY,
+            tmux       TEXT,
+            repo       TEXT,
+            last_seen  TEXT
+        );
+        CREATE TABLE IF NOT EXISTS messages(
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread     TEXT,
+            from_id    TEXT NOT NULL,
+            to_id      TEXT NOT NULL,
+            kind       TEXT NOT NULL DEFAULT 'msg',
+            body       TEXT NOT NULL,
+            priority   TEXT NOT NULL DEFAULT 'normal',
+            created_at TEXT NOT NULL,
+            read_at    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_msg_to ON messages(lower(to_id), read_at);
+        """
+    )
+    db.commit()
+    return db
+
+
+def upsert_agent(db, agent, tmux=None, repo=None):
+    if not tmux:
+        rc, out = _run(["tmux", "display-message", "-p", "#{session_name}"])
+        tmux = out if rc == 0 and out else None
+    db.execute(
+        """INSERT INTO agents(id,tmux,repo,last_seen) VALUES(?,?,?,?)
+           ON CONFLICT(id) DO UPDATE SET
+             tmux=COALESCE(excluded.tmux, agents.tmux),
+             repo=COALESCE(excluded.repo, agents.repo),
+             last_seen=excluded.last_seen""",
+        (agent, tmux, repo, now()),
+    )
+    db.commit()
+
+
+def doorbell(db, to_id, from_id, kind):
+    """Best-effort tmux nudge. Broadcast pokes every known agent but the sender."""
+    targets = []
+    if to_id.lower() == "all":
+        rows = db.execute(
+            "SELECT id FROM agents WHERE lower(id)<>lower(?)", (from_id,)
+        ).fetchall()
+        targets = [r[0] for r in rows]
+    else:
+        targets = [to_id]
+    poked = []
+    for t in targets:
+        sess = resolve_tmux_for(t, db)
+        if not sess:
+            continue
+        note = f"📬 nhq-msg from {from_id} ({kind}) — run: nhq-msg inbox"
+        _run(["tmux", "send-keys", "-t", sess, "-l", "--", note])
+        _run(["tmux", "send-keys", "-t", sess, "Enter"])
+        poked.append(sess)
+    return poked
+
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+def cmd_send(a):
+    db = connect()
+    frm = resolve_identity(a.sender)
+    upsert_agent(db, frm)
+    db.execute(
+        """INSERT INTO messages(thread,from_id,to_id,kind,body,priority,created_at)
+           VALUES(?,?,?,?,?,?,?)""",
+        (a.thread, frm, a.to, a.kind, a.body, a.priority, now()),
+    )
+    db.commit()
+    mid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    poked = [] if a.no_poke else doorbell(db, a.to, frm, a.kind)
+    tail = f" · poked {', '.join(poked)}" if poked else " · (no live recipient to poke; stored)"
+    print(f"nhq-msg: sent #{mid} {frm} → {a.to} [{a.kind}]{tail}")
+
+
+def _fmt(row) -> str:
+    mid, thread, frm, to, kind, body, prio, created, read = row
+    flag = " " if read else "•"
+    pr = " ‼" if prio == "high" else ""
+    th = f" ({thread})" if thread else ""
+    return f"{flag} #{mid} [{kind}]{pr} {frm} → {to}{th}  {created}\n    {body}"
+
+
+def _inbox_rows(db, me, unread, limit):
+    q = (
+        "SELECT id,thread,from_id,to_id,kind,body,priority,created_at,read_at "
+        "FROM messages WHERE (lower(to_id)=lower(?) OR lower(to_id)='all')"
+    )
+    if unread:
+        q += " AND read_at IS NULL"
+    q += " ORDER BY id DESC LIMIT ?"
+    return db.execute(q, (me, limit)).fetchall()
+
+
+def cmd_inbox(a):
+    db = connect()
+    me = resolve_identity(a.as_)
+    upsert_agent(db, me)
+    rows = _inbox_rows(db, me, a.unread, a.limit)
+    if a.json:
+        keys = ["id", "thread", "from", "to", "kind", "body", "priority", "created_at", "read_at"]
+        print(json.dumps([dict(zip(keys, r)) for r in rows], indent=2))
+    else:
+        if not rows:
+            print(f"nhq-msg: inbox empty for {me}" + (" (no unread)" if a.unread else ""))
+        else:
+            print(f"── inbox: {me} ({len(rows)} shown) ──")
+            for r in reversed(rows):
+                print(_fmt(r))
+    if not a.peek and rows:
+        ids = [r[0] for r in rows if r[8] is None]
+        if ids:
+            db.executemany("UPDATE messages SET read_at=? WHERE id=?", [(now(), i) for i in ids])
+            db.commit()
+
+
+def cmd_read(a):
+    db = connect()
+    me = resolve_identity(a.as_)
+    if a.all:
+        db.execute(
+            "UPDATE messages SET read_at=? WHERE read_at IS NULL AND "
+            "(lower(to_id)=lower(?) OR lower(to_id)='all')",
+            (now(), me),
+        )
+    elif a.id is not None:
+        db.execute("UPDATE messages SET read_at=? WHERE id=?", (now(), a.id))
+    else:
+        print("nhq-msg: read needs <id> or --all", file=sys.stderr)
+        sys.exit(1)
+    db.commit()
+    print(f"nhq-msg: marked read ({'all' if a.all else '#'+str(a.id)}) for {me}")
+
+
+def cmd_watch(a):
+    db = connect()
+    me = resolve_identity(a.as_)
+    upsert_agent(db, me)
+    seen = db.execute(
+        "SELECT COALESCE(MAX(id),0) FROM messages WHERE "
+        "(lower(to_id)=lower(?) OR lower(to_id)='all')",
+        (me,),
+    ).fetchone()[0]
+    print(f"nhq-msg: watching inbox for {me} (Ctrl-C to stop) …")
+    try:
+        while True:
+            rows = db.execute(
+                "SELECT id,thread,from_id,to_id,kind,body,priority,created_at,read_at "
+                "FROM messages WHERE id>? AND (lower(to_id)=lower(?) OR lower(to_id)='all') "
+                "ORDER BY id",
+                (seen, me),
+            ).fetchall()
+            for r in rows:
+                print(_fmt(r))
+                seen = max(seen, r[0])
+            time.sleep(a.poll)
+    except KeyboardInterrupt:
+        print("\nnhq-msg: stopped watching")
+
+
+def cmd_register(a):
+    db = connect()
+    me = resolve_identity(a.as_)
+    upsert_agent(db, me, tmux=a.tmux, repo=a.repo)
+    row = db.execute("SELECT id,tmux,repo,last_seen FROM agents WHERE id=?", (me,)).fetchone()
+    print(f"nhq-msg: registered {row[0]}  tmux={row[1] or '-'}  repo={row[2] or '-'}")
+
+
+def cmd_agents(a):
+    db = connect()
+    rows = db.execute("SELECT id,tmux,repo,last_seen FROM agents ORDER BY last_seen DESC").fetchall()
+    if not rows:
+        print("nhq-msg: no agents registered yet")
+        return
+    print("── registered agents ──")
+    for i, t, r, ls in rows:
+        print(f"  {i:<14} tmux={t or '-':<32} last_seen={ls or '-'}")
+
+
+def cmd_whoami(a):
+    print(resolve_identity(a.as_))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="nhq-msg", description="cross-session agent message bus")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("send"); s.set_defaults(fn=cmd_send)
+    s.add_argument("to"); s.add_argument("body")
+    s.add_argument("--kind", default="msg", choices=["msg", "ask", "done", "fyi"])
+    s.add_argument("--thread", default=None)
+    s.add_argument("--from", dest="sender", default=None)
+    s.add_argument("--priority", default="normal", choices=["normal", "high"])
+    s.add_argument("--no-poke", action="store_true")
+
+    for name in ("inbox", "peek"):
+        s = sub.add_parser(name); s.set_defaults(fn=cmd_inbox, peek=(name == "peek"))
+        s.add_argument("--unread", action="store_true")
+        s.add_argument("--as", dest="as_", default=None)
+        s.add_argument("--json", action="store_true")
+        s.add_argument("--limit", type=int, default=20)
+        if name == "inbox":
+            s.add_argument("--peek", action="store_true")
+
+    s = sub.add_parser("read"); s.set_defaults(fn=cmd_read)
+    s.add_argument("id", nargs="?", type=int)
+    s.add_argument("--all", action="store_true")
+    s.add_argument("--as", dest="as_", default=None)
+
+    s = sub.add_parser("watch"); s.set_defaults(fn=cmd_watch)
+    s.add_argument("--as", dest="as_", default=None)
+    s.add_argument("--poll", type=float, default=3.0)
+
+    s = sub.add_parser("register"); s.set_defaults(fn=cmd_register)
+    s.add_argument("--as", dest="as_", default=None)
+    s.add_argument("--tmux", default=None)
+    s.add_argument("--repo", default=None)
+
+    s = sub.add_parser("agents"); s.set_defaults(fn=cmd_agents)
+    s.add_argument("--as", dest="as_", default=None)
+
+    s = sub.add_parser("whoami"); s.set_defaults(fn=cmd_whoami)
+    s.add_argument("--as", dest="as_", default=None)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

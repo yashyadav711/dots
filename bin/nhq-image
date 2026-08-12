@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# nhq-image — generate an image through the Antigravity (agy) CLI / Gemini image tool.
+# Zero extra keys: it rides agy's Google AI Pro account. Prints the saved path.
+#
+# Usage:
+#   nhq-image "a red apple on a white table"
+#   nhq-image "hero banner for NHQ" banner.png --brand
+#   nhq-image "Kenji waving" out.png --ref sheets/kenji.png --plain --ar 16:9
+#
+# Options:
+#   --ref FILE      Reference image to match (repeatable). Character sheets,
+#                   location sheets, style boards. Identity/style is copied from
+#                   these; the prompt says what changes.
+#   --ar RATIO      1:1 4:3 3:4 16:9 9:16 21:9   (default 16:9)
+#   --brand         Grade to the NHQ "Warline" palette (warm black / crimson /
+#                   bone / sparing amber). Stacks on top of any style mode.
+#   --style TEXT    Replace the default house look with your own art direction.
+#   --sheet         Character-sheet mode: one subject, multiple angles and
+#                   expressions on a neutral background, for reuse as a --ref.
+#   --plain         No house style at all — send the prompt as written.
+#   --timeout SECS  Give up after N seconds (default 300).
+#   -v, --verbose   Stream agy's own output instead of hiding it.
+#
+# WHY THE PICKUP LOGIC LOOKS LIKE THIS (measured 2026-08-12):
+#   agy IGNORES the shell's cwd. Invoked from /tmp it saved into
+#   ~/Github/nHQ/envy/ (its own project root) plus a copy in its scratch dir.
+#   The old script did `cd "$DIR"` and asked for "the current directory", so it
+#   never found the file: every call reported "generation failed" while quietly
+#   littering an unrelated repo. We now read the file:// paths agy reports back,
+#   move the first real one to $OUT, and delete the duplicates.
+set -euo pipefail
+
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; }
+
+BRAND=0
+MODE="editorial"          # editorial | plain | sheet | custom
+STYLE_TEXT=""
+ASPECT="16:9"
+TIMEOUT=300
+VERBOSE=0
+REFS=()
+POSITIONAL=()
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--brand)   BRAND=1; shift ;;
+		--plain)   MODE="plain"; shift ;;
+		--sheet)   MODE="sheet"; shift ;;
+		--style)   MODE="custom"; STYLE_TEXT="${2:?--style needs text}"; shift 2 ;;
+		--ref)     REFS+=("${2:?--ref needs a file}"); shift 2 ;;
+		--ar)      ASPECT="${2:?--ar needs a ratio}"; shift 2 ;;
+		--timeout) TIMEOUT="${2:?--timeout needs seconds}"; shift 2 ;;
+		-v|--verbose) VERBOSE=1; shift ;;
+		-h|--help) usage; exit 0 ;;
+		--) shift; while [ $# -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
+		-*) echo "nhq-image: unknown option $1 (try --help)" >&2; exit 2 ;;
+		*)  POSITIONAL+=("$1"); shift ;;
+	esac
+done
+
+PROMPT="${POSITIONAL[0]:-}"
+if [ -z "$PROMPT" ]; then usage >&2; exit 2; fi
+OUT="${POSITIONAL[1]:-$PWD/nhq-image-$(date +%s).png}"
+OUT="$(realpath -m "$OUT")"
+mkdir -p "$(dirname "$OUT")"
+
+case "$ASPECT" in
+	1:1|4:3|3:4|16:9|9:16|21:9) ;;
+	*) echo "nhq-image: --ar must be one of 1:1 4:3 3:4 16:9 9:16 21:9" >&2; exit 2 ;;
+esac
+
+# Resolve references to absolute paths and fail loudly on a bad one — a missing
+# reference silently becomes "AI invents the character", which is the exact drift
+# these sheets exist to prevent.
+REF_BLOCK=""
+if [ ${#REFS[@]} -gt 0 ]; then
+	i=1
+	for r in "${REFS[@]}"; do
+		if [ ! -f "$r" ]; then echo "nhq-image: --ref not found: $r" >&2; exit 2; fi
+		abs="$(realpath "$r")"
+		REF_BLOCK="${REF_BLOCK}Reference image $i: $abs. "
+		i=$((i + 1))
+	done
+	REF_BLOCK="Open and study these reference images before generating. ${REF_BLOCK}Reproduce the subjects, colours, proportions and art style from the references EXACTLY — treat them as the single source of truth. Only what the subject line asks for may change. "
+fi
+
+# Resolve the agy CLI by ABSOLUTE path: subagent / cron / minimal-env callers
+# often lack ~/.local/bin on PATH, which used to break the generate step silently.
+if [ -n "${AGY_BIN:-}" ] && [ -x "$AGY_BIN" ]; then AGY="$AGY_BIN"
+elif [ -x "$HOME/.local/bin/agy" ]; then AGY="$HOME/.local/bin/agy"
+elif command -v agy >/dev/null 2>&1; then AGY="$(command -v agy)"
+else
+	echo "nhq-image: 'agy' CLI not found (\$AGY_BIN, ~/.local/bin/agy, PATH)" >&2
+	exit 1
+fi
+
+EDITORIAL="Create an ULTRA-DETAILED, premium editorial illustration suitable for a high-end magazine feature opener. The image must VISUALLY COMMUNICATE the meaning of the subject at a single glance via a strong central visual metaphor, with a clear focal point, deliberate art-directed composition, layered depth, intricate fine detail, cinematic volumetric lighting, and tasteful use of negative space. Convey the IDEA, not just a decorative photo. Sharp, cohesive, sophisticated — never generic stock imagery, never cluttered."
+SHEET="Produce a CHARACTER SHEET / model sheet: the same single subject repeated across the frame in a clean grid — front view, three-quarter view, side view and back view, plus two head close-ups with different expressions. Identical proportions, colours, clothing and details in every view. Flat neutral light-grey background, even lighting, no scenery, no props, no text or labels. This sheet will be used as the reference for every future generation, so consistency between the views matters more than drama."
+BRANDSTYLE="Colour-grade STRICTLY to the NHQ Warline palette. Dominant tones: warm near-black #14130F, deep Marlboro crimson #C8102E, bone #ECE7DA. Amber gold #F2B705 ONLY as a small sparing accent. Olive #7C873E as a subtle tertiary. Editorial, cinematic, restrained, expensive-looking. ABSOLUTELY NO neon, NO blue/teal/cyan/purple, no random text, no watermarks, no logos unless explicitly requested."
+
+case "$MODE" in
+	editorial) STYLE="Style: $EDITORIAL " ;;
+	sheet)     STYLE="$SHEET " ;;
+	custom)    STYLE="Style: $STYLE_TEXT " ;;
+	plain)     STYLE="" ;;
+esac
+[ "$BRAND" = "1" ] && STYLE="${STYLE}${BRANDSTYLE} "
+
+SCRATCH="${AGY_SCRATCH:-$HOME/.gemini/antigravity-cli/scratch}"
+TARGET="nhqimg-$(date +%s)-$$.png"
+DIR="$(dirname "$OUT")"
+LANDING="$DIR/$TARGET"
+
+# Give agy the EXACT absolute path. Measured 2026-08-12: with only a filename it
+# writes into its own project root or a brain/<session> dir — and it DELETES that
+# session dir on exit, so the file vanishes before we can collect it. With an
+# absolute path it writes exactly there, every time. The scavenging below is now
+# only a safety net for when it ignores the instruction.
+REQUEST="Generate a NEW image with the image-generation tool and save it to this EXACT absolute path: $LANDING . Do NOT copy, move, rename or reuse any existing file on disk — the reference images are to LOOK AT only, never to be copied to the output path. If you cannot generate, say so plainly instead of producing a file. ${REF_BLOCK}Subject: $PROMPT. ${STYLE}Aspect ratio: $ASPECT. Report the path you saved to."
+
+# `timeout` alone is not enough: agy leaves child processes holding the pipe
+# open, so `$( )` keeps waiting for EOF long after the deadline (measured
+# 2026-08-12: a 300s timeout still ran 8m20s). --kill-after sends SIGKILL, and
+# setsid puts agy in its own process group so the signal reaches the children.
+RUN=(timeout --signal=TERM --kill-after=15s "$TIMEOUT" setsid "$AGY" --dangerously-skip-permissions -p "$REQUEST")
+if [ "$VERBOSE" = "1" ]; then
+	REPLY_TEXT="$("${RUN[@]}" 2>&1 | tee /dev/stderr || true)"
+else
+	REPLY_TEXT="$("${RUN[@]}" 2>&1 || true)"
+fi
+
+# Finding the file agy actually wrote is the whole game. It reports paths in
+# three different shapes depending on its mood — a file:// link, a `backticked`
+# absolute path, or bare prose — and it copies the result into two or three
+# places under its app-data dir. So: harvest every path shape from the reply,
+# then fall back to a find by our UNIQUE filename across agy's own directories.
+AGY_HOME="${AGY_HOME:-$HOME/.gemini/antigravity-cli}"
+STEM="${TARGET%.png}"
+
+# PASS 1 — anything whose filename is our unique STEM. The landing path goes
+# first: when agy obeyed, that IS the file, and taking it leaves nothing behind.
+mapfile -t CANDIDATES < <(
+	printf '%s\n' "$LANDING"
+	printf '%s\n' "$REPLY_TEXT" | grep -oE 'file://[^ )"`]+' | sed 's|^file://||'
+	printf '%s\n' "$REPLY_TEXT" | grep -oE '/[A-Za-z0-9._/-]+\.(png|jpe?g|webp)'
+	printf '%s\n' "$SCRATCH/$TARGET"
+	[ -d "$AGY_HOME" ] && find "$AGY_HOME" -type f -name "$STEM.*" 2>/dev/null
+)
+
+# A reference must NEVER be picked or deleted — agy echoes those paths back in
+# its reply, and moving one would eat the user's character sheet.
+is_ref() {
+	local p; p="$(realpath -m "$1")"
+	for r in "${REFS[@]:-}"; do
+		[ -n "$r" ] || continue
+		[ "$p" = "$(realpath -m "$r")" ] && return 0
+	done
+	return 1
+}
+
+PICKED=""
+for c in "${CANDIDATES[@]}"; do
+	[ -f "$c" ] && [ -s "$c" ] || continue
+	case "$(basename "$c")" in "$STEM".*) ;; *) continue ;; esac
+	is_ref "$c" && continue
+	if [ -z "$PICKED" ]; then PICKED="$c"
+	elif [ "$c" != "$PICKED" ]; then rm -f "$c"; fi   # duplicate agy scattered
+done
+
+# PASS 2 — agy renamed the file. Take the newest image it wrote during this run,
+# still refusing to touch a reference.
+if [ -z "$PICKED" ] && [ -d "$AGY_HOME" ]; then
+	while IFS= read -r c; do
+		[ -n "$c" ] || continue
+		is_ref "$c" && continue
+		PICKED="$c"; break
+	done < <(find "$AGY_HOME" -type f -newermt "-${TIMEOUT} seconds" \
+		\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \) \
+		-printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+fi
+
+if [ -z "$PICKED" ] || [ ! -f "$PICKED" ]; then
+	echo "nhq-image: generation failed (no image produced)" >&2
+	printf '%s\n' "$REPLY_TEXT" | tail -8 >&2
+	exit 1
+fi
+
+# agy sometimes gives up on a hard prompt and COPIES an existing image to the
+# output path instead of generating. Measured 2026-08-12: an expression sheet came
+# back byte-identical to the face master, and a later run came back as the CHARACTER
+# SHEET — a file that was not even a reference for that run, just something sitting
+# in the same folder. That is a silent wrong answer: the file exists, the script
+# says "ok", and the asset library quietly gains a duplicate under a new name.
+# So compare the result against every reference AND every image sitting beside a
+# reference — that folder is exactly where it shops.
+if [ ${#REFS[@]} -gt 0 ] && command -v md5sum >/dev/null 2>&1; then
+	picked_sum="$(md5sum "$PICKED" | cut -d' ' -f1)"
+	suspects=()
+	for r in "${REFS[@]}"; do
+		[ -f "$r" ] || continue
+		suspects+=("$r")
+		while IFS= read -r sib; do suspects+=("$sib"); done < <(
+			find "$(dirname "$(realpath "$r")")" -maxdepth 1 -type f \
+				\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \) 2>/dev/null)
+	done
+	for s in "${suspects[@]}"; do
+		[ -f "$s" ] || continue
+		if [ "$picked_sum" = "$(md5sum "$s" | cut -d' ' -f1)" ]; then
+			rm -f "$PICKED"
+			echo "nhq-image: agy COPIED an existing image ($(basename "$s")) instead of generating." >&2
+			echo "           Nothing was written. Simplify the prompt or ask for one subject at a time." >&2
+			exit 1
+		fi
+	done
+fi
+
+case "$PICKED" in *.jpg|*.jpeg|*.webp) OUT="${OUT%.*}.${PICKED##*.}" ;; esac
+mv -f "$PICKED" "$OUT"
+
+# agy sometimes fans the same file into a brain/<session> dir, the app root AND
+# the landing path. The duplicate pass only sees what existed when it ran, so
+# sweep once more by our unique stem — scoped to agy's own directory, the output
+# directory, and this run's filename, so it can never touch anything of yours.
+[ -d "$AGY_HOME" ] && find "$AGY_HOME" -type f -name "$STEM.*" -delete 2>/dev/null
+find "$DIR" -maxdepth 1 -type f -name "$STEM.*" ! -path "$OUT" -delete 2>/dev/null
+
+echo "$OUT"

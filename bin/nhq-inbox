@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""nhq-inbox — the handover point between Yash's phone and the agent on the laptop.
+
+Open the URL on the phone. Files you send land in ~/Github/nhq-local-downloads;
+files the agent leaves there are listed for you to pull back. Text goes straight
+onto the laptop's clipboard and back.
+
+    nhq-inbox start     claim a port, install + start the user service
+    nhq-inbox stop      stop the service and release the port
+    nhq-inbox status    is it up, on which URL, how many files
+    nhq-inbox url       print the URL (and copy it to the clipboard)
+    nhq-inbox qr        print a scannable QR of the URL — never type the IP again
+    nhq-inbox clear     empty the drop folder (an inbox should end up empty)
+    nhq-inbox open      open the drop folder in the file manager
+    nhq-inbox serve     run in the foreground (what the service runs)
+
+WHAT IT DOES, both directions:
+  phone -> laptop   files (tap, drag-drop, or straight from the camera)
+  phone -> laptop   text: pasted text lands on the laptop's Wayland clipboard
+  laptop -> phone   any file in the drop folder, tap to download, images preview
+  laptop -> phone   the laptop's current clipboard, pulled on demand
+
+WHY A CLAIMED PORT: `nhq-port` owns 3900-3909 and those are the only ports open
+in ufw. Picking one by hand is how a URL ends up unreachable from the tablet.
+
+WHY default.target: measured 2026-08-12 on this box — `graphical-session.target`
+never activates, so anything WantedBy it silently never starts after a session
+restart (that is what killed `vox`). This unit needs no display, so it survives
+logout and reboot.
+
+WHY Wants= AND After= ON network-online: `After=` alone only orders the unit, it
+does not pull the target in. Without `Wants=`, on a cold boot the unit can start
+before the LAN address exists and bind to nothing useful.
+
+WHY THE CLIPBOARD NEEDS A SOCKET LOOKUP: `wl-copy` talks to the compositor and
+needs WAYLAND_DISPLAY, which a systemd user service does not inherit. Rather than
+depend on `import-environment` having been run, `wl_env()` finds the live
+`wayland-N` socket in XDG_RUNTIME_DIR at call time.
+
+No auth: this binds to the home LAN, behind the router, matching the rest of the
+NHQ tooling. Note it now serves downloads too, so anyone on the WiFi can read the
+drop folder — that folder is a scratch handover point, keep nothing precious in it.
+Downloads are pinned to that one directory; `..` in a name cannot escape it.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+DEST = Path(os.environ.get("NHQ_INBOX_DIR", HOME / "Github/nhq-local-downloads"))
+CLAIM = "inbox"
+UNIT = "nhq-inbox.service"
+UNIT_PATH = HOME / ".config/systemd/user" / UNIT
+MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB per file — video from the phone fits
+
+SAFE = re.compile(r"[^A-Za-z0-9._ -]")
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".avif"}
+VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+
+
+# ----------------------------------------------------------------- helpers
+
+def lan_ip() -> str:
+    """The address the tablet can actually reach — not 127.0.0.1, not a docker bridge."""
+    try:
+        out = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except Exception:
+        return "127.0.0.1"
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        iface, cidr = parts[1], parts[3]
+        if iface.startswith(("docker", "br-", "veth", "virbr")):
+            continue
+        return cidr.split("/")[0]
+    return "127.0.0.1"
+
+
+def port(claim: bool = False) -> str | None:
+    if claim:
+        return subprocess.run(
+            ["nhq-port", "claim", CLAIM], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    out = subprocess.run(["nhq-port", "list"], capture_output=True, text=True).stdout
+    for line in out.splitlines()[1:]:          # skip the PORT/NAME/PID/SINCE header
+        cols = line.split()
+        if len(cols) >= 2 and cols[0].isdigit() and cols[1] == CLAIM:
+            return cols[0]
+    return None
+
+
+def safe_name(raw: str) -> str:
+    """Never trust an upload's filename: strip any path, keep it boring."""
+    base = os.path.basename((raw or "file").replace("\\", "/")).strip()
+    base = SAFE.sub("_", base) or "file"
+    return base[:120]
+
+
+def unique_path(name: str) -> Path:
+    target = DEST / name
+    if not target.exists():
+        return target
+    stem, ext = os.path.splitext(name)
+    return DEST / f"{stem}-{datetime.now():%H%M%S}{ext}"
+
+
+def inside(name: str) -> Path | None:
+    """Resolve a requested name to a real file, or None. The only door to the disk.
+
+    `safe_name` already flattens any path, and this re-checks the resolved parent,
+    so a crafted `../../etc/passwd` lands as `.._.._etc_passwd` and then fails to
+    exist rather than escaping. Both belts stay on deliberately.
+    """
+    p = (DEST / safe_name(name)).resolve()
+    try:
+        if p.parent != DEST.resolve() or not p.is_file():
+            return None
+    except OSError:
+        return None
+    return p
+
+
+def kind_of(p: Path) -> str:
+    ext = p.suffix.lower()
+    return "image" if ext in IMAGE_EXT else "video" if ext in VIDEO_EXT else "file"
+
+
+def wl_env() -> dict:
+    """Environment a Wayland clipboard tool needs, found live rather than inherited."""
+    env = dict(os.environ)
+    run = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    env["XDG_RUNTIME_DIR"] = run
+    if not env.get("WAYLAND_DISPLAY"):
+        socks = sorted(
+            s.name for s in Path(run).glob("wayland-*")
+            if not s.name.endswith((".lock", ".sock"))
+        )
+        if socks:
+            env["WAYLAND_DISPLAY"] = socks[0]
+    return env
+
+
+def clip_write(text: str) -> bool:
+    """Put text on the laptop clipboard. Detached, because wl-copy must outlive us:
+    on Wayland the clipboard is owned by a live client, so if wl-copy dies the
+    paste buffer dies with it."""
+    if not shutil.which("wl-copy"):
+        return False
+    try:
+        subprocess.Popen(
+            ["wl-copy", "--", text], env=wl_env(), start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def clip_read() -> str:
+    if not shutil.which("wl-paste"):
+        return ""
+    try:
+        r = subprocess.run(
+            ["wl-paste", "--no-newline"], env=wl_env(),
+            capture_output=True, text=True, timeout=4,
+        )
+        return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+# ------------------------------------------------------------------ server
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0b">
+<title>NHQ Inbox</title>
+<style>
+  :root { --bg:#0a0a0b; --card:#141417; --line:#26262d; --teal:#2dd4bf; --bone:#ECECEF; --mut:#8b8b95; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--bone); min-height:100dvh;
+         font:16px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+         padding:24px 16px 56px; }
+  .wrap { max-width:640px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 4px; letter-spacing:.02em; }
+  .sub { color:var(--mut); font-size:14px; margin:0 0 22px; }
+  code { color:var(--teal); font-size:13px; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.09em; color:var(--mut);
+       margin:30px 0 10px; font-weight:600; display:flex; justify-content:space-between; }
+  #drop { border:2px dashed var(--line); border-radius:16px; padding:40px 20px; text-align:center;
+          background:var(--card); transition:border-color .15s, background .15s; cursor:pointer; }
+  #drop.hot { border-color:var(--teal); background:#14201f; }
+  #drop b { display:block; font-size:17px; margin-bottom:6px; }
+  #drop span { color:var(--mut); font-size:14px; }
+  input[type=file] { display:none; }
+  .row { display:flex; gap:10px; margin-top:12px; }
+  button { flex:1; border:0; border-radius:12px; padding:14px; font-size:15px; font-weight:600;
+           background:var(--teal); color:#06231f; cursor:pointer; font-family:inherit; }
+  button.ghost { background:transparent; color:var(--bone); border:1px solid var(--line); }
+  button:disabled { opacity:.45; }
+  textarea { width:100%; background:var(--card); color:var(--bone); border:1px solid var(--line);
+             border-radius:12px; padding:13px; font:15px/1.45 inherit; resize:vertical; min-height:88px; }
+  #bar { height:4px; background:var(--line); border-radius:99px; overflow:hidden; margin-top:14px; display:none; }
+  #bar div { height:100%; width:0; background:var(--teal); transition:width .2s; }
+  .f { display:flex; align-items:center; gap:12px; padding:10px 12px; background:var(--card);
+       border:1px solid var(--line); border-radius:12px; margin-bottom:8px; font-size:14px; }
+  .f .meta { flex:1; min-width:0; }
+  .f .nm { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .f .sz { color:var(--mut); font-size:12.5px; }
+  .f img { width:44px; height:44px; object-fit:cover; border-radius:8px; background:#000; flex:none; }
+  .f .tag { width:44px; height:44px; border-radius:8px; background:#1c1c21; color:var(--mut);
+            display:flex; align-items:center; justify-content:center; font-size:10px;
+            letter-spacing:.06em; flex:none; text-transform:uppercase; }
+  .f a { color:inherit; text-decoration:none; display:flex; align-items:center; gap:12px; flex:1; min-width:0; }
+  .x { border:0; background:transparent; color:var(--mut); font-size:20px; padding:4px 6px;
+       cursor:pointer; flex:none; line-height:1; }
+  .ok { color:var(--teal); }
+  .empty { color:var(--mut); }
+</style></head><body><div class="wrap">
+  <h1>NHQ Inbox</h1>
+  <p class="sub">Shared folder with the laptop: <code>~/Github/nhq-local-downloads</code></p>
+
+  <div id="drop"><b>Tap to pick files</b><span>or drop them here</span></div>
+  <input id="pick" type="file" multiple>
+  <div class="row">
+    <button id="send" disabled>Send</button>
+    <button id="cam" class="ghost">Camera</button>
+  </div>
+  <input id="camin" type="file" accept="image/*,video/*" capture="environment">
+  <div id="bar"><div></div></div>
+  <div id="log"></div>
+
+  <h2>Text</h2>
+  <textarea id="txt" placeholder="Paste here — it lands on the laptop's clipboard"></textarea>
+  <div class="row">
+    <button id="tsend">To laptop clipboard</button>
+    <button id="tpull" class="ghost">Pull laptop's</button>
+  </div>
+  <div id="tlog"></div>
+
+  <h2><span>Files</span><span id="count"></span></h2>
+  <div id="recent"></div>
+  <div class="row" style="margin-top:4px">
+    <button id="refresh" class="ghost">Refresh</button>
+  </div>
+</div>
+<script>
+const $ = i => document.getElementById(i);
+const drop=$('drop'), pick=$('pick'), send=$('send'), cam=$('cam'), camin=$('camin'),
+      bar=$('bar'), fill=bar.firstElementChild, log=$('log'), recent=$('recent'),
+      txt=$('txt'), tsend=$('tsend'), tpull=$('tpull'), tlog=$('tlog'), count=$('count');
+let queue=[];
+
+const kb=n=>n<1024?n+' B':n<1048576?(n/1024).toFixed(0)+' KB':n<1073741824?(n/1048576).toFixed(1)+' MB':(n/1073741824).toFixed(2)+' GB';
+const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function show(){
+  log.innerHTML=queue.map(f=>`<div class="f"><div class="meta"><span class="nm">${esc(f.name)}</span><span class="sz">${kb(f.size)}</span></div></div>`).join('');
+  send.disabled=!queue.length;
+  send.textContent=queue.length?`Send ${queue.length} file${queue.length>1?'s':''}`:'Send';
+}
+const add=fs=>{ queue=queue.concat([...fs]); show(); };
+
+drop.onclick=()=>pick.click();
+pick.onchange=e=>add(e.target.files);
+cam.onclick=()=>camin.click();
+camin.onchange=e=>add(e.target.files);
+['dragenter','dragover'].forEach(t=>drop.addEventListener(t,e=>{e.preventDefault();drop.classList.add('hot');}));
+['dragleave','drop'].forEach(t=>drop.addEventListener(t,e=>{e.preventDefault();drop.classList.remove('hot');}));
+drop.addEventListener('drop',e=>add(e.dataTransfer.files));
+
+send.onclick=()=>{
+  if(!queue.length) return;
+  const fd=new FormData(); queue.forEach(f=>fd.append('files',f,f.name));
+  const xhr=new XMLHttpRequest(); xhr.open('POST','/upload');
+  bar.style.display='block'; send.disabled=true;
+  xhr.upload.onprogress=e=>{ if(e.lengthComputable) fill.style.width=(e.loaded/e.total*100)+'%'; };
+  xhr.onload=()=>{ bar.style.display='none'; fill.style.width='0';
+    log.innerHTML='<div class="f"><span class="ok">Sent</span></div>';
+    queue=[]; send.disabled=true; send.textContent='Send'; pick.value=''; camin.value=''; list(); };
+  xhr.onerror=()=>{ bar.style.display='none'; log.innerHTML='<div class="f"><span>Upload failed — retry</span></div>'; send.disabled=false; };
+  xhr.send(fd);
+};
+
+tsend.onclick=async()=>{
+  const t=txt.value; if(!t.trim()) return;
+  tsend.disabled=true;
+  try{ const r=await fetch('/text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});
+       const j=await r.json();
+       tlog.innerHTML='<div class="f"><span class="'+(j.ok?'ok':'')+'">'+(j.ok?'On the laptop clipboard':'Clipboard unreachable')+'</span></div>';
+  }catch(e){ tlog.innerHTML='<div class="f"><span>Failed</span></div>'; }
+  tsend.disabled=false;
+};
+tpull.onclick=async()=>{
+  tpull.disabled=true;
+  try{ const r=await fetch('/clip'); const j=await r.json();
+       txt.value=j.text||''; tlog.innerHTML='<div class="f"><span class="'+(j.text?'ok':'')+'">'+(j.text?'Pulled '+j.text.length+' chars':'Laptop clipboard is empty')+'</span></div>';
+  }catch(e){ tlog.innerHTML='<div class="f"><span>Failed</span></div>'; }
+  tpull.disabled=false;
+};
+
+async function del(name){
+  await fetch('/rm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  list();
+}
+
+async function list(){
+  try{
+    const r=await fetch('/files'); const j=await r.json();
+    count.textContent=j.files.length?j.files.length+' · '+kb(j.bytes):'';
+    if(!j.files.length){ recent.innerHTML='<div class="f"><span class="empty">Empty — nothing waiting</span></div>'; return; }
+    recent.innerHTML=j.files.map(f=>{
+      const thumb=f.kind==='image'
+        ? `<img src="/thumb/${encodeURIComponent(f.name)}" loading="lazy" alt="">`
+        : `<div class="tag">${f.kind==='video'?'vid':(f.ext||'file')}</div>`;
+      return `<div class="f">
+        <a href="/dl/${encodeURIComponent(f.name)}" download>
+          ${thumb}
+          <div class="meta"><span class="nm">${esc(f.name)}</span><span class="sz">${kb(f.size)} &middot; ${f.when}</span></div>
+        </a>
+        <button class="x" onclick="del('${encodeURIComponent(f.name).replace(/'/g,"\\'")}')" aria-label="delete">&times;</button>
+      </div>`;
+    }).join('');
+  }catch(e){}
+}
+$('refresh').onclick=list;
+list();
+// The agent writes into this folder too, so poll — a file that appears while the
+// page is open should just show up.
+setInterval(()=>{ if(document.visibilityState==='visible') list(); }, 5000);
+</script></body></html>"""
+
+
+def serve() -> None:
+    from fastapi import FastAPI, Request
+    from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
+    import uvicorn
+
+    DEST.mkdir(parents=True, exist_ok=True)
+    app = FastAPI(title="NHQ Inbox", docs_url=None, redoc_url=None)
+
+    @app.get("/", response_class=HTMLResponse)
+    async def index() -> str:
+        return PAGE
+
+    @app.get("/files")
+    async def files() -> JSONResponse:
+        items, total = [], 0
+        for p in sorted(
+            (x for x in DEST.iterdir() if x.is_file()),
+            key=lambda x: x.stat().st_mtime, reverse=True,
+        ):
+            st = p.stat()
+            total += st.st_size
+            items.append({
+                "name": p.name,
+                "size": st.st_size,
+                "kind": kind_of(p),
+                "ext": p.suffix.lstrip(".").lower()[:4],
+                "when": datetime.fromtimestamp(st.st_mtime).strftime("%H:%M"),
+            })
+        return JSONResponse({"files": items, "bytes": total})
+
+    @app.get("/dl/{name}")
+    async def download(name: str):
+        p = inside(name)
+        if not p:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return FileResponse(p, filename=p.name)
+
+    @app.get("/thumb/{name}")
+    async def thumb(name: str):
+        p = inside(name)
+        if not p or kind_of(p) != "image":
+            return JSONResponse({"error": "not an image"}, status_code=404)
+        try:
+            from PIL import Image
+            import io
+            with Image.open(p) as im:
+                im.draft("RGB", (256, 256))       # cheap decode for big JPEGs
+                im = im.convert("RGB")
+                im.thumbnail((128, 128))
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=72)
+            return Response(
+                buf.getvalue(), media_type="image/jpeg",
+                headers={"Cache-Control": "max-age=60"},
+            )
+        except Exception:
+            return JSONResponse({"error": "unreadable"}, status_code=404)
+
+    @app.post("/text")
+    async def text(request: Request) -> JSONResponse:
+        body = await request.json()
+        t = (body or {}).get("text") or ""
+        if not t.strip():
+            return JSONResponse({"ok": False, "error": "empty"}, status_code=400)
+        ok = clip_write(t)
+        print(f"[{datetime.now():%H:%M:%S}] clipboard <- {len(t)} chars "
+              f"({'ok' if ok else 'FAILED'})", flush=True)
+        return JSONResponse({"ok": ok})
+
+    @app.get("/clip")
+    async def clip() -> JSONResponse:
+        return JSONResponse({"text": clip_read()[:100_000]})
+
+    @app.post("/rm")
+    async def rm(request: Request) -> JSONResponse:
+        body = await request.json()
+        p = inside((body or {}).get("name") or "")
+        if not p:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        p.unlink()
+        print(f"[{datetime.now():%H:%M:%S}] deleted {p.name}", flush=True)
+        return JSONResponse({"ok": True})
+
+    # Read the form off the Request directly. A `list[UploadFile]` signature
+    # cannot be used here: `from __future__ import annotations` turns it into a
+    # string, and this handler lives inside serve(), so Pydantic cannot resolve
+    # the forward reference and every upload 500s. Verified 2026-08-12.
+    @app.post("/upload")
+    async def upload(request: Request) -> JSONResponse:
+        form = await request.form()
+        files = [v for v in form.getlist("files") if hasattr(v, "read")]
+        if not files:
+            return JSONResponse({"error": "no files in request"}, status_code=400)
+        saved = []
+        for f in files:
+            target = unique_path(safe_name(f.filename or "file"))
+            written = 0
+            with target.open("wb") as out:
+                while chunk := await f.read(1024 * 1024):
+                    written += len(chunk)
+                    if written > MAX_BYTES:
+                        out.close()
+                        target.unlink(missing_ok=True)
+                        return JSONResponse({"error": f"{target.name} over 2 GB"}, status_code=413)
+                    out.write(chunk)
+            saved.append(target.name)
+            print(f"[{datetime.now():%H:%M:%S}] saved {target.name} ({written} bytes)", flush=True)
+        return JSONResponse({"saved": saved})
+
+    p = int(os.environ.get("NHQ_INBOX_PORT") or port() or port(claim=True) or "3900")
+    print(f"nhq-inbox -> http://{lan_ip()}:{p}  (sharing {DEST})", flush=True)
+    uvicorn.run(app, host="0.0.0.0", port=p, log_level="warning")
+
+
+# --------------------------------------------------------------------- cli
+
+UNIT_TEXT = """[Unit]
+Description=NHQ Inbox — LAN file + clipboard bridge to ~/Github/nhq-local-downloads
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=NHQ_INBOX_PORT={port}
+ExecStart={exe} serve
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def sysctl(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+
+
+def cmd_start() -> int:
+    DEST.mkdir(parents=True, exist_ok=True)
+    p = port() or port(claim=True)
+    UNIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    UNIT_PATH.write_text(UNIT_TEXT.format(port=p, exe=os.path.abspath(__file__)))
+    sysctl("daemon-reload")
+    sysctl("enable", "--now", UNIT)
+    sysctl("restart", UNIT)
+    time.sleep(1.5)
+    return cmd_status()
+
+
+def cmd_stop() -> int:
+    sysctl("disable", "--now", UNIT)
+    subprocess.run(["nhq-port", "release", CLAIM], capture_output=True)
+    print("nhq-inbox stopped, port released")
+    return 0
+
+
+def cmd_url() -> int:
+    p = port()
+    if not p:
+        print("not running — `nhq-inbox start` first", file=sys.stderr)
+        return 1
+    url = f"http://{lan_ip()}:{p}"
+    print(url)
+    if shutil.which("wl-copy"):
+        subprocess.run(["wl-copy"], input=url, text=True, env=wl_env())
+    return 0
+
+
+def cmd_qr() -> int:
+    """A QR beats reading an IP off a screen and typing it on a phone."""
+    p = port()
+    if not p:
+        print("not running — `nhq-inbox start` first", file=sys.stderr)
+        return 1
+    url = f"http://{lan_ip()}:{p}"
+    if not shutil.which("qrencode"):
+        print(url)
+        print("(install qrencode for a scannable code)", file=sys.stderr)
+        return 0
+    subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "1", url])
+    print(url)
+    return 0
+
+
+def cmd_clear() -> int:
+    n = bytes_ = 0
+    for f in DEST.iterdir() if DEST.exists() else []:
+        if f.is_file():
+            bytes_ += f.stat().st_size
+            f.unlink()
+            n += 1
+    print(f"cleared {n} file(s), {bytes_/1048576:.1f} MB")
+    return 0
+
+
+def cmd_open() -> int:
+    DEST.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen(["xdg-open", str(DEST)], env=wl_env(),
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(DEST)
+    return 0
+
+
+def cmd_status() -> int:
+    active = sysctl("is-active", UNIT).stdout.strip()
+    p = port()
+    files = [f for f in DEST.iterdir() if f.is_file()] if DEST.exists() else []
+    total = sum(f.stat().st_size for f in files)
+    print(f"service : {active}")
+    print(f"url     : http://{lan_ip()}:{p}" if p else "url     : (no port claimed)")
+    print(f"folder  : {DEST}")
+    print(f"files   : {len(files)} ({total/1048576:.1f} MB)")
+    return 0 if active == "active" else 1
+
+
+def main() -> int:
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    table = {
+        "serve": serve, "start": cmd_start, "stop": cmd_stop, "status": cmd_status,
+        "url": cmd_url, "qr": cmd_qr, "clear": cmd_clear, "open": cmd_open,
+    }
+    fn = table.get(cmd)
+    if not fn:
+        print(__doc__)
+        return 1
+    return fn() or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
