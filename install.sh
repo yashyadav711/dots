@@ -77,7 +77,7 @@ link vox/vocabulary.toml                "$HOME/.config/vox/vocabulary.toml"
 echo "==> [3/4] tmux (Oh My Tmux base + custom override)"
 [ -d "$HOME/.tmux" ] || git clone --single-branch https://github.com/gpakosz/.tmux.git "$HOME/.tmux"
 ln -sfn "$HOME/.tmux/.tmux.conf" "$HOME/.tmux.conf"
-link tmux/.tmux.conf.local            "$HOME/.tmux.conf.local"
+link tmux/tmux.conf.local             "$HOME/.tmux.conf.local"   # NOT .tmux.conf.local — the dotted copy was stale and unlinked (removed 2026-08-13)
 link bin/agyq           "$HOME/.local/bin/agyq"
 link bin/agy-snapshot   "$HOME/.local/bin/agy-snapshot"
 link bin/agy-usage      "$HOME/.local/bin/agy-usage"

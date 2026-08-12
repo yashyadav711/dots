@@ -23,5 +23,15 @@ fi
 
 # One session per directory, reattached if it already exists, so closing the
 # Orca tab and reopening it lands back in the same conversation.
+#
+# -e is not optional. A tmux pane inherits the environment of the tmux SERVER —
+# a daemon that may have started weeks ago — not of the shell you launched from.
+# On 2026-08-13 that meant $VISUAL was changed, omp was restarted repeatedly,
+# and Ctrl+E still opened vim, because the server was handing every new pane the
+# VISUAL=vim it had been born with. tmux.conf.local also puts these on
+# update-environment; passing them here as well means a fresh session is right
+# even on a server whose config predates that line.
 slug=$(basename "$PWD" | tr -c 'A-Za-z0-9_-' '-' | sed 's/-\+$//')
-exec tmux new-session -A -s "omp-${slug:-home}" omp "$@"
+exec tmux new-session -A -s "omp-${slug:-home}" \
+	-e "VISUAL=${VISUAL:-nhq-editor}" -e "EDITOR=${EDITOR:-vim}" \
+	omp "$@"

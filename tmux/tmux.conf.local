@@ -429,6 +429,21 @@ bind , previous-window
 bind . next-window
 bind R source-file ~/.tmux.conf \; display-message "tmux config reloaded"   # reload moved to prefix R
 
+# Let VISUAL/EDITOR follow the shell you attach from, instead of freezing at
+# whatever they were when the tmux SERVER first started. That default cost an
+# afternoon on 2026-08-13: $VISUAL was pointed at nhq-editor, omp was restarted
+# several times, and Ctrl+E kept opening vim — because the server had been up
+# for weeks holding VISUAL=vim, and every new pane inherits the SERVER's
+# environment, not the client's. update-environment is the list tmux refreshes
+# from the attaching client; these two were not on it.
+#
+# One `set -ga` per name, and the name bare: update-environment is an ARRAY
+# option, so -a appends a new element only when given a single word. Passing
+# `" VISUAL EDITOR"` as one quoted string appends a single junk element and
+# silently does nothing.
+set -ga update-environment VISUAL
+set -ga update-environment EDITOR
+
 # Ctrl+Up / Ctrl+Down — jump between user messages (OSC 133 prompt marks) -----
 # omp wraps every user message in OSC 133 marks (UserMessageComponent emits
 # \e]133;A\a / \e]133;B\a, verified in the binary); tmux >= 3.4 can jump between
