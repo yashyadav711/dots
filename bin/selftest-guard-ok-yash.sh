@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# selftest for the ok-Yash signature guard changes (nhq-approve + nhq-p3-guard + nhq-jcode-pretool).
+# selftest for the ok-Yash signature guard changes (nhq-approve + nhq-p3-guard).
 set -uo pipefail
 BIN="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 APPROVE="$BIN/nhq-approve"
 GUARD="$BIN/nhq-p3-guard"
-PRETOOL="$BIN/nhq-jcode-pretool"
 
 export NHQ_APPROVAL_STORE="$(mktemp -u /tmp/nhq-approval-selftest.XXXX.json)"
 export NHQ_APPROVE_BIN="$APPROVE"
@@ -15,7 +14,6 @@ no(){ echo "  ❌ $1"; FAIL=$((FAIL+1)); }
 echo "== syntax =="
 bash -n "$APPROVE" && ok "nhq-approve parses" || no "nhq-approve syntax"
 bash -n "$GUARD"   && ok "nhq-p3-guard parses" || no "nhq-p3-guard syntax"
-bash -n "$PRETOOL" && ok "nhq-jcode-pretool parses" || no "nhq-jcode-pretool syntax"
 
 echo "== nhq-approve grant/verify/consume =="
 "$APPROVE" clear >/dev/null
@@ -61,18 +59,16 @@ out="$("$GUARD" check "$RD" pretooluse 2>&1)"; echo "$out" | grep -q 'ALLOW(out-
 RN="$(mk_repo notaproduct main)"
 out="$("$GUARD" check "$RN" pretooluse 2>&1)"; echo "$out" | grep -q 'ALLOW(out-of-scope)' && ok "non-scoped repo → ALLOW(out-of-scope)" || no "non-scoped should be ungated; got: $out"
 
-echo "== jcode-pretool Director push/merge gate =="
-run_pt(){ printf '{"command":"%s"}' "$1" | JCODE_HOOK_TOOL_NAME=bash JCODE_HOOK_CWD="$2" "$PRETOOL" 2>&1; echo "rc=$?"; }
-"$APPROVE" clear >/dev/null
-# push to dev on scoped repo → allowed
-o="$(run_pt "git push origin dev" "$RD")"; echo "$o" | grep -q 'rc=0' && ok "push dev (scoped) → allowed" || no "push dev should pass; got: $o"
-# push main on scoped repo, no token → blocked
-o="$(run_pt "git -C $R push origin main" "$R")"; echo "$o" | grep -qE 'rc=2|ok - Yash' && ok "push main, no token → blocked" || no "push main should block; got: $o"
-# with token → allowed
-"$APPROVE" grant --repo heydaddy --target main >/dev/null
-o="$(run_pt "git -C $R push origin main" "$R")"; echo "$o" | grep -q 'rc=0' && ok "push main + token → allowed" || no "push main+token should pass; got: $o"
-# non-scoped repo push main → not gated
-o="$(run_pt "git -C $RN push origin main" "$RN")"; echo "$o" | grep -q 'rc=0' && ok "push main non-scoped → not gated" || no "non-scoped push should pass; got: $o"
+# RETIRED 2026-08-12 — "== jcode-pretool Director push/merge gate ==" lived here.
+# jcode had been unused for two weeks (~/.jcode last touched 2026-07-29), so the
+# hooks were unwired from ~/.jcode/config.toml and the scripts archived to
+# ~/.local/share/nhq-archive/. With nhq-jcode-pretool gone these four cases could
+# only ever report "No such file or directory" and the suite read RED at 14/5 —
+# a broken harness, not a broken gate.
+#
+# The policy itself is untouched and still proven above: nhq-p3-guard is the live
+# gate for omp and Claude Code, and the prod-P3, single-use-token, fleet-hard-block
+# and out-of-scope cases all still run. Only the jcode ADAPTER went away.
 
 echo
 echo "RESULT: PASS=$PASS FAIL=$FAIL"

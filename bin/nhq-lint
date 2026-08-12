@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""nhq-lint — reject command names the manifest cannot explain.
+
+    nhq-lint            check, print findings
+    nhq-lint --json     machine output
+    nhq-lint --quiet    errors only, no warnings
+
+Exit 0 clean (warnings allowed) · 1 errors found · 2 called wrong.
+
+WHY THIS EXISTS: the naming rule was never the problem. Three prefixes appeared
+for HeyDaddy between 15 Jul and 1 Aug 2026 and nothing objected; separately
+install.sh kept a hand-written allowlist, so `nhq-agent-alive` sat uninstalled
+for a day while the docs told people to run it. Same failure both times —
+nothing checked. install.sh fixed its half by globbing instead of remembering.
+This is the other half, and install.sh runs it.
+
+ERROR vs WARN, deliberately: an error is something provably broken against the
+manifest — a retired prefix, a grid name that cannot be derived, a face that is
+a real file where a symlink belongs, a tool on PATH with no copy in the repo.
+A warning is a judgement call, like a verb baked into a name that predates the
+convention. A linter that errors on eighty existing tools gets switched off, so
+only certainties fail the build.
+"""
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+import yaml
+
+BIN = Path(__file__).resolve().parent
+LOCAL = Path.home() / ".local/bin"
+MANIFEST = BIN / "nhq-commands.yml"
+
+DATA_SUFFIX = (".sh", ".yml", ".yaml", ".json", ".jsonl", ".md", ".bak")
+RETIRED = (re.compile(r"^hd-"), re.compile(r"^heydaddy-"))
+# Verbs that belong after the command, not inside its name. `-selftest` is
+# excluded on purpose: it is a suffix this house already uses consistently
+# across nine tools and it reads as part of the noun.
+BAKED_VERB = re.compile(
+    r"-(deploy|add|list|fetch|assemble|index|create|delete|remove|update|sync|start|stop)$"
+)
+
+
+def load():
+    if not MANIFEST.exists():
+        sys.exit(f"nhq-lint: no manifest at {MANIFEST}")
+    spec = yaml.safe_load(MANIFEST.read_text())
+    sys.path.insert(0, str(BIN))
+    from importlib.machinery import SourceFileLoader
+    gen = SourceFileLoader("nhq_gen", str(BIN / "nhq-gen")).load_module()
+    return spec, gen
+
+
+def main() -> int:
+    if any(a not in ("--json", "--quiet") for a in sys.argv[1:]):
+        print(__doc__, file=sys.stderr)
+        return 2
+
+    spec, gen = load()
+    grid = dict(gen.faces(spec))          # face -> impl
+    known = gen.declared(spec)
+    projects = set(spec)
+
+    errors, warns = [], []
+
+    def scan(d: Path, where: str):
+        if not d.is_dir():
+            return []
+        return [p for p in sorted(d.iterdir())
+                if p.name.startswith("nhq-") and not p.name.endswith(DATA_SUFFIX)]
+
+    repo = scan(BIN, "dots/bin")
+    repo_names = {p.name for p in repo}
+
+    # 1. Retired prefixes, anywhere on PATH.
+    for p in sorted(LOCAL.iterdir()) if LOCAL.is_dir() else []:
+        if any(r.match(p.name) for r in RETIRED):
+            errors.append(f"{p.name}: retired prefix — the convention folds this into nhq-<project>-*")
+
+    # 2. Anything on PATH claiming a manifest project's prefix must be declared.
+    for p in sorted(LOCAL.iterdir()) if LOCAL.is_dir() else []:
+        n = p.name
+        if not n.startswith("nhq-") or n.endswith(DATA_SUFFIX):
+            continue
+        proj = n.split("-")[1] if n.count("-") >= 1 else ""
+        if proj in projects and n not in known:
+            errors.append(f"{n}: not derivable from the manifest — add it to nhq-commands.yml or rename it")
+
+    # 3. Every declared face must be a symlink to its impl, not a real file.
+    for face, impl in grid.items():
+        for d in (BIN, LOCAL):
+            p = d / face
+            if p.exists() and not p.is_symlink():
+                errors.append(f"{p}: real file where a generated face belongs — run nhq-gen --apply")
+            elif p.is_symlink() and Path(os.readlink(p)).name != impl:
+                errors.append(f"{p}: points at {Path(os.readlink(p)).name}, manifest says {impl}")
+            elif not p.exists():
+                warns.append(f"{face}: declared but not generated yet in {d} — run nhq-gen --apply")
+
+    # 4. Repo drift: a real tool on PATH with no copy in the repo is lost on a
+    #    reformat. Five commands were in exactly this state on 2026-08-12,
+    #    including nhq-clip, which CLAUDE.md tells every agent to use.
+    for p in sorted(LOCAL.iterdir()) if LOCAL.is_dir() else []:
+        if not p.name.startswith("nhq-") or p.name.endswith(DATA_SUFFIX):
+            continue
+        if not p.is_symlink() and p.name not in repo_names:
+            errors.append(f"{p.name}: real file in ~/.local/bin with no copy in dots/bin — a reformat loses it")
+
+    # 5. Verb baked into a name that is not a generated face.
+    for p in repo:
+        if p.name in grid or p.name in known:
+            continue
+        if BAKED_VERB.search(p.name):
+            warns.append(f"{p.name}: verb in the filename — the convention wants `nhq-<noun> <verb>`")
+
+    if "--json" in sys.argv:
+        print(json.dumps({"ok": not errors, "errors": errors, "warnings": warns,
+                          "faces_declared": len(grid), "tools_scanned": len(repo)}, indent=2))
+        return 1 if errors else 0
+
+    for e in errors:
+        print(f"  ERROR  {e}", file=sys.stderr)
+    if "--quiet" not in sys.argv:
+        for w in warns:
+            print(f"  warn   {w}", file=sys.stderr)
+    print(f"nhq-lint: {len(repo)} tools · {len(grid)} generated faces · "
+          f"{len(errors)} errors · {len(warns)} warnings")
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

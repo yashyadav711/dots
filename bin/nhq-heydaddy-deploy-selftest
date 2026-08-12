@@ -2,7 +2,7 @@
 # nhq-heydaddy-deploy-selftest — proves nhq-heydaddy-deploy can never hang.
 #
 # heydaddy#225: the dispatcher blocked forever on `railway up` with no output,
-# so `heydaddy-promote to-prod` could never finish unattended. The fix is
+# so `nhq-heydaddy-promote to-prod` could never finish unattended. The fix is
 # detach + poll + hard deadlines. This selftest exercises that WITHOUT touching
 # Railway: it puts a fake `railway` and `curl` on PATH and drives the dispatcher
 # through a normal build, a build that never finishes, an upload that never
@@ -11,7 +11,11 @@
 # Run:  nhq-heydaddy-deploy-selftest        (nothing is deployed; no network)
 set -uo pipefail
 
-DISPATCHER="$(cd "$(dirname "$0")" && pwd)/nhq-heydaddy-deploy"
+# Resolve through the symlink: this selftest is installed into ~/.local/bin,
+# but the dispatcher deliberately is NOT (install.sh skips it — it is reached
+# only through its four faces). Without readlink -f, $0 resolves to
+# ~/.local/bin and the dispatcher is "not found". Fixed 2026-08-12.
+DISPATCHER="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/nhq-heydaddy-deploy"
 [[ -x "$DISPATCHER" ]] || { echo "cannot find an executable $DISPATCHER" >&2; exit 2; }
 
 WORK="$(mktemp -d -t nhq-hd-deploy-selftest.XXXXXX)"
@@ -122,7 +126,7 @@ check "stuck build hits NHQ_DEPLOY_TIMEOUT"  dev-be  stuck_build  1 30 "TIMED OU
 check "stuck upload hits trigger timeout"    dev-be  stuck_upload 1 30 "did not return within 2s" -y
 
 echo ""
-echo "(c) a failing build — must return non-zero so heydaddy-promote stops"
+echo "(c) a failing build — must return non-zero so nhq-heydaddy-promote stops"
 check "FAILED build exits non-zero"          dev-be  failing       1 30 "deploy FAILED" -y
 check "trigger error exits non-zero"         dev-be  trigger_fails 1 30 "trigger failed (exit 7)" -y
 

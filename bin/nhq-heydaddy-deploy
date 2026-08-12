@@ -7,7 +7,7 @@
 #   nhq-heydaddy-prod-fe-deploy   prod · heydaddy-web  (frontend)  railway redeploy --from-source
 #
 # Flags:  --dry-run   print the plan, touch nothing
-#         -y|--yes    skip the prod typed confirmation (heydaddy-promote passes this)
+#         -y|--yes    skip the prod typed confirmation (nhq-heydaddy-promote passes this)
 #
 # Env:  HEYDADDY_DIR                 source tree to upload   (default ~/Github/Work/heydaddy)
 #       NHQ_DEPLOY_TRIGGER_TIMEOUT   cap on the upload/trigger call, seconds (default 900)
@@ -19,7 +19,7 @@
 #
 # ── heydaddy#225 — why this script is shaped like this ────────────────────────
 # Symptom: `nhq-heydaddy-{prod,dev}-be-deploy` blocked forever with no output;
-# `heydaddy-promote to-prod` sat ~33 min on the backend step and never reached
+# `nhq-heydaddy-promote to-prod` sat ~33 min on the backend step and never reached
 # frontend+verify. Root cause was NOT one bad command — it was that NOTHING in
 # the chain was bounded or observable:
 #   1. Every `railway` call inherited this script's stdin and had no deadline.
@@ -36,12 +36,12 @@
 #      in 0.04 s with exit 2 and never reaches `railway up` at all.
 #   4. A `railway up --detach` that returns 0 only means the build was QUEUED.
 #      Nothing polled the result, so a failed build still looked like success
-#      and `heydaddy-promote` marched on to the next step.
+#      and `nhq-heydaddy-promote` marched on to the next step.
 # Fix: every railway call runs under `timeout` with stdin from /dev/null (a
 # prompt now dies instantly instead of hanging), the deploy is triggered with
 # `--detach` and then POLLED to a terminal state with visible progress, there is
 # a hard overall deadline that fails LOUD, and any failure exits non-zero so
-# heydaddy-promote stops instead of shipping half a release.
+# nhq-heydaddy-promote stops instead of shipping half a release.
 #
 # ── 2026-08-01 — the false failure on a healthy prod release ─────────────────
 # Symptom: `nhq-heydaddy-prod-fe-deploy` printed an empty "current deployment:"

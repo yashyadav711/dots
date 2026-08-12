@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# nhq-heydaddy-promote — thin wrapper → scripts/promote.sh in the heydaddy repo.
+#
+# All logic lives in the repo (scripts/promote.sh) so it versions with the code
+# it ships. This wrapper only locates the repo and hands off every argument.
+#
+#   Tier model: local → staging → dev → prod
+#   Run `nhq-heydaddy-promote --help` for the full command reference.
+set -euo pipefail
+
+HEYDADDY_DIR="${HEYDADDY_DIR:-$HOME/Github/Work/heydaddy}"
+SCRIPT="$HEYDADDY_DIR/scripts/promote.sh"
+
+if [[ ! -f "$SCRIPT" ]]; then
+  echo "nhq-heydaddy-promote: cannot find $SCRIPT" >&2
+  echo "  Set HEYDADDY_DIR to your heydaddy checkout (currently: $HEYDADDY_DIR)." >&2
+  exit 1
+fi
+
+exec bash "$SCRIPT" "$@"

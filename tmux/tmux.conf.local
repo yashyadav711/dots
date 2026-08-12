@@ -429,22 +429,34 @@ bind , previous-window
 bind . next-window
 bind R source-file ~/.tmux.conf \; display-message "tmux config reloaded"   # reload moved to prefix R
 
-# Ctrl+Up -> scroll the REAL pane back to your previous message ---------------
-# omp already wraps every user message in OSC 133 prompt marks (verified in the
-# binary: UserMessageComponent emits \e]133;A\a / \e]133;B\a), and tmux >= 3.4
-# can jump between those marks. So the pane genuinely scrolls — no popup, no
-# menu, the actual conversation moves.
+# Ctrl+Up / Ctrl+Down — jump between user messages (OSC 133 prompt marks) -----
+# omp wraps every user message in OSC 133 marks (UserMessageComponent emits
+# \e]133;A\a / \e]133;B\a, verified in the binary); tmux >= 3.4 can jump between
+# them. The pane genuinely scrolls — no popup, no menu, the actual conversation
+# moves.
 #
-# Root binding fires from the live prompt: entering copy-mode leaves the cursor
-# on the current prompt mark, so the FIRST previous-prompt is a no-op and the
-# second lands on the last message. Measured: scroll_position 0 -> 39 with
-# "QUESTION-12" (the last user message) at the top of the pane. Each further
-# Ctrl+Up inside copy-mode steps one message further up (49, 59, 69...).
+# Root C-Up: a single previous-prompt is correct. Measured 2026-08-12 on a bash
+# pane with real OSC 133 marks: entering copy-mode lands at the live prompt
+# (cursor_y=27, scroll=0); ONE previous-prompt reaches the previous mark
+# (scroll=24 — that is the prior user message). An earlier version used two
+# calls on the mistaken belief the first was a no-op — it is not; two calls
+# overshoot by one message (scroll jumped to 75 instead of 24).
 #
-# Escape / a plain click leaves copy-mode and returns to the input box (see
-# copy-mode-type-exit.sh). Ctrl+Down is deliberately left alone.
-bind -n C-Up copy-mode \; send-keys -X previous-prompt \; send-keys -X previous-prompt
-bind -T copy-mode-vi C-Up send-keys -X previous-prompt
+# Root C-Down: intentionally unbound. At the live prompt you are already at the
+# newest message; entering copy-mode and issuing next-prompt would be meaningless.
+# Leaving it unbound lets the running app (omp) receive Ctrl+Down naturally for
+# its own purposes (multi-line input, suggestion navigation, etc.).
+#
+# Inside copy-mode both directions work: C-Up steps back, C-Down steps forward.
+# When next-prompt has no mark below the cursor it is a silent no-op; exit with
+# Escape, a click, or any letter (copy-mode-type-exit.sh handles that).
+#
+# Measured 2026-08-12: scroll 0 → 24 (C-Up, one prompt back), 24 → 0 (C-Down,
+# one prompt forward). Escape / a plain click leaves copy-mode and returns to
+# the input box (see copy-mode-type-exit.sh).
+bind -n C-Up copy-mode \; send-keys -X previous-prompt
+bind -T copy-mode-vi C-Up  send-keys -X previous-prompt
+bind -T copy-mode-vi C-Down send-keys -X next-prompt
 
 # Ctrl+Enter (and every other modified key) only survives the trip through tmux when
 # extended keys are on. With it off, tmux flattens Ctrl+Enter to a bare CR, so omp's

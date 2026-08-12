@@ -73,7 +73,7 @@ p3_match_file() {
     if [[ "$f" == $g || "$f" == $core || "$f" == */$core ]]; then excluded=0; break; fi
   done
   if [[ $excluded -eq 0 ]]; then
-    for g in "**/bin/p3-paths.json" "**/bin/nhq-p3-guard" "**/bin/nhq-jcode-pretool" "**/.nhq/pre-tool-guard"; do
+    for g in "**/bin/p3-paths.json" "**/bin/nhq-p3-guard" "**/.nhq/pre-tool-guard"; do
       core="${g#\*\*/}"
       # shellcheck disable=SC2053
       if [[ "$f" == $g || "$f" == $core || "$f" == */$core ]]; then excluded=1; break; fi

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""nhq-create-book — assemble a vault book: chapters in, one bound document out."""
 import sys
 import os
 import json

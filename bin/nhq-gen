@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""nhq-gen — generate every command face declared in nhq-commands.yml.
+
+    nhq-gen              show what would change, touch nothing
+    nhq-gen --apply      create/repair the symlinks
+    nhq-gen --list       print every name this manifest defines
+    nhq-gen --json       machine output
+
+A "face" is a symlink named `nhq-<project>-<env>[-<side>]-<action>` pointing at
+the one real script that implements it. The script reads `basename "$0"` and
+serves whichever face was called — the pattern `nhq-heydaddy-deploy` has used
+since 1 Aug 2026 (its line 89).
+
+WHY GENERATE: Yash's naming scheme (2026-08-12) puts project, environment, side
+and action all in the name, so tab completion is the menu and `--env prod` can
+never be forgotten. The price is combinatorial — envs × sides × actions — and
+hand-writing that grid is precisely what let three prefixes appear for HeyDaddy
+between 15 Jul and 1 Aug. Declared once here, the grid cannot drift from itself.
+
+WHERE THE LINKS GO: both `dots/bin` (so the repo carries them and install.sh's
+`nhq-*` glob installs them on a fresh machine) and `~/.local/bin` (so they work
+right now without re-running install.sh).
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import yaml
+
+BIN = Path(__file__).resolve().parent
+LOCAL = Path.home() / ".local/bin"
+MANIFEST = BIN / "nhq-commands.yml"
+
+
+def faces(spec: dict) -> list[tuple[str, str]]:
+    """Every (face_name, impl) the manifest defines. The single source of the grid."""
+    out: list[tuple[str, str]] = []
+    for project, cfg in spec.items():
+        envs = cfg.get("envs") or []
+        sides = cfg.get("sides") or []
+        for action, a in (cfg.get("grid") or {}).items():
+            impl = a["impl"]
+            needs_side = a.get("side") == "required"
+            if needs_side and not sides:
+                sys.exit(f"nhq-gen: {project}.{action} wants a side but {project} declares none")
+            for env in envs:
+                if needs_side:
+                    out.extend((f"nhq-{project}-{env}-{s}-{action}", impl) for s in sides)
+                else:
+                    out.append((f"nhq-{project}-{env}-{action}", impl))
+    return sorted(out)
+
+
+def declared(spec: dict) -> set[str]:
+    """Grid faces + hand-written `direct` names + the impls themselves.
+
+    This is the set `nhq-lint` measures reality against, so it lives here rather
+    than being re-derived there and drifting.
+    """
+    names = {f for f, _ in faces(spec)}
+    for cfg in spec.values():
+        names |= set((cfg.get("direct") or {}).keys())
+        names |= {a["impl"] for a in (cfg.get("grid") or {}).values()}
+    return names
+
+
+def plan(spec: dict) -> list[dict]:
+    """Where each face should point.
+
+    Inside dots/bin the link target is the bare impl NAME, i.e. relative. An
+    absolute target would bake `/home/yash/Github/dots` into a committed symlink
+    and break on any other machine or clone path — which is the exact promise
+    this repo exists to keep. In ~/.local/bin the target has to be absolute,
+    because from there the impl lives in another tree entirely.
+    """
+    rows = []
+    for face, impl in faces(spec):
+        for where, want in ((BIN / face, impl), (LOCAL / face, str(BIN / impl))):
+            target = BIN / impl
+            have = os.readlink(where) if where.is_symlink() else None
+            if have == want:
+                state = "ok"
+            elif where.exists() and not where.is_symlink():
+                state = "BLOCKED"      # a real file sits where a face belongs
+            elif have is None:
+                state = "create"
+            else:
+                state = "repoint"
+            rows.append({
+                "face": face, "impl": impl, "path": str(where), "target": want,
+                "state": state, "impl_exists": target.exists(),
+            })
+    return rows
+
+
+def main() -> int:
+    if not MANIFEST.exists():
+        print(f"nhq-gen: no manifest at {MANIFEST}", file=sys.stderr)
+        return 2
+    spec = yaml.safe_load(MANIFEST.read_text())
+
+    if "--list" in sys.argv:
+        for face, impl in faces(spec):
+            print(f"{face}  ->  {impl}")
+        return 0
+
+    rows = plan(spec)
+    apply = "--apply" in sys.argv
+
+    if "--json" in sys.argv:
+        print(json.dumps({"ok": True, "applied": apply, "faces": rows}, indent=2))
+        return 0
+
+    missing = sorted({r["impl"] for r in rows if not r["impl_exists"]})
+    blocked = [r for r in rows if r["state"] == "BLOCKED"]
+    todo = [r for r in rows if r["state"] in ("create", "repoint")]
+
+    for r in todo:
+        if apply and r["impl_exists"]:
+            p = Path(r["path"])
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if p.is_symlink() or p.exists():
+                p.unlink()
+            p.symlink_to(r["target"])
+        verb = "linked " if apply and r["impl_exists"] else r["state"]
+        print(f"  {verb:<8} {r['path']}  ->  {r['impl']}")
+
+    for r in blocked:
+        print(f"  BLOCKED  {r['path']} is a real file, not a link — move it first",
+              file=sys.stderr)
+
+    print(f"\n{len(rows)} faces · {len(todo)} to do · {len(blocked)} blocked")
+    if missing:
+        # Not fatal: the manifest is allowed to describe a tool before it is
+        # written. Saying so is more useful than refusing to run.
+        print(f"impl not written yet: {', '.join(missing)}", file=sys.stderr)
+    if not apply and todo:
+        print("re-run with --apply", file=sys.stderr)
+    return 1 if blocked else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Thin wrapper — the real logic lives in the heydaddy repo (source of truth).
+# Keeping it here just puts `nhq-heydaddy-local-docker` on PATH.
+exec /home/yash/Github/Work/heydaddy/scripts/local-dev.sh "$@"

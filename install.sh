@@ -68,7 +68,7 @@ link bin/agy-usage      "$HOME/.local/bin/agy-usage"
 #   *.sh / *.yml / *.json / *.jsonl / *.md — libs + data. nhq-lib.sh and the
 #     registries are resolved as siblings in dots/bin via `readlink -f`, so they
 #     must stay beside the binaries and must NOT be linked.
-#   nhq-heydaddy-deploy — a dispatcher that picks its behaviour from argv[0].
+#   nhq-heydaddy-deploy, nhq-heydaddy-probe — dispatchers that picks its behaviour from argv[0].
 #     It is installed under its four face names (dev/prod × be/fe), which are
 #     symlinks to it inside dots/bin and are matched by the glob. Linking the
 #     dispatcher under its own name would give it no face to dispatch to.
@@ -76,12 +76,28 @@ for path in "$DOTS"/bin/nhq-*; do
   cmd=$(basename "$path")
   case "$cmd" in
     *.sh|*.yml|*.json|*.jsonl|*.md) continue ;;
-    nhq-heydaddy-deploy)            continue ;;
+    nhq-heydaddy-deploy|nhq-heydaddy-probe) continue ;;
   esac
   [ -x "$path" ] || continue
   link "bin/$cmd" "$HOME/.local/bin/$cmd"
 done
 link bin/mcp-write-guard "$HOME/.local/bin/mcp-write-guard"
+
+# Generated faces, then the name guard.
+#
+# nhq-gen reads bin/nhq-commands.yml and creates every `nhq-<project>-<env>[-<side>]-<action>`
+# symlink the manifest declares — the fully-qualified names Yash navigates by tab
+# (2026-08-12). They are generated rather than hand-written because the grid is
+# combinatorial (envs × sides × actions) and hand-maintaining it is exactly what
+# let three prefixes appear for HeyDaddy between 15 Jul and 1 Aug.
+#
+# nhq-lint then refuses names the manifest cannot explain. It runs HERE, at
+# install, for the same reason the loop above became a glob: the rule was never
+# the problem, nothing checking it was. It prints and does not abort — a naming
+# complaint must not stop a machine being rebuilt — but it is loud, and errors
+# are only ever things provably broken, never style opinions.
+"$DOTS"/bin/nhq-gen --apply
+"$DOTS"/bin/nhq-lint --quiet || echo "  ^ naming errors above — fix them before they spread"
 
 
 echo "==> [4/4] System config (apply manually with sudo or per-user as noted)"

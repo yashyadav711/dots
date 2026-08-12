@@ -1,0 +1,99 @@
+# nhq-commands.yml — the grammar for every generated NHQ command name.
+#
+# Read by `nhq-gen` (creates the names) and `nhq-lint` (rejects names this file
+# cannot explain). Data, not a command: install.sh's `nhq-*` glob skips *.yml,
+# and the tools find it as a sibling via `readlink -f`, so it must stay in
+# dots/bin next to them.
+#
+# ── Why names are generated ──────────────────────────────────────────────────
+# Yash, 2026-08-12: "jaise user directories mein tab daba daba ke jaata hai,
+# waise hi commands bhi." Fully-qualified names — nhq-heydaddy-prod-health —
+# so tab completion is the menu, the name still explains itself in shell history
+# a month later, an agent can CONSTRUCT the name from the grammar without
+# reading --help, and the environment is welded in where `--env prod` could have
+# been forgotten or typo'd.
+#
+# The cost of that style is combinatorial: projects × envs × sides × actions.
+# Hand-written, that is exactly the rot that produced three prefixes for HeyDaddy
+# between 15 Jul and 1 Aug 2026. So the faces are GENERATED from this file and
+# never typed. Add an action here, run `nhq-gen`, every combination appears.
+#
+# ── Shape ────────────────────────────────────────────────────────────────────
+#   <project>:
+#     envs:   [...]            required — always in the name, even a lone `local`
+#     sides:  [...]            optional — only if the project has be/fe style parts
+#     grid:
+#       <action>:
+#         impl: <file>         the ONE real script, dispatching on argv[0]
+#         side: required|none  does this action need a side?
+#     direct:                  real files, not generated, but legitimate
+#       <name>: <one-line reason it is not a grid name>
+#
+# Generated face = nhq-<project>-<env>[-<side>]-<action>
+#
+# The dispatcher reads `basename "$0"` and serves whichever face was called —
+# the pattern nhq-heydaddy-deploy has used since 1 Aug 2026 (its line 89).
+
+heydaddy:
+  envs:  [dev, prod]
+  sides: [be, fe]
+  grid:
+    deploy:
+      impl: nhq-heydaddy-deploy
+      side: required
+      note: >
+        Prod-critical and older than this convention, but its four faces already
+        used project-env-side-action, so nothing about it had to change. Left
+        untouched deliberately.
+    health:
+      impl: nhq-heydaddy-probe
+      side: required
+      note: is it serving correctly — backend /health, frontend /
+    logs:
+      impl: nhq-heydaddy-probe
+      side: required
+      note: railway logs for that service and environment
+    ping:
+      impl: nhq-heydaddy-probe
+      side: none
+      note: env-level reachability of both hosts, no body parsing
+  direct:
+    nhq-heydaddy-totp: >
+      Prints the admin TOTP code. One secret, no env axis — it is not per
+      environment. Was `hd-code`; `hd-` is retired because an abbreviation
+      defeats tab completion, which is the whole point of the scheme.
+    nhq-heydaddy-promote: >
+      Walks the whole tier ladder local → staging → dev → prod, so it spans
+      every env rather than naming one. Thin wrapper over the repo's
+      scripts/promote.sh, which is marked TIER MODEL — LOCKED and is what
+      drives the deploy faces above.
+    nhq-heydaddy-local-docker: >
+      Repo scripts/local-dev.sh — Docker plus `supabase start`. Was
+      `heydaddy-local`. Renamed because the old name did not say which of the
+      two local modes it was.
+    nhq-heydaddy-local-remote: >
+      No Docker, runs against the REMOTE dev Supabase, works on any branch.
+      Was `hd-dev`. Same reason: `heydaddy-local` and `hd-dev` were both "run
+      it locally" under two different prefixes and neither name said how.
+    nhq-heydaddy-deploy-selftest: >
+      Proves the deploy dispatcher can never hang. `-selftest` is a suffix this
+      house already uses consistently across nine tools, so it reads as part of
+      the noun rather than a verb baked into the name.
+    nhq-heydaddy-probe: >
+      The implementation behind the health / ping / logs faces. Listed so lint
+      does not flag the real script sitting beside its own generated symlinks.
+
+anvil:
+  # One environment today. `local` is still written into every name rather than
+  # dropped, so the day Anvil gets a dev or prod the grid widens instead of
+  # every existing name changing meaning underneath you.
+  envs: [local]
+  grid:
+    up:     { impl: nhq-anvil-local, side: none, note: start Supabase + dashboard, verify, print the card }
+    down:   { impl: nhq-anvil-local, side: none, note: stop the dashboard and the Supabase containers }
+    status: { impl: nhq-anvil-local, side: none, note: what is running right now }
+    reset:  { impl: nhq-anvil-local, side: none, note: wipe the DB, re-apply migrations, reseed, re-verify }
+    scan:   { impl: nhq-anvil-local, side: none, note: run the agent against THIS machine and show findings }
+    logs:   { impl: nhq-anvil-local, side: none, note: tail the dashboard dev server log }
+    verify: { impl: nhq-anvil-local, side: none, note: run the full gate suite, no servers needed }
+  direct: {}

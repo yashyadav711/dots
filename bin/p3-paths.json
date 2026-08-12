@@ -56,7 +56,6 @@
       "ai/p3-paths.json",
       "**/bin/p3-paths.json",
       "**/bin/nhq-p3-guard",
-      "**/bin/nhq-jcode-pretool",
       "**/bin/dangerous-command-guard*",
       "**/.nhq/pre-tool-guard"
     ]

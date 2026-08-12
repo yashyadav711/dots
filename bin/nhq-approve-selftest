@@ -13,7 +13,6 @@ trap 'rm -rf "$TMP"' EXIT
 
 APPROVE="$BIN/nhq-approve"
 P3="$BIN/nhq-p3-guard"
-PRETOOL="$BIN/nhq-jcode-pretool"
 
 # Hermetic env: throwaway store, silent audit/notify, sandbox p3 policy.
 export NHQ_APPROVAL_STORE="$TMP/approval.json"
@@ -55,17 +54,6 @@ p3verdict() { # $1=repo $2..=env
 p3allow() { # $1=repo $2..=env → allow|deny
   local repo="$1"; shift
   if env "$@" "$P3" check "$repo" >/dev/null 2>&1; then echo allow; else echo deny; fi
-}
-
-# jcode pretool push/merge rc for a Director/fleet caller (0 allow, 2 block).
-pretool_rc() { # $1=cmd $2=cwd $3..=env
-  local cmd="$1" cwd="$2"; shift 2
-  printf '{"command":%s}' "$(jq -Rn --arg c "$cmd" '$c')" | \
-    env -u TMUX -u NHQ_SESSION "$@" \
-      JCODE_HOOK_TOOL_NAME=bash JCODE_HOOK_CWD="$cwd" \
-      NHQ_APPROVAL_STORE="$NHQ_APPROVAL_STORE" NHQ_NOTIFY="$NHQ_NOTIFY" \
-      NHQ_NOTIFY_SUPPRESS=1 "$PRETOOL" >/dev/null 2>&1
-  echo $?
 }
 
 echo "── A: nhq-approve token store primitives ──────────────────────────────"
@@ -122,33 +110,17 @@ DOTS="$TMP/dots"
 mkrepo "$DOTS" "https://github.com/1jehuang/dots.git" main ".env" "SECRET=1"
 eq "6b. Director non-scoped-repo main P3 → verdict" "$(p3verdict "$DOTS" NHQ_AGENT=Director NHQ_SESSION=main)" "ALLOW(out-of-scope)"
 
-echo "── C: nhq-jcode-pretool Director prod push/merge gate (cases 7 + 8) ────"
-"$APPROVE" clear >/dev/null
-# 7. Director push to dev / a feat branch → NOT gated (passes).
-PFEAT="$TMP/hd-push-feat"
-mkrepo "$PFEAT" "https://github.com/yashyadav711/heydaddy.git" main
-git -C "$PFEAT" checkout -q -b feat/x
-eq "7. Director push feat/x (scoped repo) → allow"   "$(pretool_rc "git -C $PFEAT push origin feat/x" "$PFEAT" NHQ_AGENT=Director)" "0"
-eq "7b. Director bare push while on feat → allow"    "$(pretool_rc "git -C $PFEAT push" "$PFEAT" NHQ_AGENT=Director)" "0"
-# Director on main pushing an explicit dev refspec → not main → allow
-PMAIN="$TMP/hd-push-main"
-mkrepo "$PMAIN" "https://github.com/yashyadav711/heydaddy.git" main
-eq "7c. Director push origin dev (on main) → allow"  "$(pretool_rc "git -C $PMAIN push origin dev" "$PMAIN" NHQ_AGENT=Director)" "0"
-# non-scoped repo main push → allow
-eq "7d. Director push non-scoped repo main → allow"  "$(pretool_rc "git -C $DOTS push origin main" "$DOTS" NHQ_AGENT=Director)" "0"
-
-# 8. Director push to scoped-repo main WITHOUT token → blocked; WITH token → allowed.
-eq "8a. Director push heydaddy main, no token → BLOCK" "$(pretool_rc "git -C $PMAIN push origin main" "$PMAIN" NHQ_AGENT=Director)" "2"
-"$APPROVE" grant --repo heydaddy --target main >/dev/null
-eq "8b. Director push heydaddy main, with token → allow" "$(pretool_rc "git -C $PMAIN push origin main" "$PMAIN" NHQ_AGENT=Director)" "0"
-eq "8c. push did NOT consume token (still valid)"   "$(("$APPROVE" verify --repo heydaddy --target main >/dev/null 2>&1) && echo hit || echo miss)" "hit"
-# merge naming main while on main → blocked without token
-git -C "$PMAIN" checkout -q -b feat3
-git -C "$PMAIN" checkout -q main
-"$APPROVE" clear >/dev/null
-eq "8d. Director merge feat3 on main, no token → BLOCK" "$(pretool_rc "git -C $PMAIN merge feat3" "$PMAIN" NHQ_AGENT=Director)" "2"
-# quoted 'git push origin main' inside echo must NOT fire
-eq "8e. Director echo 'git push origin main' → allow"  "$(pretool_rc "echo \"git push origin main\"" "$PMAIN" NHQ_AGENT=Director)" "0"
+# ── C: RETIRED 2026-08-12 ────────────────────────────────────────────────────
+# Section C covered the jcode pre_tool push/merge gate (cases 7 and 8). jcode was
+# unused for two weeks (~/.jcode last touched 2026-07-29), so the whole family was
+# retired: the hooks were unwired from ~/.jcode/config.toml and the scripts moved
+# to ~/.local/share/nhq-archive/. With nhq-jcode-pretool gone these eight cases
+# returned 127 and the suite read 22 passed / 8 failed — a failure of the harness,
+# not of the gate.
+#
+# What was covered here is NOT lost: the same Protocol-3 policy is exercised by
+# section B through nhq-p3-guard, which is the live gate for omp and Claude Code.
+# Only the jcode ADAPTER for it went away. Restore from git if jcode ever returns.
 
 echo "── D: regressions — frozen behavior preserved ─────────────────────────"
 # firststone whole-repo block still fires

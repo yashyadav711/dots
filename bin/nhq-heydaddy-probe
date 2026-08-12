@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# nhq-heydaddy-probe — read-only sibling of nhq-heydaddy-deploy; ten faces
+#   (called through symlinks, same argv[0] dispatch pattern):
+#
+#   nhq-heydaddy-dev-be-health     nhq-heydaddy-prod-be-health
+#   nhq-heydaddy-dev-fe-health     nhq-heydaddy-prod-fe-health
+#   nhq-heydaddy-dev-ping          nhq-heydaddy-prod-ping
+#   nhq-heydaddy-dev-be-logs       nhq-heydaddy-prod-be-logs
+#   nhq-heydaddy-dev-fe-logs       nhq-heydaddy-prod-fe-logs
+#
+# health — curl the service URL; print status, HTTP code, latency ms. For
+#          backend faces the /health endpoint returns JSON that includes a
+#          "commit" field (verified 2026-08-12: {"status":"ok","commit":"<sha>",
+#          "version":"<sha>","started_at":...,"uptime_seconds":...}); that SHA is
+#          surfaced alongside the HTTP status so you can confirm what code is live
+#          without touching the deploy tooling. Exit 0 if HTTP 200, 1 otherwise.
+#          Never hangs: every curl call is capped at CURL_TIMEOUT.
+# ping   — fast reachability of BOTH env hosts (PING_TIMEOUT each). One line per
+#          host. Exit 0 only if both reply 200.
+# logs   — `railway logs` for the service+environment; pass-through to the CLI.
+#          -n N controls line count (default 100). Exit 2 if railway is absent.
+#
+# Flags (health, ping): --json   emit one JSON object to stdout; all noise to
+#                                stderr. snake_case keys; latency_ms has the unit
+#                                in the key name; checked_at is ISO-8601 + offset.
+#
+# URLs, service names, and Railway env strings are verbatim from
+# nhq-heydaddy-deploy lines 91-107 and confirmed against scripts/promote.sh
+# lines 58-61. Do not edit here without updating those two places.
+#   backend  → Railway service "heydaddy",     env "dev" / "production"
+#   frontend → Railway service "heydaddy-web", env "dev" / "production"
+# ("production" is what the Railway API calls it; nhq-heydaddy-deploy line 93
+# is the authority — it writes RW_ENV="production" for prod faces.)
+#
+# Made by Director for Yash — 2026-08-12.
+set -uo pipefail
+
+PROJECT_ID="0a52cb6e-d0da-49d2-b608-ea1fa6b4c68f"
+CURL_TIMEOUT=10   # seconds; health curl --max-time; keeps the tool bounded even
+                  # on a dead or firewall-stalled host
+PING_TIMEOUT=5    # seconds; ping is a quick reachability check, not a full probe
+
+# ── Resolve env + tier + action from the invoked name ──────────────────────
+# Same pattern as nhq-heydaddy-deploy line 89: self="$(basename "$0")"
+self="$(basename "$0")"
+case "$self" in
+  *-dev-be-health)  RW_ENV="dev";        SERVICE="heydaddy";     TIER="be"; ACTION="health" ;;
+  *-dev-fe-health)  RW_ENV="dev";        SERVICE="heydaddy-web"; TIER="fe"; ACTION="health" ;;
+  *-prod-be-health) RW_ENV="production"; SERVICE="heydaddy";     TIER="be"; ACTION="health" ;;
+  *-prod-fe-health) RW_ENV="production"; SERVICE="heydaddy-web"; TIER="fe"; ACTION="health" ;;
+  *-dev-ping)       RW_ENV="dev";        SERVICE="";             TIER="";   ACTION="ping"   ;;
+  *-prod-ping)      RW_ENV="production"; SERVICE="";             TIER="";   ACTION="ping"   ;;
+  *-dev-be-logs)    RW_ENV="dev";        SERVICE="heydaddy";     TIER="be"; ACTION="logs"   ;;
+  *-dev-fe-logs)    RW_ENV="dev";        SERVICE="heydaddy-web"; TIER="fe"; ACTION="logs"   ;;
+  *-prod-be-logs)   RW_ENV="production"; SERVICE="heydaddy";     TIER="be"; ACTION="logs"   ;;
+  *-prod-fe-logs)   RW_ENV="production"; SERVICE="heydaddy-web"; TIER="fe"; ACTION="logs"   ;;
+  *)
+    printf 'nhq-heydaddy-probe: call me through one of the symlinks:\n' >&2
+    printf '  nhq-heydaddy-{dev,prod}-{be,fe}-{health,logs}\n' >&2
+    printf '  nhq-heydaddy-{dev,prod}-ping\n' >&2
+    exit 2 ;;
+esac
+
+# "production" → "prod" for human output; Railway API keeps the full string.
+env_label="$( [[ "$RW_ENV" == "production" ]] && echo "prod" || echo "$RW_ENV" )"
+[[ -n "$TIER" ]] && side_label=" · $TIER" || side_label=""
+LABEL="${env_label}${side_label}"
+
+# ── URL table (mirrors nhq-heydaddy-deploy lines 104-107) ──────────────────
+URL=""
+if [[ "$ACTION" != "ping" ]]; then
+  case "$RW_ENV/$TIER" in
+    dev/be)        URL="https://heydaddy-dev.up.railway.app/health" ;;
+    dev/fe)        URL="https://heydaddy-web-dev.up.railway.app/"   ;;
+    production/be) URL="https://api.heydaddy.app/health"            ;;
+    production/fe) URL="https://www.heydaddy.app/"                  ;;
+  esac
+fi
+
+# Ping hits both env URLs; index 0=be, 1=fe — same host table as above.
+declare -a PING_URLS PING_SIDES
+case "$RW_ENV" in
+  dev)        PING_URLS=("https://heydaddy-dev.up.railway.app/health"
+                         "https://heydaddy-web-dev.up.railway.app/") ;;
+  production) PING_URLS=("https://api.heydaddy.app/health"
+                         "https://www.heydaddy.app/")                ;;
+esac
+PING_SIDES=("be" "fe")
+
+# ── ISO-8601 timestamp with local offset (--rfc-3339 is GNU coreutils) ─────
+now_iso() { date --rfc-3339=seconds 2>/dev/null | sed 's/ /T/'; }
+
+# ── Flag parsing ────────────────────────────────────────────────────────────
+want_json=0
+log_lines=100
+i=0
+while (( i < $# )); do
+  i=$(( i + 1 ))
+  arg="${!i}"
+  case "$arg" in
+    --help|-h)
+      printf '%s — HeyDaddy %s probe (%s).\n' "$self" "$LABEL" "$ACTION"
+      printf '\n'
+      case "$ACTION" in
+        health)
+          printf 'Usage: %s [--json] [--help]\n\n' "$self"
+          printf '  Curl %s\n' "$URL"
+          printf '  Print HTTP code and latency in ms.\n'
+          [[ "$TIER" == "be" ]] && printf '  Backend: also surfaces the commit SHA from the JSON /health response.\n'
+          printf '\n'
+          printf '  Exit 0 → HTTP 200 (healthy).\n'
+          printf '  Exit 1 → anything else (wrong code, no response, curl error).\n'
+          ;;
+        ping)
+          printf 'Usage: %s [--json] [--help]\n\n' "$self"
+          printf '  Fast reachability of both %s hosts (%d s timeout each):\n' \
+            "$env_label" "$PING_TIMEOUT"
+          printf '    %s  (%s · be)\n' "${PING_URLS[0]}" "$env_label"
+          printf '    %s  (%s · fe)\n' "${PING_URLS[1]}" "$env_label"
+          printf '\n'
+          printf '  Exit 0 only if both return HTTP 200.\n'
+          ;;
+        logs)
+          printf 'Usage: %s [-n N] [--help]\n\n' "$self"
+          printf '  Fetch last N lines of railway logs for %s (service=%s env=%s).\n' \
+            "$LABEL" "$SERVICE" "$RW_ENV"
+          printf '  -n N   line count (default %d).\n' "$log_lines"
+          printf '  Requires railway CLI on PATH and authenticated.\n'
+          printf '\n'
+          printf '  Exit 2 if railway is not found.\n'
+          ;;
+      esac
+      exit 0
+      ;;
+    --json)
+      want_json=1
+      ;;
+    -n)
+      i=$(( i + 1 ))
+      log_lines="${!i:-100}"
+      ;;
+    -n[0-9]*)
+      log_lines="${arg#-n}"
+      ;;
+    *)
+      printf '%s: unknown argument: %s\n' "$self" "$arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# ── health ──────────────────────────────────────────────────────────────────
+do_health() {
+  local tmpbody; tmpbody="$(mktemp -t nhq-probe.XXXXXX)"
+  trap 'rm -f "$tmpbody"' RETURN
+
+  local t0 t1 latency_ms http_code
+  t0="$(date +%s%3N)"
+  http_code="$(curl -s -o "$tmpbody" -w '%{http_code}' \
+    --max-time "$CURL_TIMEOUT" "$URL" 2>/dev/null)" || http_code="000"
+  t1="$(date +%s%3N)"
+  latency_ms=$(( t1 - t0 ))
+
+  # Backend /health is JSON; surface commit only for be faces (fe is HTML).
+  local commit=""
+  if [[ "$TIER" == "be" ]] && command -v python3 >/dev/null 2>&1; then
+    commit="$(python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    # "commit" field is the stamped RAILWAY_GIT_COMMIT_SHA (promote.sh line 334).
+    # "version" mirrors it as a fallback from when the stamp was not yet in place.
+    print((d.get("commit") or d.get("version") or "")[:40])
+except Exception:
+    print("")
+' <"$tmpbody" 2>/dev/null)" || commit=""
+  fi
+
+  local ok=0
+  [[ "$http_code" == "200" ]] && ok=1
+  local checked_at; checked_at="$(now_iso)"
+
+  if (( want_json )); then
+    local ok_bool; ok_bool="$( (( ok )) && echo true || echo false )"
+    printf '{"ok":%s,"env":"%s","side":"%s","url":"%s","http_code":"%s","latency_ms":%d,"commit":"%s","checked_at":"%s"}\n' \
+      "$ok_bool" "$env_label" "$TIER" "$URL" \
+      "$http_code" "$latency_ms" "$commit" "$checked_at"
+  else
+    local sym; sym="$( (( ok )) && echo '✓' || echo '✗' )"
+    printf '%s %s  HTTP %s  %d ms' "$sym" "$LABEL" "$http_code" "$latency_ms"
+    [[ -n "$commit" ]] && printf '  commit=%s' "${commit:0:8}"
+    printf '\n'
+    if ! (( ok )); then
+      local body; body="$(cat "$tmpbody" 2>/dev/null || true)"
+      printf '  url: %s\n' "$URL" >&2
+      [[ -n "$body" ]] && printf '  response: %s\n' "${body:0:120}" >&2
+    fi
+  fi
+
+  (( ok )) && return 0 || return 1
+}
+
+# ── ping ────────────────────────────────────────────────────────────────────
+do_ping() {
+  local all_ok=1
+  local -a codes latencies syms
+
+  for i in 0 1; do
+    local t0 t1
+    t0="$(date +%s%3N)"
+    codes[$i]="$(curl -s -o /dev/null -w '%{http_code}' \
+      --max-time "$PING_TIMEOUT" "${PING_URLS[$i]}" 2>/dev/null)" || codes[$i]="000"
+    t1="$(date +%s%3N)"
+    latencies[$i]=$(( t1 - t0 ))
+    if [[ "${codes[$i]}" == "200" ]]; then
+      syms[$i]="✓"
+    else
+      syms[$i]="✗"
+      all_ok=0
+    fi
+  done
+
+  local checked_at; checked_at="$(now_iso)"
+  local ok_bool; ok_bool="$( (( all_ok )) && echo true || echo false )"
+
+  if (( want_json )); then
+    # Two hosts → emit a "hosts" array rather than lying with a single side/url.
+    printf '{"ok":%s,"env":"%s","hosts":[{"side":"%s","url":"%s","http_code":"%s","latency_ms":%d},{"side":"%s","url":"%s","http_code":"%s","latency_ms":%d}],"checked_at":"%s"}\n' \
+      "$ok_bool" "$env_label" \
+      "${PING_SIDES[0]}" "${PING_URLS[0]}" "${codes[0]}" "${latencies[0]}" \
+      "${PING_SIDES[1]}" "${PING_URLS[1]}" "${codes[1]}" "${latencies[1]}" \
+      "$checked_at"
+  else
+    for i in 0 1; do
+      printf '%s %s · %s  HTTP %s  %d ms\n' \
+        "${syms[$i]}" "$env_label" "${PING_SIDES[$i]}" "${codes[$i]}" "${latencies[$i]}"
+    done
+  fi
+
+  (( all_ok )) && return 0 || return 1
+}
+
+# ── logs ────────────────────────────────────────────────────────────────────
+do_logs() {
+  if ! command -v railway >/dev/null 2>&1; then
+    printf '%s: railway CLI is not on PATH — install it from railway.app/cli\n' "$self" >&2
+    exit 2
+  fi
+  # Close stdin so any interactive prompt railway might open EOFs immediately
+  # rather than blocking this script forever — same discipline as nhq-heydaddy-deploy.
+  exec railway logs \
+    --project  "$PROJECT_ID" \
+    --service  "$SERVICE" \
+    --environment "$RW_ENV" \
+    --lines    "$log_lines" \
+    </dev/null
+}
+
+# ── dispatch ────────────────────────────────────────────────────────────────
+case "$ACTION" in
+  health) do_health ;;
+  ping)   do_ping   ;;
+  logs)   do_logs   ;;
+esac
