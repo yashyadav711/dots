@@ -281,14 +281,26 @@ up)
     ok "already running on :$DASH_PORT"
   else
     stop_dash
-    # Detach properly. Three things matter here and each one bit once:
-    #   </dev/null   pnpm/next must never inherit our stdin, or a prompt hangs invisibly.
-    #   >log 2>&1    without this the child keeps our stdout open, so `cmd | tail` never
-    #                sees EOF and the caller appears to hang long after we exited.
-    #   setsid       new session, so it survives this shell and Ctrl-C on the caller.
-    # `$!` would capture setsid, not the server, so the pid is resolved from the
-    # listening socket after readiness instead — that is the process `down` must kill.
-    ( cd apps/dashboard && setsid pnpm dev --port "$DASH_PORT" </dev/null >"$DASH_LOG" 2>&1 & )
+    # Detach properly. Redirecting 0/1/2 is NOT enough, and that cost an hour:
+    # a long-lived child also inherits every descriptor at fd>=3, so when this
+    # script is run in a pipeline (`... | tail`) the dev server keeps the
+    # caller's captured stdout open. `tail` prints, the script exits, and the
+    # SHELL still hangs — output complete, prompt never returns. The child must
+    # therefore close everything above stderr before it execs.
+    #   setsid       new session, so the server survives this shell and Ctrl-C
+    #   </dev/null   never inherit stdin, or a prompt hangs invisibly
+    #   >log 2>&1    keep the server's own chatter out of our stdout
+    #   fd sweep     the part that actually fixes the pipeline hang
+    # `$!` would be setsid's pid, not the server's, so the pid that `down` needs
+    # is resolved from the listening socket once it is up.
+    setsid sh -c '
+      cd "$1" || exit 1
+      for f in /proc/self/fd/*; do
+        n=${f##*/}
+        [ "$n" -gt 2 ] 2>/dev/null && eval "exec $n>&-" 2>/dev/null
+      done
+      exec pnpm dev --port "$2"
+    ' _ "$PWD/apps/dashboard" "$DASH_PORT" </dev/null >"$DASH_LOG" 2>&1 &
     wait_for dash_up 200 120 "Next.js" || {
       bad "dashboard did not respond on :$DASH_PORT"
       printf "    ${D}last lines of %s:${X}\n" "$DASH_LOG"; tail -12 "$DASH_LOG" | sed 's/^/      /'
