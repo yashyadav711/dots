@@ -1,0 +1,80 @@
+# vox vocabulary — edit freely, then run:  vox restart
+#
+# Literal word/phrase replacements applied AFTER transcription.
+# Matching is case-insensitive and whole-word only, so "yah" never touches
+# "yahan". If the original started with a capital, the replacement is
+# capitalised too. Longer phrases win over shorter ones.
+# Keys containing a space must be quoted.
+#
+# Why there is no keyword-bias list here: Whisper's initial-prompt biasing was
+# measured on 2026-08-11 and it made things worse — a 508-character list of our
+# project names slowed decoding by 30% AND corrupted a word it used to get
+# right ("Helmet" became "Helpet"). Deterministic replacements below cost
+# nothing and only ever touch what they are aimed at.
+
+[fix]
+# --- Hinglish spelling: the model writes book-transliteration, we want casual ---
+yah        = "ye"
+vah        = "wo"
+veh        = "wo"
+thik       = "theek"
+mainne     = "maine"
+nahin      = "nahi"
+achchha    = "achha"
+sachchi    = "sacchi"
+svaad      = "swaad"
+"maine ne" = "maine"
+"kyun ki"  = "kyunki"
+"is liye"  = "isliye"
+"ke lie"   = "ke liye"
+"hain na"  = "hai na"
+
+# --- product and tool names the model hears phonetically ---
+"sub line"     = "Sublime"
+"sublime text" = "Sublime"
+"hey daddy"    = "HeyDaddy"
+heydaddy       = "HeyDaddy"
+"hey dady"     = "HeyDaddy"
+"hyper land"   = "Hyprland"
+hyperland      = "Hyprland"
+"cachy os"     = "CachyOS"
+"catchy os"    = "CachyOS"
+"n h q"        = "NHQ"
+nhq            = "NHQ"
+"eleven labs"  = "ElevenLabs"
+"open router"  = "OpenRouter"
+"deep seek"    = "DeepSeek"
+"super base"   = "Supabase"
+"supa base"    = "Supabase"
+"cloud flare"  = "Cloudflare"
+"fire crawl"   = "Firecrawl"
+"anti gravity" = "Antigravity"
+"sync thing"   = "Syncthing"
+grafify        = "graphify"
+"post gress"   = "Postgres"
+obsidian       = "Obsidian"
+orca           = "Orca"
+julian         = "Julian"
+julien         = "Julian"
+julion         = "Julian"
+"jullian"      = "Julian"
+carlos         = "Carlos"
+telegram       = "Telegram"
+claude         = "Claude"
+gemini         = "Gemini"
+cursor         = "Cursor"
+codex          = "Codex"
+venice         = "Venice"
+stripe         = "Stripe"
+vercel         = "Vercel"
+docker         = "Docker"
+github         = "GitHub"
+"git hub"      = "GitHub"
+"vs code"      = "VS Code"
+api            = "API"
+ui             = "UI"
+ux             = "UX"
+url            = "URL"
+cli            = "CLI"
+mcp            = "MCP"
+qa             = "QA"

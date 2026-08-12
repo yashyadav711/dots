@@ -47,6 +47,18 @@ link yazi/theme.toml                    "$HOME/.config/yazi/theme.toml"
 link yazi/yazi.toml                     "$HOME/.config/yazi/yazi.toml"
 link yazi/package.toml                  "$HOME/.config/yazi/package.toml"  # then run: ya pkg install  (restores flavors)
 
+# vox — system-wide voice typing. Source and config only; the venv (125 MB) and
+# the whisper/silero models (55 MB) stay out of the repo and are rebuilt on a
+# new machine. Untracked until 2026-08-13, which meant 1373 lines of voxd.py —
+# and weeks of measured tuning written into its comments — existed on exactly
+# one laptop.
+mkdir -p "$HOME/.local/share/vox" "$HOME/.config/vox"
+link vox/voxd.py                        "$HOME/.local/share/vox/voxd.py"
+link vox/voxbar.py                      "$HOME/.local/share/vox/voxbar.py"
+link vox/selftest.py                    "$HOME/.local/share/vox/selftest.py"
+link vox/config.toml                    "$HOME/.config/vox/config.toml"
+link vox/vocabulary.toml                "$HOME/.config/vox/vocabulary.toml"
+
 echo "==> [3/4] tmux (Oh My Tmux base + custom override)"
 [ -d "$HOME/.tmux" ] || git clone --single-branch https://github.com/gpakosz/.tmux.git "$HOME/.tmux"
 ln -sfn "$HOME/.tmux/.tmux.conf" "$HOME/.tmux.conf"

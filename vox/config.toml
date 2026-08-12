@@ -1,0 +1,78 @@
+# vox — system-wide voice typing.  Edit, then run:  vox restart
+# Switch model quickly:  vox model hinglish   |   vox model english
+
+# ── the gesture ───────────────────────────────────────────────────────────────
+# Two gestures, two models. Double-tap the bare modifier.
+modifier             = "Alt"    # Hinglish  — Hindi + English, romanised
+modifier_english     = "Ctrl"   # English   — Parakeet, perfect punctuation, no Hindi
+                                # set to "" to disable the second gesture
+double_tap_window_ms = 300      # gap between first release and second press
+
+# ── model lifetime ────────────────────────────────────────────────────────────
+idle_unload_sec = 300           # drop the model from RAM after 5 min idle (0 = never)
+threads         = 4             # inference threads
+
+# ── recording ─────────────────────────────────────────────────────────────────
+source         = ""             # "" = system default mic, or a name from
+                                # `pactl list short sources`
+max_record_sec = 300            # hard stop so a forgotten session cannot run forever
+min_record_sec = 0.35           # shorter than this is treated as a misfire
+
+# ── on-screen overlay ─────────────────────────────────────────────────────────
+overlay            = true       # bottom-centre waveform while recording
+# The live caption is GONE (2026-08-13). There used to be a second strip across
+# the top of the screen streaming provisional text while you spoke, and these
+# keys tuned it: live_preview, partial_every_sec, buffer_trim_sec, keep_live_sec,
+# preview_max_window_sec, partial_threads. All removed, along with the second
+# whisper-server the caption needed (~70 MB) and a decode every ~1.2 s taken
+# from the machine while the mic was open.
+#
+# Yash: "koi processing nahi ho jab tak mike se recording ho rahi ho."
+# So: waveform while you talk, one decode when you stop, text lands at once.
+
+# ── output ────────────────────────────────────────────────────────────────────
+# paste     : put it on the clipboard and fire the paste shortcut — the whole
+#             text lands at once, instantly, however long it is.
+#             Ctrl+Shift+V when a terminal has focus, Ctrl+V everywhere else,
+#             injected by Hyprland's own sendshortcut. Falls back to typing.
+# type      : simulate keystrokes. Reliable everywhere, but ~5 ms per character.
+# clipboard : copy only, paste it yourself.
+output            = "paste"
+copy_to_clipboard = true        # always also copy the final text
+trailing_space    = true        # add a space after, so you can keep dictating
+# Apps whose paste shortcut is Ctrl+Shift+V instead of Ctrl+V.
+terminal_classes  = ["kitty", "foot", "alacritty", "wezterm", "ghostty", "xterm",
+                     "konsole", "gnome-terminal", "orca-ide", "stably-orca"]
+type_delay_ms     = 0           # ms between keystrokes; raise to 2-4 if an app still drops keys
+# Long text typed in one burst overruns terminals and TUIs — they split it across
+# submissions and eat the first characters. So it goes out in bites.
+type_chunk_chars    = 300       # max characters per burst (0 = one burst)
+type_chunk_pause_ms = 120       # pause between bursts
+notify            = true
+
+# ── engine ────────────────────────────────────────────────────────────────────
+# whisper  : Whisper-Hindi2Hinglish-Swift q5_0 via whisper-server. A whisper-base
+#            fine-tune that writes Hindi in Roman script. THIS IS THE HINGLISH ONE.
+#            Measured here: RTF ~0.20 (10 s of speech -> ~2 s). Weaker punctuation.
+# parakeet : sherpa-onnx Parakeet TDT 0.6B v3 int8 — the model Orca uses.
+#            Measured here: RTF 0.10, perfect English with punctuation, but it has
+#            no Hindi at all ("kisi ek varg" came out as "kisi ekvariki").
+#
+# Rejected after measuring on this CPU — kept here so nobody re-tests them:
+#   whisper small ......................... RTF 1.38
+#   Hindi2Hinglish-Apex (large-v3-turbo) .. RTF 3.48  (encoder alone 29.7 s)
+engine = "whisper"
+
+whisper_model = "~/.local/share/vox/models/ggml-hinglish-q5_0.bin"
+# "auto" makes Whisper run a separate language-detection pass first — measured
+# at 2.2 s of pure waste on an 11 s clip, with identical output. Keep it pinned.
+whisper_lang  = "en"
+whisper_port  = 8127
+
+# Voice activity detection — whisper only ever sees the parts with speech in
+# them. Without it, a mic with a loud idle floor makes it hallucinate: 10 s of
+# an empty room decoded as "Haan."
+vad_model     = "~/.local/share/vox/models/silero_vad.onnx"
+vad_threshold = 0.4             # raise toward 0.6 if noise still gets through
+
+parakeet_dir  = "~/.config/orca/speech-models/parakeet-tdt-0.6b-v3-int8"
