@@ -17,8 +17,16 @@ onto the laptop's clipboard and back.
 WHAT IT DOES, both directions:
   phone -> laptop   files (tap, drag-drop, or straight from the camera)
   phone -> laptop   text: pasted text lands on the laptop's Wayland clipboard
+  phone -> laptop   a PROMPT typed straight into a live agent's session
   laptop -> phone   any file in the drop folder, tap to download, images preview
   laptop -> phone   the laptop's current clipboard, pulled on demand
+
+PROMPTING AN AGENT: pick Director / NV / Builder, type, send. It resolves the
+name through `nhq-tell`, which owns the lookup from an agent to whichever tmux
+session that agent is sitting in — the registry and the slug rule are its
+business, not this file's. If nobody is home the panel says offline and the
+send is refused rather than dropped silently. Replies come back the way they
+always do: the agent's own Telegram notification when it finishes.
 
 WHY A CLAIMED PORT: `nhq-port` owns 3900-3909 and those are the only ports open
 in ufw. Picking one by hand is how a URL ends up unreachable from the tablet.
@@ -37,15 +45,23 @@ needs WAYLAND_DISPLAY, which a systemd user service does not inherit. Rather tha
 depend on `import-environment` having been run, `wl_env()` finds the live
 `wayland-N` socket in XDG_RUNTIME_DIR at call time.
 
-No auth: this binds to the home LAN, behind the router, matching the rest of the
-NHQ tooling. Note it now serves downloads too, so anyone on the WiFi can read the
-drop folder — that folder is a scratch handover point, keep nothing precious in it.
-Downloads are pinned to that one directory; `..` in a name cannot escape it.
+FILES AND CLIPBOARD HAVE NO AUTH: they bind to the home LAN, behind the router,
+matching the rest of the NHQ tooling. Anyone on the WiFi can read the drop
+folder — it is a scratch handover point, keep nothing precious in it. Downloads
+are pinned to that one directory; `..` in a name cannot escape it.
+
+PROMPTS DO HAVE A KEY, and the difference is the point. Moving a file is one
+thing; starting an agent that can run shell commands on this laptop is another,
+and "it's only the home WiFi" is a thin wall to put in front of arbitrary
+execution. The key is generated once into ~/.config/nhq/inbox-token and travels
+in the URL that `nhq-inbox qr` prints, so the phone gets it by scanning and
+never has to see it again. A plain URL still does files and clipboard.
 """
 
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -180,6 +196,69 @@ def clip_read() -> str:
         return ""
 
 
+# ------------------------------------------------------------------- agents
+
+# The shortlist worth a button on a phone. The names, aliases and repos live in
+# fleet-registry.json; `nhq-tell` owns the lookup from a name to whichever tmux
+# session that agent is actually sitting in. This file deliberately knows
+# neither — a second copy of the slug rule here is how the two drift apart.
+AGENTS = [("director", "Director"), ("envy", "NV"), ("builder", "Builder")]
+
+TOKEN_PATH = HOME / ".config/nhq/inbox-token"
+
+
+def tool(name: str) -> str:
+    """Absolute path to an NHQ tool.
+
+    A systemd user unit starts with a near-empty PATH — ~/.local/bin is on it
+    only because an interactive shell puts it there. Resolving by bare name
+    works when run by hand and fails as a service, which is the worst of both.
+    """
+    return shutil.which(name) or str(HOME / ".local/bin" / name)
+
+
+def token() -> str:
+    """The key that unlocks sending prompts, created once and kept on disk.
+
+    Files and clipboard stay open on the LAN as they always were. Prompts do
+    not: a prompt reaches an agent that can run shell commands on this laptop,
+    so anyone who can reach the port would otherwise have arbitrary execution
+    through it. The token rides in the URL that `nhq-inbox qr` prints, so the
+    phone gets it by scanning once and never sees it again.
+    """
+    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if TOKEN_PATH.exists():
+        existing = TOKEN_PATH.read_text().strip()
+        if existing:
+            return existing
+    fresh = secrets.token_urlsafe(9)
+    TOKEN_PATH.write_text(fresh + "\n")
+    TOKEN_PATH.chmod(0o600)
+    return fresh
+
+
+def agent_where(key: str) -> str:
+    """The live tmux session for an agent, or "" when nobody is home."""
+    try:
+        r = subprocess.run([tool("nhq-tell"), "--where", key],
+                           capture_output=True, text=True, timeout=6)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def agent_send(key: str, text: str) -> tuple[bool, str]:
+    """Type a prompt into an agent's session. Returns (sent, detail)."""
+    try:
+        r = subprocess.run([tool("nhq-tell"), key, text],
+                           capture_output=True, text=True, timeout=20)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if r.returncode != 0:
+        return False, (r.stderr.strip().splitlines() or ["not running"])[0]
+    return True, r.stdout.strip()
+
+
 # ------------------------------------------------------------------ server
 
 PAGE = r"""<!doctype html>
@@ -229,6 +308,15 @@ PAGE = r"""<!doctype html>
        cursor:pointer; flex:none; line-height:1; }
   .ok { color:var(--teal); }
   .empty { color:var(--mut); }
+  /* Agent picker — same card language as .f, but a row of choices. */
+  .who { display:flex; gap:8px; margin-bottom:10px; }
+  .who button { flex:1; background:var(--card); color:var(--bone); border:1px solid var(--line);
+                border-radius:12px; padding:11px 8px; font-size:14px; font-weight:600;
+                display:flex; flex-direction:column; align-items:center; gap:4px; }
+  .who button.on { border-color:var(--teal); color:var(--teal); background:#14201f; }
+  .who .dot { width:7px; height:7px; border-radius:99px; background:#4b4b55; }
+  .who button.live .dot { background:var(--teal); }
+  .who .st { font-size:10.5px; font-weight:500; color:var(--mut); letter-spacing:.04em; }
 </style></head><body><div class="wrap">
   <h1>NHQ Inbox</h1>
   <p class="sub">Shared folder with the laptop: <code>~/Github/nhq-local-downloads</code></p>
@@ -242,6 +330,14 @@ PAGE = r"""<!doctype html>
   <input id="camin" type="file" accept="image/*,video/*" capture="environment">
   <div id="bar"><div></div></div>
   <div id="log"></div>
+
+  <h2><span>Prompt an agent</span><span id="plock"></span></h2>
+  <div id="who" class="who"></div>
+  <textarea id="ptxt" placeholder="What should they do? This types straight into their session."></textarea>
+  <div class="row">
+    <button id="psend" disabled>Send prompt</button>
+  </div>
+  <div id="plog"></div>
 
   <h2>Text</h2>
   <textarea id="txt" placeholder="Paste here — it lands on the laptop's clipboard"></textarea>
@@ -266,6 +362,46 @@ let queue=[];
 
 const kb=n=>n<1024?n+' B':n<1048576?(n/1024).toFixed(0)+' KB':n<1073741824?(n/1048576).toFixed(1)+' MB':(n/1073741824).toFixed(2)+' GB';
 const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// ---- prompting an agent -------------------------------------------------
+// The key arrives once, in the URL that the QR encodes, and is kept per device.
+// It is stripped from the address bar straight away so it does not sit in
+// screenshots or get shared when the page is sent to someone.
+const who=$('who'), ptxt=$('ptxt'), psend=$('psend'), plog=$('plog'), plock=$('plock');
+let target=null, key=localStorage.getItem('nhq-key')||'';
+const qk=new URLSearchParams(location.search).get('k');
+if(qk){ key=qk; localStorage.setItem('nhq-key',qk); history.replaceState({},'',location.pathname); }
+
+async function whoList(){
+  try{
+    const j=await (await fetch('/agents')).json();
+    who.innerHTML=j.agents.map(a=>
+      `<button data-k="${a.key}" class="${a.session?'live':''}${a.key===target?' on':''}">
+         <span class="dot"></span>${esc(a.label)}
+         <span class="st">${a.session?'live':'offline'}</span>
+       </button>`).join('');
+    [...who.children].forEach(b=>b.onclick=()=>{ target=b.dataset.k; whoList(); ready(); });
+    plock.textContent = key ? '' : 'locked — scan the QR';
+    ready();
+  }catch(e){}
+}
+const ready=()=>{ psend.disabled = !(target && key && ptxt.value.trim()); };
+ptxt.oninput=ready;
+
+psend.onclick=async()=>{
+  const t=ptxt.value.trim(); if(!t||!target) return;
+  psend.disabled=true;
+  try{
+    const r=await fetch('/prompt',{method:'POST',headers:{'Content-Type':'application/json'},
+                                   body:JSON.stringify({target,text:t,k:key})});
+    const j=await r.json();
+    plog.innerHTML='<div class="f"><span class="'+(j.ok?'ok':'')+'">'+esc(j.ok?('Sent to '+j.session):(j.error||'Failed'))+'</span></div>';
+    if(j.ok) ptxt.value='';
+  }catch(e){ plog.innerHTML='<div class="f"><span>Failed</span></div>'; }
+  ready();
+};
+whoList();
+setInterval(()=>{ if(document.visibilityState==='visible') whoList(); }, 10000);
+
 
 function show(){
   log.innerHTML=queue.map(f=>`<div class="f"><div class="meta"><span class="nm">${esc(f.name)}</span><span class="sz">${kb(f.size)}</span></div></div>`).join('');
@@ -417,6 +553,46 @@ def serve() -> None:
     async def clip() -> JSONResponse:
         return JSONResponse({"text": clip_read()[:100_000]})
 
+    @app.get("/agents")
+    async def agents() -> JSONResponse:
+        return JSONResponse({"agents": [
+            {"key": k, "label": label, "session": agent_where(k)}
+            for k, label in AGENTS
+        ]})
+
+    @app.post("/prompt")
+    async def prompt(request: Request) -> JSONResponse:
+        """Type a prompt into a live agent session.
+
+        The only endpoint here that needs the key. Everything else on this page
+        moves files and clipboard text; this one reaches an agent that can run
+        commands on the laptop, so it is not something the whole WiFi should be
+        able to do just by finding the port.
+
+        The target is matched against the shortlist rather than passed through.
+        nhq-tell is invoked as argv so there is no shell to inject into either
+        way, but an endpoint that will start work on this machine should accept
+        the three names it means and nothing else.
+        """
+        body = await request.json() or {}
+        if not secrets.compare_digest(str(body.get("k") or ""), token()):
+            return JSONResponse({"ok": False, "error": "locked — scan the QR again"},
+                                status_code=403)
+        target = str(body.get("target") or "")
+        if target not in {k for k, _ in AGENTS}:
+            return JSONResponse({"ok": False, "error": "unknown agent"}, status_code=400)
+        text = (body.get("text") or "").strip()
+        if not text:
+            return JSONResponse({"ok": False, "error": "empty"}, status_code=400)
+
+        session = agent_where(target)
+        ok, detail = agent_send(target, text)
+        print(f"[{datetime.now():%H:%M:%S}] prompt -> {target} "
+              f"({session or 'offline'}): {'ok' if ok else detail}", flush=True)
+        if not ok:
+            return JSONResponse({"ok": False, "error": detail}, status_code=409)
+        return JSONResponse({"ok": True, "session": session})
+
     @app.post("/rm")
     async def rm(request: Request) -> JSONResponse:
         body = await request.json()
@@ -500,12 +676,21 @@ def cmd_stop() -> int:
     return 0
 
 
-def cmd_url() -> int:
+def shared_url() -> str | None:
+    """The URL to hand the phone — with the key, so prompting works after one scan.
+
+    Not a second URL to remember. A plain `http://ip:port` still serves files
+    and clipboard exactly as before; it just leaves the prompt panel locked.
+    """
     p = port()
-    if not p:
+    return f"http://{lan_ip()}:{p}?k={token()}" if p else None
+
+
+def cmd_url() -> int:
+    url = shared_url()
+    if not url:
         print("not running — `nhq-inbox start` first", file=sys.stderr)
         return 1
-    url = f"http://{lan_ip()}:{p}"
     print(url)
     if shutil.which("wl-copy"):
         subprocess.run(["wl-copy"], input=url, text=True, env=wl_env())
@@ -528,11 +713,10 @@ def qr_block(url: str) -> None:
 
 def cmd_qr() -> int:
     """A QR beats reading an IP off a screen and typing it on a phone."""
-    p = port()
-    if not p:
+    url = shared_url()
+    if not url:
         print("not running — `nhq-inbox start` first", file=sys.stderr)
         return 1
-    url = f"http://{lan_ip()}:{p}"
     if not shutil.which("qrencode"):
         print(url)
         print("(install qrencode for a scannable code)", file=sys.stderr)
@@ -571,8 +755,10 @@ def cmd_status() -> int:
     print(f"url     : {url}" if url else "url     : (no port claimed)")
     print(f"folder  : {DEST}")
     print(f"files   : {len(files)} ({total/1048576:.1f} MB)")
+    # The QR carries the key; the printed line does not. Scanning it unlocks
+    # prompting on that phone, while a status pasted into a chat stays harmless.
     if url and active == "active":
-        qr_block(url)
+        qr_block(shared_url() or url)
     return 0 if active == "active" else 1
 
 

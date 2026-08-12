@@ -1,28 +1,81 @@
 #!/usr/bin/env bash
-# nhq-tell <session> "<message>" — message a running fleet agent mid-task.
+# nhq-tell <session|agent> "<message>" — message a running agent mid-task.
 #
-# Types the message into the live claude TUI via tmux send-keys (literal), then
-# presses Enter. This is how Director/Yash redirect an agent without killing it.
+# Types the message into the live TUI via tmux send-keys (literal), then presses
+# Enter. This is how Director/Yash redirect an agent without killing it.
 #
 # Usage: nhq-tell fleet-heydaddy-add-retry "actually, cap retries at 3"
+#        nhq-tell nv "check the vox selftest"
+#
+# It takes an AGENT NAME as well as a session name (2026-08-13), because the
+# caller usually knows who it wants, not which tmux session that person happens
+# to be sitting in — and there are two naming schemes in play:
+#   fleet-<agent>-<task>   spawned task sessions (nhq-spawn)
+#   omp-<dirslug>          Yash's own interactive sessions (ompt)
+# Names and aliases come from fleet-registry.json, so `nv`, `envy`, `dir`,
+# `builder` all land where you would expect. An exact session name still wins,
+# so every existing caller is untouched.
 set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
 # shellcheck source=/dev/null
 source "$(dirname "$SELF")/nhq-lib.sh"
 
-SESSION="${1:-}"
+TARGET="${1:-}"
 MESSAGE="${2:-}"
 
-if [[ -z "$SESSION" || -z "$MESSAGE" ]]; then
-  echo "usage: nhq-tell <session> \"<message>\"" >&2
+# --where resolves and prints the session without sending anything. The inbox
+# web UI uses it to show who is actually live before you type at them, and it
+# means the slug rule below has exactly one implementation rather than a second
+# copy in Python.
+WHERE=0
+if [[ "$TARGET" == "--where" ]]; then WHERE=1; TARGET="${2:-}"; MESSAGE="-"; fi
+
+if [[ -z "$TARGET" || -z "$MESSAGE" ]]; then
+  echo "usage: nhq-tell <session|agent> \"<message>\"" >&2
+  echo "       nhq-tell --where <session|agent>" >&2
   exit 1
 fi
 
-if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-  echo "nhq-tell: no such session: $SESSION" >&2
-  echo "  live sessions: $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^fleet-' | paste -sd', ' -)" >&2
+# The slug ompt builds from a repo directory. Kept character-for-character in
+# step with dots/bin/ompt — if that expression changes, this one must too.
+ompt_slug() { basename "$1" | tr -c 'A-Za-z0-9_-' '-' | sed 's/-\+$//'; }
+
+resolve_session() {
+  local tok="$1" key repo slug hit
+
+  # An exact session name wins, always. Callers that already know the session
+  # must never be second-guessed by a registry lookup.
+  if tmux has-session -t "$tok" 2>/dev/null; then printf '%s' "$tok"; return 0; fi
+
+  key="$(nhq_agent_canon "$tok")"
+  [[ -z "$key" ]] && return 1
+
+  repo="$(nhq_agent_repo "$key")"
+  if [[ -n "$repo" ]]; then
+    slug="$(ompt_slug "$repo")"
+    if tmux has-session -t "omp-$slug" 2>/dev/null; then printf 'omp-%s' "$slug"; return 0; fi
+  fi
+
+  # Fall back to a spawned task session for the same agent, newest first.
+  hit="$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+         | grep -m1 -E "^fleet-${key}(-|$)" || true)"
+  [[ -n "$hit" ]] && { printf '%s' "$hit"; return 0; }
+  return 1
+}
+
+SESSION="$(resolve_session "$TARGET" || true)"
+
+if [[ -z "$SESSION" ]]; then
+  echo "nhq-tell: nothing live for: $TARGET" >&2
+  echo "  live sessions: $(tmux list-sessions -F '#{session_name}' 2>/dev/null | paste -sd', ' -)" >&2
+  echo "  known agents : $(jq -r '.agents | keys | join(", ")' "$(nhq_registry)" 2>/dev/null)" >&2
   exit 1
+fi
+
+if [[ "$WHERE" == "1" ]]; then
+  echo "$SESSION"
+  exit 0
 fi
 
 tmux send-keys -t "$SESSION" -l -- "$MESSAGE"
