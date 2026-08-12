@@ -237,6 +237,17 @@ def token() -> str:
     return fresh
 
 
+def open_mode() -> bool:
+    """NHQ_INBOX_OPEN=1 drops the key and lets anyone on the LAN prompt an agent.
+
+    Here because it is Yash's call to make, not mine. The default is locked
+    because a prompt runs commands on this laptop and the home WiFi is a thin
+    wall in front of that; but if the key ever costs more than it earns, this is
+    the one line to flip in the unit rather than a patch to the page.
+    """
+    return os.environ.get("NHQ_INBOX_OPEN", "") == "1"
+
+
 def agent_where(key: str) -> str:
     """The live tmux session for an agent, or "" when nobody is home."""
     try:
@@ -317,6 +328,16 @@ PAGE = r"""<!doctype html>
   .who .dot { width:7px; height:7px; border-radius:99px; background:#4b4b55; }
   .who button.live .dot { background:var(--teal); }
   .who .st { font-size:10.5px; font-weight:500; color:var(--mut); letter-spacing:.04em; }
+  /* The locked state has to be loud. The first version said "locked" in 11px
+     grey in the header and Yash reasonably read the dead Send button as broken. */
+  .lockbox { background:var(--card); border:1px solid var(--line); border-radius:12px;
+             padding:14px; margin-bottom:12px; }
+  .lockbox b { display:block; color:var(--teal); font-size:14px; margin-bottom:6px; }
+  .lockbox span { display:block; color:var(--mut); font-size:13px; line-height:1.45; }
+  .lockbox .row { margin-top:12px; }
+  .lockbox input { flex:2; background:var(--bg); color:var(--bone); border:1px solid var(--line);
+                   border-radius:12px; padding:12px; font:15px inherit; min-width:0; }
+  .hint { color:var(--mut); font-size:12.5px; margin-top:8px; min-height:1em; }
 </style></head><body><div class="wrap">
   <h1>NHQ Inbox</h1>
   <p class="sub">Shared folder with the laptop: <code>~/Github/nhq-local-downloads</code></p>
@@ -332,11 +353,21 @@ PAGE = r"""<!doctype html>
   <div id="log"></div>
 
   <h2><span>Prompt an agent</span><span id="plock"></span></h2>
+  <div id="lockbox" class="lockbox" hidden>
+    <b>Locked</b>
+    <span>A prompt runs commands on the laptop, so this panel needs the key once per device.
+          On the laptop run <code>nhq-inbox qr</code> and scan it — or paste the key here.</span>
+    <div class="row">
+      <input id="pkey" type="text" inputmode="latin" autocomplete="off" placeholder="key">
+      <button id="punlock" class="ghost">Unlock</button>
+    </div>
+  </div>
   <div id="who" class="who"></div>
   <textarea id="ptxt" placeholder="What should they do? This types straight into their session."></textarea>
   <div class="row">
     <button id="psend" disabled>Send prompt</button>
   </div>
+  <div id="phint" class="hint"></div>
   <div id="plog"></div>
 
   <h2>Text</h2>
@@ -366,26 +397,51 @@ const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&qu
 // The key arrives once, in the URL that the QR encodes, and is kept per device.
 // It is stripped from the address bar straight away so it does not sit in
 // screenshots or get shared when the page is sent to someone.
-const who=$('who'), ptxt=$('ptxt'), psend=$('psend'), plog=$('plog'), plock=$('plock');
-let target=null, key=localStorage.getItem('nhq-key')||'';
+const who=$('who'), ptxt=$('ptxt'), psend=$('psend'), plog=$('plog'), plock=$('plock'),
+      lockbox=$('lockbox'), pkey=$('pkey'), punlock=$('punlock'), phint=$('phint');
+let target=null, key=localStorage.getItem('nhq-key')||'', open_=false;
 const qk=new URLSearchParams(location.search).get('k');
 if(qk){ key=qk; localStorage.setItem('nhq-key',qk); history.replaceState({},'',location.pathname); }
+
+punlock.onclick=()=>{
+  const v=pkey.value.trim(); if(!v) return;
+  key=v; localStorage.setItem('nhq-key',v); pkey.value=''; whoList();
+};
 
 async function whoList(){
   try{
     const j=await (await fetch('/agents')).json();
+    open_ = !!j.open;
+    // Default to whoever is actually live, so the common case is type-and-send
+    // rather than tap-then-type. Only ever picks for you when you have not.
+    if(!target){ const live=j.agents.find(a=>a.session); if(live) target=live.key; }
     who.innerHTML=j.agents.map(a=>
       `<button data-k="${a.key}" class="${a.session?'live':''}${a.key===target?' on':''}">
          <span class="dot"></span>${esc(a.label)}
          <span class="st">${a.session?'live':'offline'}</span>
        </button>`).join('');
-    [...who.children].forEach(b=>b.onclick=()=>{ target=b.dataset.k; whoList(); ready(); });
-    plock.textContent = key ? '' : 'locked — scan the QR';
-    ready();
+    [...who.children].forEach(b=>b.onclick=()=>{ target=b.dataset.k; whoList(); });
+    const locked = !key && !open_;
+    lockbox.hidden = !locked;
+    plock.textContent = locked ? 'locked' : '';
+    ready(j.agents);
   }catch(e){}
 }
-const ready=()=>{ psend.disabled = !(target && key && ptxt.value.trim()); };
-ptxt.oninput=ready;
+
+// Say WHY the button is off. A dead button with no reason is what made this
+// look broken the first time.
+function ready(list){
+  const locked = !key && !open_;
+  const sel = list && list.find(a=>a.key===target);
+  psend.disabled = !(target && !locked && ptxt.value.trim());
+  phint.textContent =
+      locked                 ? 'Unlock above to send prompts.'
+    : !target                ? 'Pick who it goes to.'
+    : !ptxt.value.trim()     ? ''
+    : (sel && !sel.session)  ? 'That one is offline — sending will fail.'
+    : '';
+}
+ptxt.oninput=()=>ready();
 
 psend.onclick=async()=>{
   const t=ptxt.value.trim(); if(!t||!target) return;
@@ -555,10 +611,13 @@ def serve() -> None:
 
     @app.get("/agents")
     async def agents() -> JSONResponse:
-        return JSONResponse({"agents": [
-            {"key": k, "label": label, "session": agent_where(k)}
-            for k, label in AGENTS
-        ]})
+        return JSONResponse({
+            "open": open_mode(),
+            "agents": [
+                {"key": k, "label": label, "session": agent_where(k)}
+                for k, label in AGENTS
+            ],
+        })
 
     @app.post("/prompt")
     async def prompt(request: Request) -> JSONResponse:
@@ -575,8 +634,8 @@ def serve() -> None:
         the three names it means and nothing else.
         """
         body = await request.json() or {}
-        if not secrets.compare_digest(str(body.get("k") or ""), token()):
-            return JSONResponse({"ok": False, "error": "locked — scan the QR again"},
+        if not open_mode() and not secrets.compare_digest(str(body.get("k") or ""), token()):
+            return JSONResponse({"ok": False, "error": "locked — scan the QR on the laptop"},
                                 status_code=403)
         target = str(body.get("target") or "")
         if target not in {k for k, _ in AGENTS}:
