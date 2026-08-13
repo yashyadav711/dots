@@ -485,7 +485,6 @@ EOF
   # ── tmux ────────────────────────────────────────────────────────────────────
   # Same base as the laptop: gpakosz/.tmux + his tmux.conf.local.
   [[ -d $HOME/.tmux ]] || run git clone --depth 1 https://github.com/gpakosz/.tmux.git "$HOME/.tmux"
-  run ln -sfn "$HOME/.tmux/.tmux.conf" "$HOME/.tmux.conf"
 
   local dots=$HOME/Github/dots
   if [[ -f $dots/tmux/tmux.conf.local ]]; then
@@ -496,33 +495,50 @@ EOF
   fi
 
   # THE REMOTE CLIPBOARD FIX.
-  # His tmux.conf.local binds copy straight to `wl-copy`, and the gpakosz base
-  # picks its copy command from $XDG_SESSION_TYPE. Over SSH there is no Wayland
-  # display, so both paths fail and every copy dies in tmux's internal buffer —
+  # tmux.conf.local binds copy straight to `wl-copy`, and the gpakosz base picks
+  # its copy command from $XDG_SESSION_TYPE. Over SSH there is no Wayland (or X)
+  # display, so both paths fail and every copy dies in tmux's internal buffer:
   # you select text and nothing reaches the laptop clipboard.
-  # OSC 52 is the fix: tmux hands the selection to the *terminal*, which is
-  # kitty on the laptop, so remote copies land in the local clipboard. Loaded
-  # after tmux.conf.local so it wins.
+  #
+  # OSC 52 is the fix — tmux hands the selection to the CLIENT terminal (kitty
+  # on the laptop), which puts it in the local clipboard.
+  #
+  # It must load AFTER tmux.conf.local to win. gpakosz's .tmux.conf sources
+  # .tmux.conf.local itself, so ~/.tmux.conf becomes a real file that sources
+  # the base and then this override, instead of the usual symlink. And the
+  # override self-guards on there being no display, so the identical file is
+  # harmless if it ever lands on a machine with a real Wayland session.
   wr "$HOME/.tmux.conf.remote" <<'EOF'
-# nhq-newbox — remote/headless clipboard. Sourced last, overrides the
-# wl-copy bindings from tmux.conf.local which cannot work without a Wayland
-# session. OSC 52 sends the selection to the CLIENT terminal (kitty), so
-# copying inside a remote tmux reaches the laptop clipboard.
-set -g set-clipboard on
-set -g allow-passthrough on
+# nhq-newbox — clipboard for a headless/SSH session.
+#
+# Guarded: only takes effect when there is NO Wayland and NO X display, i.e.
+# when wl-copy/xclip cannot possibly work. On a graphical machine this file
+# does nothing and the normal wl-copy bindings stand.
+if-shell '[ -z "$WAYLAND_DISPLAY" ] && [ -z "$DISPLAY" ]' {
+  set -g set-clipboard on
+  set -g allow-passthrough on
 
-unbind -T copy-mode    MouseDragEnd1Pane
-unbind -T copy-mode-vi MouseDragEnd1Pane
-bind -T copy-mode    MouseDragEnd1Pane send -X copy-selection-and-cancel
-bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-selection-and-cancel
-bind -T copy-mode    y send -X copy-selection-and-cancel
-bind -T copy-mode-vi y send -X copy-selection-and-cancel
-
-# A headless box has no Wayland session; make that explicit for the base config.
-setenv -g XDG_SESSION_TYPE tty
+  # Replace the wl-copy/xclip copy pipelines with plain copy-selection, which
+  # tmux then forwards to the client terminal over OSC 52.
+  unbind -T copy-mode    MouseDragEnd1Pane
+  unbind -T copy-mode-vi MouseDragEnd1Pane
+  bind -T copy-mode    MouseDragEnd1Pane send -X copy-selection-and-cancel
+  bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-selection-and-cancel
+  bind -T copy-mode    y send -X copy-selection-and-cancel
+  bind -T copy-mode-vi y send -X copy-selection-and-cancel
+}
 EOF
-  grep -q 'tmux.conf.remote' "$HOME/.tmux.conf.local" 2>/dev/null \
-    || say "  ${C_D}note: source ~/.tmux.conf.remote at the end of ~/.tmux.conf.local (or keep it separate and use -f)${C_0}"
+
+  # ~/.tmux.conf as a real file: base first (which pulls in .tmux.conf.local),
+  # then our override last so it actually wins. A symlink to the base could
+  # never achieve that ordering.
+  wr "$HOME/.tmux.conf" <<'EOF'
+# nhq-newbox — load order matters:
+#   1. gpakosz/.tmux base, which itself sources ~/.tmux.conf.local
+#   2. ~/.tmux.conf.remote, the headless-clipboard override, LAST so it wins
+source-file ~/.tmux/.tmux.conf
+if-shell '[ -f ~/.tmux.conf.remote ]' 'source-file ~/.tmux.conf.remote'
+EOF
 
   # login shell
   if [[ $SHELL != */zsh ]]; then
@@ -560,9 +576,29 @@ verify_shell() {
   zsh -ic 'alias ls' 2>/dev/null | grep -q eza && ok "ls → eza wired" || bad "ls alias not active"
   command -v eza >/dev/null && ok "eza installed (ls/la/ll depend on it)" || bad "eza MISSING — ls/la/ll are broken"
   command -v bat >/dev/null && ok "bat installed (cat depends on it)" || bad "bat MISSING — cat is broken"
-  [[ -f $HOME/.tmux.conf ]] && ok "tmux.conf linked" || bad "tmux.conf missing"
-  [[ -f $HOME/.tmux.conf.remote ]] && ok "OSC52 remote-clipboard override present" || warn "no remote clipboard override — copies will not reach the laptop"
-  tmux -f /dev/null new-session -d -s _nhqcheck 2>/dev/null && { ok "tmux can start a session"; tmux kill-session -t _nhqcheck 2>/dev/null; } || warn "tmux failed to start a test session"
+  [[ -f $HOME/.tmux.conf ]] && ok "tmux.conf present" || bad "tmux.conf missing"
+
+  # Check the RESOLVED BINDING, not that a file exists. The override file was
+  # written correctly on rig and never sourced, so "file present" passed while
+  # copy was still piping to wl-copy and silently failing over SSH.
+  if tmux -f "$HOME/.tmux.conf" new-session -d -s _nhqcheck 2>/dev/null; then
+    ok "tmux starts with the real config"
+    local binding; binding=$(tmux list-keys -T copy-mode-vi 2>/dev/null | grep MouseDragEnd1Pane || true)
+    if [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]]; then
+      ok "graphical session — wl-copy/xclip bindings are correct here"
+    elif grep -qE 'wl-copy|xclip|pbcopy' <<<"$binding"; then
+      bad "copy still pipes to wl-copy/xclip with no display — copies will NOT reach your laptop. Is ~/.tmux.conf.remote sourced?"
+    elif grep -q 'copy-selection' <<<"$binding"; then
+      ok "copy uses OSC52 (reaches the laptop clipboard over SSH)"
+    else
+      warn "could not determine the copy binding: ${binding:-<none>}"
+    fi
+    [[ $(tmux show -gv set-clipboard 2>/dev/null) == on ]] && ok "set-clipboard on (OSC52 enabled)" \
+      || warn "set-clipboard is $(tmux show -gv set-clipboard 2>/dev/null) — OSC52 will not forward"
+    tmux kill-session -t _nhqcheck 2>/dev/null
+  else
+    bad "tmux failed to start with ~/.tmux.conf — config error"
+  fi
 }
 
 # ─────────────────────────────────────────────────────────── gpu
