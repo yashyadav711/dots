@@ -444,6 +444,20 @@ bind R source-file ~/.tmux.conf \; display-message "tmux config reloaded"   # re
 set -ga update-environment VISUAL
 set -ga update-environment EDITOR
 
+# Trackpad scrolling: ONE line per wheel event, not five.
+#
+# Oh My Tmux binds the wheel with `-N 5`, which is right for a notched mouse
+# wheel — one physical click, five lines. A trackpad has no notches: libinput
+# turns a finger drag into a stream of wheel events, so every one of them was
+# jumping five lines and the pane flew past whatever Yash was reading.
+# 2026-08-13: "trackpad se bht zyada lines scroll hojati h aur bht fast".
+#
+# One line per event is what makes a trackpad feel like it is dragging the text
+# rather than throwing it. If a real mouse ever feels sluggish, this is the
+# number to raise — but raise it here, not by living with the default.
+bind -T copy-mode-vi WheelUpPane   select-pane \; send-keys -X -N 1 scroll-up
+bind -T copy-mode-vi WheelDownPane select-pane \; send-keys -X -N 1 scroll-down
+
 # Ctrl+Up / Ctrl+Down — jump between user messages (OSC 133 prompt marks) -----
 # omp wraps every user message in OSC 133 marks (UserMessageComponent emits
 # \e]133;A\a / \e]133;B\a, verified in the binary); tmux >= 3.4 can jump between

@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# nhq-voice-stop — turn voice typing off, all of it, in one word.
+#
+# WHY THIS EXISTS: on 2026-08-13 Yash wanted it off — "abhi m use nhi kr rha,
+# bnd krna chahta hoo voice to text se related sab cheeze" — and the honest
+# answer at the time was three commands and a `pgrep` to check nothing was left
+# holding the microphone. That is not an off switch.
+#
+# WHY IT DISABLES AND NOT JUST STOPS: `systemctl --user stop vox` is undone by
+# the next reboot, because the unit is enabled. An off switch that quietly turns
+# itself back on is worse than no off switch — you stop trusting it and go back
+# to checking by hand. So this disables too, and `--on` is the way back.
+#
+# WHY IT KILLS BY NAME AFTERWARDS: whisper-server and the voxbar overlay are
+# children of the daemon and normally die with it, but the server is a separate
+# binary holding ~500 MB and the overlay owns a Wayland surface. If either is
+# ever orphaned, "off" would still mean a process on the mic and a strip on the
+# screen. Belt and braces, and it prints what it found.
+#
+#   nhq-voice-stop            stop it and keep it stopped
+#   nhq-voice-stop --on       start it again and re-enable it
+#   nhq-voice-stop --status   what is running right now
+set -uo pipefail
+
+BITS=(whisper-server voxbar.py parecord)
+
+state() {
+  local active enabled
+  active=$(systemctl --user is-active vox 2>/dev/null)
+  enabled=$(systemctl --user is-enabled vox 2>/dev/null)
+  printf '  service : %s (%s)\n' "${active:-unknown}" "${enabled:-unknown}"
+  local found=0
+  for b in "${BITS[@]}" voxd.py; do
+    local pids; pids=$(pgrep -f -- "$b" 2>/dev/null | paste -sd' ' -)
+    [ -n "$pids" ] && { printf '  %-15s pid %s\n' "$b" "$pids"; found=1; }
+  done
+  [ "$found" = 0 ] && printf '  processes: none\n'
+}
+
+case "${1:-stop}" in
+  --status|status)
+    state
+    ;;
+
+  --on|on|start)
+    systemctl --user enable --now vox >/dev/null 2>&1
+    sleep 1
+    echo "voice typing on — double-tap Alt to dictate"
+    state
+    ;;
+
+  *)
+    systemctl --user disable --now vox >/dev/null 2>&1
+    # Give the daemon a moment to take its children with it before checking for
+    # orphans; killing something that was already on its way out just produces a
+    # confusing line in the output.
+    sleep 1
+    for b in "${BITS[@]}"; do
+      pids=$(pgrep -f -- "$b" 2>/dev/null | paste -sd' ' -)
+      [ -z "$pids" ] && continue
+      echo "  orphaned $b ($pids) — killing"
+      pkill -f -- "$b" 2>/dev/null
+    done
+    sleep 0.5
+    echo "voice typing off — Alt+Alt does nothing until \`nhq-voice-stop --on\`"
+    state
+    ;;
+esac
