@@ -56,18 +56,16 @@ from gi.repository import GLib, Gtk  # noqa: E402
 import cairo  # noqa: E402
 
 # ── geometry ─────────────────────────────────────────────────────────────────
-# 56, up from 36. The strip is now an instrument rather than a row of bars: it
-# needs room for the bracket, the scale above the datum line and the vernier
-# comb below it. 74 is what the prototype was judged at; 56 keeps every
-# proportion (they are all fractions of h) while taking noticeably less screen.
-WAVE_H = 56
+# 34. The caliper is drawn as its TOP HALF only — the datum line sits on the
+# bottom edge of the screen and every tooth grows up out of it, so the lower
+# comb that used to hang below the line is gone. Yash: "sirf upper half neeche
+# wala line k hata do, half se hi bottom touch hoga laptop ka." Half the
+# instrument needs a little over half the height.
+#
+# Every dimension below is a fraction of h, so this number can move again
+# without any of the drawing needing to be re-tuned.
+WAVE_H = 34
 FPS = 60
-
-# The origin is pinned to the right edge and the scale runs the whole width from
-# it. This was briefly the corner version, with the instrument packed into the
-# right-hand end and the rest of the strip empty; Yash rejected that and asked
-# for the full sweep — "hard right full sweep vaala sahi hai".
-ORIGIN_INSET = 18.0
 
 # Four states, four colours. With no caption these are the entire status
 # display, so they are picked to be unmistakable at the edge of vision rather
@@ -248,7 +246,7 @@ class State:
 
 
 class WaveStrip(Gtk.ApplicationWindow):
-    """Bottom edge — a caliper anchored right, measuring the full width leftward."""
+    """Bottom edge — the top half of a caliper, growing up out of the screen edge."""
 
     def __init__(self, app: Gtk.Application, state: State):
         super().__init__(application=app)
@@ -294,22 +292,25 @@ class WaveStrip(Gtk.ApplicationWindow):
         if s.alpha < 0.01:
             return
 
-        # A vernier caliper anchored at the RIGHT EDGE, measuring the full width
-        # of the monitor leftward. Chosen by Yash on 2026-08-13: "hard right full
-        # sweep vaala sahi hai" — after the corner version, which packed the same
-        # instrument into the right-hand end, looked wrong to him: "ye jo pichhe
-        # vaali line hai na, ye actually tumko poore length par daalni padegi".
+        # A vernier caliper, cut in half lengthways. The datum line lies ON the
+        # bottom edge of the screen and everything grows up out of it — Yash,
+        # 2026-08-13: "sirf upper half neeche wala line k hata do, half se hi
+        # bottom touch hoga laptop ka."
         #
-        # So: the scale is the full width and never moves. The origin is pinned
-        # at the right. The only thing that travels is the jaw, and it travels
-        # leftward out of the origin as you get louder.
+        # The two combs used to be separated by sitting on opposite sides of the
+        # datum, which is how a real caliper reads. With only the top half there
+        # is no opposite side, so they are separated by WEIGHT instead: the fixed
+        # scale is short and dim, the vernier comb that rides the jaw is tall and
+        # bright. Same information, one side of the line.
         #
-        # Every dimension is a fraction of h, so WAVE_H can change without any
-        # of this needing re-tuning.
-        ox = w - ORIGIN_INSET
-        cy = h * 0.54
+        # Origin is the centre and the jaws open symmetrically, which is what
+        # "Heavy" is — the right-anchored full sweep this replaced put the origin
+        # at the edge and swept one way.
+        cx = w / 2.0
+        base = float(h)                          # the screen's own bottom edge
         lv = 0.05 + s.smooth * 0.95              # never fully dead
-        span = ox - 14.0
+        jaw_max = cx * 0.88
+        open_ = lv * jaw_max
 
         def measure(v: float, a: float) -> None:
             cr.set_source_rgba(*s.shade(v, a))
@@ -317,96 +318,86 @@ class WaveStrip(Gtk.ApplicationWindow):
         def status(a: float) -> None:
             cr.set_source_rgba(*s.chrome(a))
 
-        def line(x0, y0, x1, y1, lw):
+        def tick(x: float, up: float, lw: float) -> None:
             cr.set_line_width(lw)
-            cr.move_to(x0, y0)
-            cr.line_to(x1, y1)
+            cr.move_to(x, base - up)
+            cr.line_to(x, base)
             cr.stroke()
 
-        # The overlay brings its own floor. It floats over whatever is at the
-        # bottom of the screen — on 2026-08-13 that was a terminal status line,
-        # and hairlines over grey text are unreadable. Weighted to the right,
-        # where the instrument is densest, and gone by the left edge.
-        pad = cairo.LinearGradient(0, 0, ox, 0)
+        # The overlay brings its own floor: it floats over whatever is at the
+        # bottom of the screen, and hairlines over a terminal's status text are
+        # unreadable. Centred like the instrument, gone by both edges.
+        pad = cairo.LinearGradient(0, 0, w, 0)
         pad.add_color_stop_rgba(0.00, 0, 0, 0, 0.0)
-        pad.add_color_stop_rgba(0.55, 0, 0, 0, 0.13 * s.alpha)
-        pad.add_color_stop_rgba(1.00, 0, 0, 0, 0.32 * s.alpha)
+        pad.add_color_stop_rgba(0.50, 0, 0, 0, 0.26 * s.alpha)
+        pad.add_color_stop_rgba(1.00, 0, 0, 0, 0.0)
         cr.set_source(pad)
         cr.rectangle(0, 0, w, h)
         cr.fill()
 
-        # Brackets at both ends. The right one is heavy — that is the anchor,
-        # and it is the piece that carries the state colour at full strength.
-        status(0.62 + 0.30 * lv)
-        cr.set_line_width(2.6)
-        cr.move_to(ox - 18, 6); cr.line_to(ox, 6)
-        cr.line_to(ox, h - 6); cr.line_to(ox - 18, h - 6)
-        cr.stroke()
-        status(0.24)
-        cr.set_line_width(1.6)
-        cr.move_to(24, 6); cr.line_to(10, 6)
-        cr.line_to(10, h - 6); cr.line_to(24, h - 6)
-        cr.stroke()
+        # The datum: a hairline along the very bottom, running the full width.
+        # It is the one thing always visible, so it carries the state colour at
+        # full strength rather than being dimmed by the microphone.
+        rail = cairo.LinearGradient(0, 0, w, 0)
+        c0 = s.chrome(0.0)
+        c1 = s.chrome(0.55 + 0.35 * lv)
+        rail.add_color_stop_rgba(0.00, *c0)
+        rail.add_color_stop_rgba(0.14, *c1)
+        rail.add_color_stop_rgba(0.86, *c1)
+        rail.add_color_stop_rgba(1.00, *c0)
+        cr.set_source(rail)
+        cr.rectangle(0, base - 1.6, w, 1.6)
+        cr.fill()
 
-        # The fixed scale: the full-length back line he asked for. It does not
-        # move and it does not respond to the microphone; it is the ruler.
-        n = 56
-        sp = span / n
-        for i in range(1, n + 1):
-            x = ox - i * sp
-            if x < 8:
-                break
+        # Fixed scale — the ruler. Short, dim, and it does not answer to the
+        # microphone; it is the thing being measured against.
+        main = 40
+        sp = jaw_max / main
+        for i in range(main + 1):
+            d = jaw_max - i * sp
+            u = d / cx
             major = i % 5 == 0
-            u = i / n
-            status((0.30 + 0.26 * (1 - u)) * (1.0 - 0.55 * u * u) + 0.05)
-            line(x, cy - (15 if major else 8), x, cy, 2.2 if major else 1.4)
+            status((0.20 + 0.26 * (1 - u)) * (1.0 - 0.5 * u * u) + 0.05)
+            for x in (cx + d, cx - d):
+                tick(x, 13 if major else 7, 2.2 if major else 1.4)
 
-        # The vernier comb rides on the jaw. 55 teeth against the fixed 56 is the
-        # vernier principle itself — the combs beat against each other, and where
-        # they align is the reading.
-        vn = 55
-        vsp = (sp * n) / vn
-        reach = lv * span * 0.92
-        jx = ox - reach
+        # Vernier comb — 39 teeth against the fixed 40, which is the vernier
+        # principle itself: the two combs beat against each other and where they
+        # line up is the reading. Tall and bright so it reads over the ruler.
+        vn = 39
+        vsp = (sp * main) / vn
         for i in range(vn + 1):
-            x = jx + i * vsp
-            if x > ox or x < 8:
-                continue
+            lo = i * vsp
             major = i % 5 == 0
-            u = i / vn
-            measure(lv, (0.9 if major else 0.5) * lv * (1.0 - 0.55 * u * u))
-            line(x, cy, x, cy + (14 if major else 7), 2.4 if major else 1.5)
+            for sgn in (1, -1):
+                x = cx + sgn * (open_ + lo)
+                if x < 2 or x > w - 2:
+                    continue
+                u = abs(x - cx) / cx
+                measure(lv, (0.95 if major else 0.58) * lv * (1.0 - 0.55 * u * u))
+                tick(x, 26 if major else 15, 2.6 if major else 1.6)
 
-        # The measurement itself: a bracket at the travelling jaw and a run of
-        # cells filling back to the origin. This is the part that sweeps out from
-        # the right as you speak, and it is what makes the strip a meter rather
-        # than a pattern.
-        cr.set_line_width(2.4)
-        measure(lv, 0.78 + 0.20 * lv)
-        cr.move_to(jx + 10, cy - 16); cr.line_to(jx, cy - 16)
-        cr.line_to(jx, cy + 16); cr.line_to(jx + 10, cy + 16)
-        cr.stroke()
+        # The jaw faces: where the measurement is actually taken. Full height,
+        # so the two of them frame the reading.
+        for sgn in (1, -1):
+            measure(lv, 0.62 + 0.36 * lv)
+            tick(cx + sgn * open_, h - 2, 3.0)
 
-        cells = 26
-        cw = reach / cells
-        for i in range(cells):
-            measure(lv, 0.18 + 0.58 * lv * (1 - i / cells * 0.7))
-            cr.rectangle(jx + 4 + i * cw, cy - 4, max(1.4, cw - 2.6), 8)
-            cr.fill()
+        # Origin mark, so the eye knows what this is measured from.
+        status(0.30 + 0.5 * lv)
+        tick(cx, h - 4, 1.8)
 
-        # The jaw face at the origin — the fixed end of the caliper.
-        status(0.70 + 0.28 * lv)
-        line(ox, cy - 24, ox, cy + 23, 3.0)
-
-        # Scanlines, weighted right like the wash. Full-width at full strength
-        # would be a permanent dark band across the bottom of the monitor.
-        scan = cairo.LinearGradient(0, 0, ox, 0)
-        scan.add_color_stop_rgba(0.0, 0, 0, 0, 0.0)
-        scan.add_color_stop_rgba(1.0, 0, 0, 0, 0.18 * s.alpha)
+        # Scanlines, centred with the rest and kept light — full strength across
+        # the width would be a permanent dark band along the bottom of the
+        # monitor rather than an overlay.
+        scan = cairo.LinearGradient(0, 0, w, 0)
+        scan.add_color_stop_rgba(0.00, 0, 0, 0, 0.0)
+        scan.add_color_stop_rgba(0.50, 0, 0, 0, 0.16 * s.alpha)
+        scan.add_color_stop_rgba(1.00, 0, 0, 0, 0.0)
         y = (s.breathe * 3.5) % 3.0
         cr.set_source(scan)
-        while y < h:
-            cr.rectangle(0, y, ox, 1.0)
+        while y < h - 2:
+            cr.rectangle(0, y, w, 1.0)
             y += 3.0
         cr.fill()
 

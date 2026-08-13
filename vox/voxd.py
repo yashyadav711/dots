@@ -62,6 +62,18 @@ FLOOR_HEADROOM_DB = 4.0
 # fixed span any more — only a floor under how narrow it may collapse, which is
 # what stops a silent room from turning a stray tick into a full-height bar.
 MIN_SPAN_DB = 18.0
+# ...and an ABSOLUTE gate under that, because the relative scale is not enough.
+# Measured 2026-08-13: the denoiser puts this room at about -69 dBFS, so a tap
+# on the desk at -47 sits 22 dB above the floor and, against an 18 dB span,
+# pinned the bar to full — in silence. Yash: "main abhi kuchh bol bhi nahi raha
+# hoon ... khud hi chale ja raha hai."
+#
+# -50 comes from his own speech, not from taste: across the bench clips a
+# 50 ms block of speech runs -28 to -48 dBFS at the median and -14 to -23 at the
+# 90th percentile, so a gate here removes the room and every quiet transient in
+# it while leaving even the quietest syllable intact. Swept -70/-58/-54/-50/-46:
+# -46 starts eating speech, -50 does not.
+SILENCE_GATE_DB = -50.0
 CHUNK_SEC = 0.05
 CHUNK_BYTES = int(SAMPLE_RATE * CHUNK_SEC) * 2   # 16-bit mono
 
@@ -114,7 +126,7 @@ DEFAULTS: dict = {
     "vad_threshold": 0.4,
     # Second pass — see class Polish for the measurements behind these numbers.
     "polish": True,
-    "polish_min_sec": 1.5,
+    "polish_min_chars": 220,
     "polish_model": "gemini-3-flash",
     "polish_url": "http://127.0.0.1:51200/v1/chat/completions",
     "polish_timeout_sec": 25.0,
@@ -367,7 +379,7 @@ class Polish:
         10 s dictation ->  4 s becomes 11 s   (2.7x, not worth it)
         53 s dictation -> 20 s becomes 27 s   (1.35x, clearly worth it)
 
-    So it runs only past `polish_min_sec`. Short commands stay instant; long
+    So it runs only past `polish_min_chars`. Short replies stay instant; long
     dictations — the ones that actually need paragraphs — pay proportionally
     least for them.
 
@@ -383,13 +395,38 @@ class Polish:
 
     def __init__(self, cfg: dict):
         self.enabled = bool(cfg.get("polish", True))
-        self.min_sec = float(cfg.get("polish_min_sec", 25.0))
+        # No polish_min_sec fallback. Nothing reads it any more, and the
+        # selftest is right to fail a cfg.get for a key with no default — a
+        # half-removed knob is worse than either keeping it or deleting it.
+        self.min_chars = int(cfg.get("polish_min_chars", 220))
         self.model = str(cfg.get("polish_model", "gemini-3-flash"))
         self.url = str(cfg.get("polish_url", "http://127.0.0.1:51200/v1/chat/completions"))
         self.timeout = float(cfg.get("polish_timeout_sec", 25.0))
 
-    def wanted(self, audio_s: float) -> bool:
-        return self.enabled and audio_s >= self.min_sec
+    def wanted(self, text: str) -> bool:
+        """Is this transcript long enough for the second pass to earn its seconds?
+
+        Measured on 2026-08-13, from his own dictations:
+
+            290 chars ->  294  in 4.6 s     nothing changed, five seconds gone
+            361 chars ->  379  in 7.1 s     added the markdown emphasis
+            830 chars ->  805  in 9.8 s     restructured into paragraphs
+
+        The pass costs the same 5-8 s whatever it is given — it is round-trip
+        bound, not length bound. So on a short reply it is pure wait for a
+        result that is, measurably, the same text back.
+
+        The gate was on AUDIO SECONDS at 25, which I had picked from usage
+        stats. Yash overruled it to 1.5 — polish everything — and was then
+        immediately right about the consequence: "speed bahut bahut hi slow
+        aaya". Both of those are correct, because seconds of audio was the wrong
+        thing to measure. What the pass buys is punctuation and paragraphs, and
+        that depends on how much TEXT there is, not how long he took to say it.
+
+        So: characters. Short replies go out at once, anything with real
+        structure in it gets cleaned up. `polish_min_chars` is the one number.
+        """
+        return self.enabled and len(text.strip()) >= self.min_chars
 
     def run(self, text: str) -> str:
         import urllib.request  # noqa: PLC0415
@@ -1193,8 +1230,13 @@ class Vox:
         # MIN_SPAN_DB stops the scale collapsing onto silence. Without it, ten
         # seconds of a quiet room makes floor and ceiling nearly equal and the
         # tiniest tick of noise reads as a full-height bar.
+        #
+        # SILENCE_GATE_DB is the part MIN_SPAN_DB could not cover. The scale is
+        # relative to the room, and after the denoiser this room is at -69 dBFS,
+        # so a desk tap 22 dB above that still filled the bar. Below the gate
+        # nothing is drawn at all, whatever the relative maths says.
         span = max(ceil - (floor + FLOOR_HEADROOM_DB), MIN_SPAN_DB)
-        above = db - (floor + FLOOR_HEADROOM_DB)
+        above = db - max(floor + FLOOR_HEADROOM_DB, SILENCE_GATE_DB)
         if above <= 0.0:
             return 0.0
         return min(1.0, above / span) ** 0.7
@@ -1396,7 +1438,7 @@ class Vox:
                 self.desktop.notify("🔇 Kuch samajh nahi aaya", f"{audio_s:.0f}s audio", ms=2500)
                 return
 
-            if self.polish.wanted(audio_s):
+            if self.polish.wanted(text):
                 # Stay red and keep the light travelling: this is still work,
                 # and going green then freezing would read as a hang.
                 self.overlay.send(busy=True)

@@ -493,6 +493,15 @@ def test_end_to_end() -> None:
               spoken_result(final[-1])[:56] if final else "no result")
 
         # 4. cancel throws the audio away
+        #
+        # `journalctl --since` resolves to ONE SECOND. wait_for above returns the
+        # instant scenario 3's `transcribed` is printed, and the three lines
+        # between there and here take microseconds — so this window opened in the
+        # same second as that line and contained it, and the check failed for a
+        # reason that has nothing to do with cancel. Raising scenario 3's timeout
+        # (2026-08-13) fixed a different instance of the same confusion and left
+        # this one. Wait out the second instead.
+        time.sleep(1.2)
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         sock_cmd("start")
         time.sleep(1)
