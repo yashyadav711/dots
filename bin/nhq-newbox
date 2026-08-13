@@ -86,12 +86,31 @@ wr() {
   rm -f "$tmp"
 }
 
-pkg() {  # pkg <packages…> — install only what is missing
-  local miss=()
-  for p in "$@"; do pacman -Qq "$p" &>/dev/null || miss+=("$p"); done
-  ((${#miss[@]})) || { ok "already installed: $*"; return 0; }
+# pkg <packages…> — install only what is missing.
+#
+# pacman transactions are ATOMIC: one unresolvable name means ZERO of the batch
+# installs. A single typo ('cpuid', which is AUR-only) silently cost 27 correct
+# packages on rig's first real run. So: drop names the repos do not know about
+# BEFORE calling pacman, name them clearly, and if the batch still fails, fall
+# back to installing one at a time so one broken package cannot block the rest.
+pkg() {
+  local miss=() unknown=()
+  for p in "$@"; do
+    pacman -Qq "$p" &>/dev/null && continue
+    if pacman -Si "$p" &>/dev/null; then miss+=("$p"); else unknown+=("$p"); fi
+  done
+  ((${#unknown[@]})) && warn "not in any repo, skipped: ${unknown[*]}  (AUR? then: paru -S ${unknown[*]})"
+  ((${#miss[@]})) || { ok "nothing to install"; return 0; }
   say "  installing: ${miss[*]}"
-  run sudo pacman -S --needed --noconfirm "${miss[@]}"
+  if run sudo pacman -S --needed --noconfirm "${miss[@]}"; then return 0; fi
+
+  warn "batch install failed — retrying individually so one bad package cannot block the rest"
+  local failed=()
+  for p in "${miss[@]}"; do
+    run sudo pacman -S --needed --noconfirm "$p" || failed+=("$p")
+  done
+  if ((${#failed[@]})); then bad "could not install: ${failed[*]}"; return 1; fi
+  ok "all installed on the individual retry"
 }
 
 svc() {  # svc <unit…> — enable+start, idempotent
@@ -210,13 +229,13 @@ stage_base() {
       btop htop duf dust lazygit git git-lfs \
       neovim vim yazi tmux zsh \
       rsync aria2 wget curl openssh mosh \
-      man-db tealdeer unzip p7zip zip \
+      man-db tealdeer unzip 7zip zip \
       smartmontools lm_sensors pciutils usbutils \
       pacman-contrib reflector expac \
       base-devel dkms \
       wl-clipboard xclip \
       yt-dlp ffmpeg imagemagick \
-      cpuid hwinfo lshw fastfetch \
+      hwinfo lshw fastfetch \
       uv python-pipx nodejs go rustup \
       earlyoom snapper btrfs-progs inotify-tools
 
