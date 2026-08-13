@@ -15,7 +15,8 @@ onto the laptop's clipboard and back.
     nhq-inbox serve     run in the foreground (what the service runs)
 
 WHAT IT DOES, both directions:
-  phone -> laptop   files (tap, drag-drop, or straight from the camera)
+  phone -> laptop   files (tap, drag-drop, or straight from the camera), with
+                    an optional note saved as a sidecar next to each one
   phone -> laptop   text: pasted text lands on the laptop's Wayland clipboard
   phone -> laptop   a PROMPT typed straight into a live agent's session
   laptop -> phone   any file in the drop folder, tap to download, images preview
@@ -367,12 +368,21 @@ PAGE = r"""<!doctype html>
   .lockbox input { flex:2; background:var(--bg); color:var(--bone); border:1px solid var(--line);
                    border-radius:12px; padding:12px; font:15px inherit; min-width:0; }
   .hint { color:var(--mut); font-size:12.5px; margin-top:8px; min-height:1em; }
+  /* The upload note. Shorter than the other boxes on purpose — it is a caption,
+     not a message, and a tall box invites an essay nobody will read later. */
+  .note-in { min-height:52px; margin-top:12px; }
+  .f .note { display:block; color:var(--teal); font-size:12.5px; margin-top:3px;
+             white-space:normal; }
 </style></head><body><div class="wrap">
   <h1>NHQ Inbox</h1>
   <p class="sub">Shared folder with the laptop: <code>~/Github/nhq-local-downloads</code></p>
 
   <div id="drop"><b>Tap to pick files</b><span>or drop them here</span></div>
   <input id="pick" type="file" multiple>
+  <!-- Only appears once something is queued: an empty box above an empty drop
+       zone is just clutter, and the note only means anything with a file. -->
+  <textarea id="note" class="note-in" hidden
+            placeholder="Say what this is (optional) — saved next to the file"></textarea>
   <div class="row">
     <button id="send" disabled>Send</button>
     <button id="cam" class="ghost">Camera</button>
@@ -488,9 +498,11 @@ whoList();
 setInterval(()=>{ if(document.visibilityState==='visible') whoList(); }, 10000);
 
 
+const note=$('note');
 function show(){
   log.innerHTML=queue.map(f=>`<div class="f"><div class="meta"><span class="nm">${esc(f.name)}</span><span class="sz">${kb(f.size)}</span></div></div>`).join('');
   send.disabled=!queue.length;
+  note.hidden=!queue.length;
   send.textContent=queue.length?`Send ${queue.length} file${queue.length>1?'s':''}`:'Send';
 }
 const add=fs=>{ queue=queue.concat([...fs]); show(); };
@@ -506,12 +518,14 @@ drop.addEventListener('drop',e=>add(e.dataTransfer.files));
 send.onclick=()=>{
   if(!queue.length) return;
   const fd=new FormData(); queue.forEach(f=>fd.append('files',f,f.name));
+  if(note.value.trim()) fd.append('note', note.value.trim());
   const xhr=new XMLHttpRequest(); xhr.open('POST','/upload');
   bar.style.display='block'; send.disabled=true;
   xhr.upload.onprogress=e=>{ if(e.lengthComputable) fill.style.width=(e.loaded/e.total*100)+'%'; };
   xhr.onload=()=>{ bar.style.display='none'; fill.style.width='0';
     log.innerHTML='<div class="f"><span class="ok">Sent</span></div>';
-    queue=[]; send.disabled=true; send.textContent='Send'; pick.value=''; camin.value=''; list(); };
+    queue=[]; note.value=''; note.hidden=true;
+    send.disabled=true; send.textContent='Send'; pick.value=''; camin.value=''; list(); };
   xhr.onerror=()=>{ bar.style.display='none'; log.innerHTML='<div class="f"><span>Upload failed — retry</span></div>'; send.disabled=false; };
   xhr.send(fd);
 };
@@ -550,7 +564,7 @@ async function list(){
       return `<div class="f">
         <a href="/dl/${encodeURIComponent(f.name)}" download>
           ${thumb}
-          <div class="meta"><span class="nm">${esc(f.name)}</span><span class="sz">${kb(f.size)} &middot; ${f.when}</span></div>
+          <div class="meta"><span class="nm">${esc(f.name)}</span><span class="sz">${kb(f.size)} &middot; ${f.when}</span>${f.note?`<span class="note">${esc(f.note)}</span>`:''}</div>
         </a>
         <button class="x" onclick="del('${encodeURIComponent(f.name).replace(/'/g,"\\'")}')" aria-label="delete">&times;</button>
       </div>`;
@@ -584,14 +598,22 @@ def serve() -> None:
             (x for x in DEST.iterdir() if x.is_file()),
             key=lambda x: x.stat().st_mtime, reverse=True,
         ):
+            # A note belongs TO a file, so it is shown on that file's row rather
+            # than as a row of its own. Listing both would put a 200-byte .md
+            # beside every screenshot and make the folder look twice as full as
+            # it is.
+            if p.name.endswith(".note.md"):
+                continue
             st = p.stat()
             total += st.st_size
+            side = DEST / f"{p.name}.note.md"
             items.append({
                 "name": p.name,
                 "size": st.st_size,
                 "kind": kind_of(p),
                 "ext": p.suffix.lstrip(".").lower()[:4],
                 "when": datetime.fromtimestamp(st.st_mtime).strftime("%H:%M"),
+                "note": side.read_text()[:400].strip() if side.exists() else "",
             })
         return JSONResponse({"files": items, "bytes": total})
 
@@ -688,6 +710,10 @@ def serve() -> None:
         if not p:
             return JSONResponse({"error": "not found"}, status_code=404)
         p.unlink()
+        # The note goes with it. A sidecar whose file is gone is never seen
+        # again — it is hidden from the listing by design — so it would just
+        # accumulate in a folder that is supposed to end up empty.
+        (DEST / f"{p.name}.note.md").unlink(missing_ok=True)
         print(f"[{datetime.now():%H:%M:%S}] deleted {p.name}", flush=True)
         return JSONResponse({"ok": True})
 
@@ -715,7 +741,22 @@ def serve() -> None:
                     out.write(chunk)
             saved.append(target.name)
             print(f"[{datetime.now():%H:%M:%S}] saved {target.name} ({written} bytes)", flush=True)
-        return JSONResponse({"saved": saved})
+
+        # The optional note, written as a sidecar NEXT TO each file rather than
+        # as one file for the batch. A screenshot and "the button is misaligned"
+        # are useless apart, and whoever opens the folder later opens a file —
+        # not an index — so the note has to be wherever they land. Duplicating a
+        # line of text across three sidecars costs nothing and means it cannot
+        # be missed.
+        note = str(form.get("note") or "").strip()
+        if note:
+            for name in saved:
+                body = note if len(saved) == 1 else (
+                    f"{note}\n\nSent together with: " + ", ".join(saved))
+                (DEST / f"{name}.note.md").write_text(body + "\n")
+            print(f"[{datetime.now():%H:%M:%S}] note ({len(note)} chars) on "
+                  f"{len(saved)} file(s)", flush=True)
+        return JSONResponse({"saved": saved, "note": bool(note)})
 
     p = int(os.environ.get("NHQ_INBOX_PORT") or port() or port(claim=True) or "3900")
     print(f"nhq-inbox -> http://{lan_ip()}:{p}  (sharing {DEST})", flush=True)
