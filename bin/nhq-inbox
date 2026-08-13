@@ -309,7 +309,15 @@ PAGE = r"""<!doctype html>
 <meta name="theme-color" content="#0a0a0b">
 <title>NHQ Inbox</title>
 <style>
-  :root { --bg:#0a0a0b; --card:#141417; --line:#26262d; --teal:#2dd4bf; --bone:#ECECEF; --mut:#8b8b95; }
+  /* --line is for dividers between things that are already visible. --edge is
+     for the EDGE OF SOMETHING YOU TOUCH, and it is deliberately much lighter.
+     The drop zone and the message box were both --card on --bg with a --line
+     border — three shades inside 3% lightness of each other — so they were
+     present, correctly laid out, and effectively invisible. Yash: "tap to pick
+     files aur type a message box chupke huye h". A control the eye cannot find
+     is a control that does not exist. */
+  :root { --bg:#0a0a0b; --card:#141417; --line:#26262d; --edge:#5c5c68;
+          --field:#1b1b20; --teal:#2dd4bf; --bone:#ECECEF; --mut:#8b8b95; }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   body { margin:0; background:var(--bg); color:var(--bone); min-height:100dvh;
          font:16px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
@@ -320,8 +328,11 @@ PAGE = r"""<!doctype html>
   code { color:var(--teal); font-size:13px; }
   h2 { font-size:12px; text-transform:uppercase; letter-spacing:.09em; color:var(--mut);
        margin:30px 0 10px; font-weight:600; display:flex; justify-content:space-between; }
-  #drop { border:2px dashed var(--line); border-radius:16px; padding:40px 20px; text-align:center;
-          background:var(--card); transition:border-color .15s, background .15s; cursor:pointer; }
+  /* The primary action on the page, so it gets the accent outright rather than
+     only on hover — nothing else here competes for the first look. */
+  #drop { border:2px dashed rgba(45,212,191,.45); border-radius:16px; padding:40px 20px;
+          text-align:center; background:var(--field); cursor:pointer;
+          transition:border-color .15s, background .15s; }
   #drop.hot { border-color:var(--teal); background:#14201f; }
   #drop b { display:block; font-size:17px; margin-bottom:6px; }
   #drop span { color:var(--mut); font-size:14px; }
@@ -329,10 +340,13 @@ PAGE = r"""<!doctype html>
   .row { display:flex; gap:10px; margin-top:12px; }
   button { flex:1; border:0; border-radius:12px; padding:14px; font-size:15px; font-weight:600;
            background:var(--teal); color:#06231f; cursor:pointer; font-family:inherit; }
-  button.ghost { background:transparent; color:var(--bone); border:1px solid var(--line); }
+  button.ghost { background:transparent; color:var(--bone); border:1px solid var(--edge); }
   button:disabled { opacity:.45; }
-  textarea { width:100%; background:var(--card); color:var(--bone); border:1px solid var(--line);
-             border-radius:12px; padding:13px; font:15px/1.45 inherit; resize:vertical; min-height:88px; }
+  textarea { width:100%; background:var(--field); color:var(--bone); border:1px solid var(--edge);
+             border-radius:12px; padding:13px; font:15px/1.45 inherit; resize:vertical;
+             min-height:88px; }
+  textarea::placeholder { color:#7c7c88; }
+  textarea:focus { outline:none; border-color:rgba(45,212,191,.6); }
   #bar { height:4px; background:var(--line); border-radius:99px; overflow:hidden; margin-top:14px; display:none; }
   #bar div { height:100%; width:0; background:var(--teal); transition:width .2s; }
   .f { display:flex; align-items:center; gap:12px; padding:10px 12px; background:var(--card);
@@ -351,7 +365,7 @@ PAGE = r"""<!doctype html>
   .empty { color:var(--mut); }
   /* Agent picker — same card language as .f, but a row of choices. */
   .who { display:flex; gap:8px; margin-bottom:10px; }
-  .who button { flex:1; background:var(--card); color:var(--bone); border:1px solid var(--line);
+  .who button { flex:1; background:var(--field); color:var(--bone); border:1px solid var(--edge);
                 border-radius:12px; padding:11px 8px; font-size:14px; font-weight:600;
                 display:flex; flex-direction:column; align-items:center; gap:4px; }
   .who button.on { border-color:var(--teal); color:var(--teal); background:#14201f; }
@@ -365,7 +379,7 @@ PAGE = r"""<!doctype html>
   .lockbox b { display:block; color:var(--teal); font-size:14px; margin-bottom:6px; }
   .lockbox span { display:block; color:var(--mut); font-size:13px; line-height:1.45; }
   .lockbox .row { margin-top:12px; }
-  .lockbox input { flex:2; background:var(--bg); color:var(--bone); border:1px solid var(--line);
+  .lockbox input { flex:2; background:var(--bg); color:var(--bone); border:1px solid var(--edge);
                    border-radius:12px; padding:12px; font:15px inherit; min-width:0; }
   .hint { color:var(--mut); font-size:12.5px; margin-top:8px; min-height:1em; }
   /* The upload note. Shorter than the other boxes on purpose — it is a caption,
