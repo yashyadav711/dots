@@ -11,6 +11,7 @@ ayugram-desktop
 base
 base-devel
 bash-completion
+bat
 bind
 blueman
 bluez
@@ -70,6 +71,8 @@ efitools
 ethtool
 exfatprogs
 exo
+expac
+eza
 f2fs-tools
 fastfetch
 ffmpegthumbnailer
@@ -210,6 +213,7 @@ qt5-wayland
 qt5ct
 qt6-wayland
 qt6ct
+rate-mirrors
 rebuild-detector
 reflector
 remmina

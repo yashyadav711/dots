@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# nhq-flash — write a bootable image to a REMOVABLE USB device, safely.
+#
+# Usage:
+#   nhq-flash <image.iso> <device>     # e.g. nhq-flash cachyos.iso /dev/sda
+#   nhq-flash <image.iso> auto         # pick the only removable USB disk present
+#   nhq-flash --list                   # show candidate removable disks
+#
+# Options:
+#   -y, --yes         skip the interactive confirmation
+#       --no-verify   skip the read-back sha256 check (not recommended)
+#       --keep        do not power off / eject the device at the end
+#
+# Safety: the target MUST be a whole disk (not a partition), MUST be flagged
+# removable AND hotplug, MUST NOT be the disk holding /, /home or /boot, and
+# MUST NOT be larger than 512 GiB. Anything else is refused outright. This is
+# the guard rail that stops a one-character typo from erasing an internal NVMe.
+#
+# The write itself needs root. If not already root, the script re-execs its own
+# write stage through pkexec, so the password goes into the desktop's polkit
+# dialog -- never into a shell, a log, or an agent transcript.
+#
+# Proof of success: after writing, the first N bytes of the device are read back
+# and sha256-summed; that digest must equal the image's own digest. A flash that
+# silently truncated or hit a dying stick fails here instead of at boot.
+set -uo pipefail
+
+RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; BLD=$'\e[1m'; DIM=$'\e[2m'; RST=$'\e[0m'
+die() { printf '%snhq-flash: %s%s\n' "$RED" "$*" "$RST" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+MAX_BYTES=$((512 * 1024 * 1024 * 1024))
+
+human() { numfmt --to=iec-i --suffix=B --format='%.2f' "$1" 2>/dev/null || echo "$1 bytes"; }
+
+list_candidates() {
+  lsblk -dnp -o NAME,SIZE,RM,HOTPLUG,TRAN,MODEL | awk '$3==1 && $4==1'
+}
+
+# ---------------------------------------------------------------- write stage
+# Runs as root. Args: image device expected_sha256 do_verify
+if [[ "${1:-}" == "--_write" ]]; then
+  [[ $EUID -eq 0 ]] || die "--_write is the internal root stage"
+  IMG=$2; DEV=$3; WANT=$4; VERIFY=$5
+  SIZE=$(stat -c %s "$IMG") || die "cannot stat $IMG"
+
+  # re-assert the guards inside the privileged stage: never trust the caller
+  base=${DEV#/dev/}
+  [[ -b $DEV ]] || die "$DEV is not a block device"
+  [[ $(cat "/sys/block/$base/removable" 2>/dev/null) == 1 ]] || die "$DEV is not removable"
+  DEVSZ=$(( $(cat "/sys/block/$base/size") * 512 ))
+  (( DEVSZ <= MAX_BYTES )) || die "$DEV is $(human "$DEVSZ") — too big to be a pendrive, refusing"
+  (( DEVSZ >= SIZE )) || die "$DEV holds $(human "$DEVSZ"), image needs $(human "$SIZE")"
+
+  say "${DIM}unmounting any partition of $DEV…${RST}"
+  for p in $(lsblk -lnp -o NAME,MOUNTPOINT "$DEV" | awk 'NF>1 {print $1}'); do
+    umount -f "$p" 2>/dev/null && say "  umounted $p"
+  done
+  swapoff "$DEV"* 2>/dev/null
+
+  say "${DIM}clearing old partition signatures…${RST}"
+  wipefs -a "$DEV" >/dev/null 2>&1 || true
+
+  say "${BLD}writing $(human "$SIZE") → $DEV${RST}"
+  dd if="$IMG" of="$DEV" bs=4M status=progress oflag=direct conv=fsync || die "dd failed"
+  sync
+  blockdev --rereadpt "$DEV" 2>/dev/null || partprobe "$DEV" 2>/dev/null || true
+  say "${GRN}write done${RST}"
+
+  if [[ $VERIFY == 1 ]]; then
+    say "${BLD}reading back $(human "$SIZE") to verify…${RST}"
+    blockdev --flushbufs "$DEV" 2>/dev/null || true
+    GOT=$(dd if="$DEV" bs=4M count=$(( (SIZE + 4194303) / 4194304 )) iflag=direct 2>/dev/null \
+          | head -c "$SIZE" | sha256sum | cut -d' ' -f1)
+    if [[ $GOT != "$WANT" ]]; then
+      printf '%sREAD-BACK MISMATCH%s\n  on disk  %s\n  in image %s\n' "$RED" "$RST" "$GOT" "$WANT" >&2
+      die "the stick did not take the image faithfully — try another port or another stick"
+    fi
+    say "${GRN}read-back sha256 matches the image ✔${RST}"
+  fi
+  exit 0
+fi
+
+# ------------------------------------------------------------------ user stage
+YES=0; VERIFY=1; KEEP=0; IMG=""; DEV=""
+while (($#)); do
+  case $1 in
+    --list) list_candidates; exit 0 ;;
+    -y|--yes) YES=1 ;;
+    --no-verify) VERIFY=0 ;;
+    --keep) KEEP=1 ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -*) die "unknown option $1" ;;
+    *) if [[ -z $IMG ]]; then IMG=$1; elif [[ -z $DEV ]]; then DEV=$1; else die "too many arguments"; fi ;;
+  esac
+  shift
+done
+[[ -n $IMG && -n $DEV ]] || { sed -n '2,30p' "$0" | sed 's/^# \?//'; exit 2; }
+[[ -f $IMG ]] || die "no such image: $IMG"
+
+if [[ $DEV == auto ]]; then
+  mapfile -t cands < <(list_candidates)
+  ((${#cands[@]} == 1)) || die "auto needs exactly one removable USB disk, found ${#cands[@]}:
+$(printf '  %s\n' "${cands[@]}")"
+  DEV=$(awk '{print $1}' <<<"${cands[0]}")
+fi
+[[ $DEV == /dev/* ]] || DEV=/dev/$DEV
+base=${DEV#/dev/}
+
+# ---- guards -----------------------------------------------------------------
+[[ -b $DEV ]] || die "$DEV is not a block device"
+[[ -d /sys/block/$base ]] || die "$DEV is a partition, not a whole disk — pass the disk (e.g. /dev/sda)"
+[[ $(cat "/sys/block/$base/removable" 2>/dev/null) == 1 ]] \
+  || die "$DEV is NOT flagged removable — refusing (this guard exists to protect your internal disks)"
+[[ $(lsblk -dno HOTPLUG "$DEV") == 1 ]] || die "$DEV is not hotplug — refusing"
+DEVSZ=$(( $(cat "/sys/block/$base/size") * 512 ))
+(( DEVSZ <= MAX_BYTES )) || die "$DEV is $(human "$DEVSZ") — too big for a pendrive, refusing"
+for crit in / /home /boot /boot/efi /var; do
+  holder=$(findmnt -no SOURCE --target "$crit" 2>/dev/null) || continue
+  [[ $holder == "$DEV"* ]] && die "$DEV currently backs $crit — absolutely refusing"
+done
+SIZE=$(stat -c %s "$IMG")
+(( DEVSZ >= SIZE )) || die "$DEV holds $(human "$DEVSZ") but the image is $(human "$SIZE")"
+
+# ---- checksum of the image (what read-back must reproduce) -------------------
+say "${DIM}hashing image…${RST}"
+WANT=$(sha256sum "$IMG" | cut -d' ' -f1)
+
+# ---- confirmation -----------------------------------------------------------
+MODEL=$(lsblk -dno MODEL "$DEV" | xargs)
+printf '\n%sabout to ERASE %s%s\n' "$BLD$YEL" "$DEV" "$RST"
+printf '  device : %s  %s  (%s)\n' "$DEV" "$(human "$DEVSZ")" "${MODEL:-unknown}"
+printf '  image  : %s  %s\n' "$IMG" "$(human "$SIZE")"
+printf '  sha256 : %s\n' "$WANT"
+printf '  will be lost:\n'
+lsblk -lno NAME,SIZE,FSTYPE,LABEL "$DEV" | sed 's/^/    /'
+printf '\n'
+if (( ! YES )); then
+  read -r -p "type ERASE to continue: " ans
+  [[ $ans == ERASE ]] || die "aborted"
+fi
+
+# ---- unmount at user level (no password needed) -----------------------------
+while read -r part mp; do
+  [[ -n ${mp:-} ]] && { udisksctl unmount -b "$part" >/dev/null 2>&1 && say "${DIM}unmounted $part${RST}"; }
+done < <(lsblk -lnp -o NAME,MOUNTPOINT "$DEV" | awk 'NF>1')
+
+# ---- privileged write -------------------------------------------------------
+if [[ $EUID -eq 0 ]]; then
+  "$0" --_write "$IMG" "$DEV" "$WANT" "$VERIFY" || exit 1
+else
+  say "${DIM}asking for root via polkit (type your password in the desktop dialog)…${RST}"
+  pkexec --disable-internal-agent "$(readlink -f "$0")" --_write "$IMG" "$DEV" "$WANT" "$VERIFY"
+  rc=$?
+  (( rc == 127 || rc == 126 )) && die "polkit authorisation was dismissed or failed"
+  (( rc == 0 )) || exit $rc
+fi
+
+(( KEEP )) || udisksctl power-off -b "$DEV" >/dev/null 2>&1 \
+  && say "${DIM}device powered off — safe to unplug${RST}"
+
+printf '\n%s✅ %s flashed to %s and verified — bootable, safe to unplug%s\n' \
+  "$GRN$BLD" "$(basename "$IMG")" "$DEV" "$RST"

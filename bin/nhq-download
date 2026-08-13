@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+"""
+nhq-download — parallel, multi-mirror, resumable downloader. Stdlib only, no root.
+
+Why it exists: it was written when neither aria2 nor axel was installed here and
+adding them needed a sudo password. aria2 arrived later (2026-08-14), so this is
+no longer the only option — but it stays because it needs no root and nothing
+outside python3, which makes it the dependency-free path on a fresh machine, and
+because one command does multi-mirror + resume + checksum verification together.
+
+Usage:
+    nhq-download <url> [mirror-url ...] [options]
+    nhq-download --status <output-path>
+
+Options:
+    -o, --out PATH        output file path (default: <dir>/<basename of url>)
+    -d, --dir DIR         output directory (default: ~/Downloads)
+    -c, --conns N         concurrent connections (default: 16)
+    -k, --chunk MiB       work-unit size in MiB (default: 8)
+        --sha256 X        expected sha256; X = hex digest, a URL to a .sha256
+                          file, or "auto" to try <first-url>.sha256
+        --mirrors-file F  read extra mirror URLs from F (one per line)
+        --timeout SEC     per-request socket timeout (default: 30)
+        --interval SEC    progress line interval (default: 2 tty / 10 non-tty)
+        --no-resume       ignore any existing partial download and start over
+        --json            emit machine-readable progress/result lines
+    -h, --help            this text
+
+How it works:
+  1. Probe every URL with a 1-byte Range request. Mirrors that answer 206 and
+     agree on the total size are kept; the rest are dropped (a mirror that
+     ignores Range would silently corrupt a segmented download).
+  2. The file is split into fixed work units pushed onto a queue. N worker
+     threads pull units and fetch them from mirrors round-robin, writing with
+     os.pwrite() straight to the right offset -- no temp parts, no reassembly.
+     A slow mirror only slows its own units, it never strands the download.
+  3. Completed units are recorded in <out>.nhqdl, so Ctrl-C / crash / reboot
+     resumes exactly where it stopped. Live stats land in <out>.nhqdl.progress
+     for `nhq-download --status`.
+  4. sha256 is verified at the end when given.
+
+Exit codes: 0 ok, 1 error, 2 usage, 3 checksum mismatch, 130 interrupted.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import queue
+import re
+import shutil
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+UA = "nhq-download/1.0"
+BLOCK = 1 << 18  # 256 KiB socket reads
+STATE_SUFFIX = ".nhqdl"
+
+
+# ---------------------------------------------------------------- formatting
+
+def human(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.2f} {unit}"
+        n /= 1024
+    return f"{n:.2f} TiB"
+
+
+def hms(sec: float) -> str:
+    if sec != sec or sec in (float("inf"), float("-inf")) or sec < 0:
+        return "--:--"
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------------- probing
+
+def _open(url: str, headers: dict, timeout: float):
+    req = urllib.request.Request(url, headers=headers)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def probe(url: str, timeout: float) -> dict:
+    """Range-probe a URL. Returns {url(final), size, ranges}."""
+    headers = {"User-Agent": UA, "Range": "bytes=0-0", "Accept-Encoding": "identity"}
+    with _open(url, headers, timeout) as r:
+        code = getattr(r, "status", r.getcode())
+        final = r.geturl()
+        crange = r.headers.get("Content-Range")
+        clen = r.headers.get("Content-Length")
+        r.read(1)
+    if code == 206 and crange:
+        m = re.search(r"/\s*(\d+)\s*$", crange)
+        return {"url": final, "size": int(m.group(1)) if m else 0, "ranges": True}
+    return {"url": final, "size": int(clen) if clen and clen.isdigit() else 0, "ranges": False}
+
+
+def fetch_text(url: str, timeout: float) -> str:
+    with _open(url, {"User-Agent": UA}, timeout) as r:
+        return r.read(65536).decode("utf-8", "replace")
+
+
+def resolve_sha256(spec: str, first_url: str, timeout: float) -> str | None:
+    if not spec:
+        return None
+    if re.fullmatch(r"[0-9a-fA-F]{64}", spec.strip()):
+        return spec.strip().lower()
+    url = f"{first_url}.sha256" if spec == "auto" else spec
+    try:
+        txt = fetch_text(url, timeout)
+    except Exception as e:
+        if spec == "auto":
+            eprint(f"nhq-download: no checksum at {url} ({e}) — continuing unverified")
+            return None
+        raise SystemExit(f"nhq-download: cannot read checksum from {url}: {e}")
+    m = re.search(r"\b([0-9a-fA-F]{64})\b", txt)
+    if not m:
+        raise SystemExit(f"nhq-download: no sha256 digest found in {url}")
+    return m.group(1).lower()
+
+
+# --------------------------------------------------------------------- state
+
+class State:
+    """Persisted chunk bitmap so an interrupted download resumes exactly."""
+
+    def __init__(self, path: Path, size: int, chunk: int, sha: str | None):
+        self.path = Path(str(path) + STATE_SUFFIX)
+        self.progress_path = Path(str(self.path) + ".progress")
+        self.size = size
+        self.chunk = chunk
+        self.sha = sha
+        self.total = (size + chunk - 1) // chunk if size else 0
+        self.done = ["0"] * self.total
+        self.lock = threading.Lock()
+        self._last_save = 0.0
+
+    def load(self) -> bool:
+        try:
+            d = json.loads(self.path.read_text())
+        except Exception:
+            return False
+        if d.get("size") != self.size or d.get("chunk") != self.chunk:
+            return False
+        bits = d.get("done", "")
+        if len(bits) != self.total:
+            return False
+        self.done = list(bits)
+        return True
+
+    def mark(self, idx: int):
+        with self.lock:
+            self.done[idx] = "1"
+            now = time.monotonic()
+            if now - self._last_save > 1.0:
+                self._last_save = now
+                self._write()
+
+    def save(self):
+        with self.lock:
+            self._write()
+
+    def _write(self):
+        tmp = Path(str(self.path) + ".tmp")
+        tmp.write_text(json.dumps({
+            "size": self.size, "chunk": self.chunk,
+            "sha256": self.sha, "done": "".join(self.done),
+        }))
+        os.replace(tmp, self.path)
+
+    def pending(self) -> list[int]:
+        return [i for i, c in enumerate(self.done) if c == "0"]
+
+    def bytes_done(self) -> int:
+        n = self.done.count("1")
+        if n == self.total and self.total:
+            return self.size
+        full = n * self.chunk
+        # last chunk is short; correct for it if it is already done
+        if self.total and self.done[-1] == "1":
+            full -= self.chunk - (self.size - (self.total - 1) * self.chunk)
+        return min(full, self.size)
+
+    def cleanup(self):
+        for p in (self.path, self.progress_path, Path(str(self.path) + ".tmp")):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+
+# ------------------------------------------------------------------- mirrors
+
+class Mirrors:
+    def __init__(self, urls: list[str]):
+        self.items = [{"url": u, "cooldown": 0.0, "ok": 0, "err": 0} for u in urls]
+        self.i = 0
+        self.lock = threading.Lock()
+
+    def pick(self) -> dict:
+        with self.lock:
+            n = len(self.items)
+            now = time.monotonic()
+            for _ in range(n):
+                m = self.items[self.i % n]
+                self.i += 1
+                if m["cooldown"] <= now:
+                    return m
+            return min(self.items, key=lambda m: m["cooldown"])
+
+    def penalise(self, m: dict, seconds: float):
+        with self.lock:
+            m["err"] += 1
+            m["cooldown"] = time.monotonic() + seconds
+
+    def reward(self, m: dict):
+        with self.lock:
+            m["ok"] += 1
+
+
+# ------------------------------------------------------------------ download
+
+class Downloader:
+    def __init__(self, out: Path, mirrors: Mirrors, state: State, conns: int,
+                 timeout: float, as_json: bool):
+        self.out = out
+        self.mirrors = mirrors
+        self.st = state
+        self.conns = conns
+        self.timeout = timeout
+        self.as_json = as_json
+        self.q: queue.Queue[int] = queue.Queue()
+        self.stop = threading.Event()
+        self.error: str | None = None
+        self.blk_lock = threading.Lock()
+        self.got = 0            # bytes fetched this run
+        self.base = 0           # bytes already on disk from a previous run
+        self.fd = -1
+
+    def add(self, n: int):
+        with self.blk_lock:
+            self.got += n
+
+    def fetch(self, idx: int, m: dict):
+        start = idx * self.st.chunk
+        end = min(start + self.st.chunk, self.st.size) - 1
+        need = end - start + 1
+        headers = {"User-Agent": UA, "Range": f"bytes={start}-{end}",
+                   "Accept-Encoding": "identity"}
+        got = 0
+        try:
+            with _open(m["url"], headers, self.timeout) as r:
+                if getattr(r, "status", r.getcode()) != 206:
+                    raise OSError("mirror stopped honouring Range")
+                off = start
+                while got < need:
+                    b = r.read(min(BLOCK, need - got))
+                    if not b:
+                        break
+                    os.pwrite(self.fd, b, off)
+                    off += len(b)
+                    got += len(b)
+                    self.add(len(b))
+                    if self.stop.is_set():
+                        raise OSError("aborted")
+            if got != need:
+                raise OSError(f"short read {got}/{need}")
+        except BaseException:
+            self.add(-got)  # do not double-count on retry
+            raise
+
+    def worker(self):
+        attempts = max(6, len(self.mirrors.items) * 3)
+        while not self.stop.is_set():
+            try:
+                idx = self.q.get_nowait()
+            except queue.Empty:
+                return
+            for a in range(attempts):
+                if self.stop.is_set():
+                    return
+                m = self.mirrors.pick()
+                wait = max(0.0, m["cooldown"] - time.monotonic())
+                if wait:
+                    time.sleep(min(wait, 3.0))
+                try:
+                    self.fetch(idx, m)
+                    self.mirrors.reward(m)
+                    self.st.mark(idx)
+                    break
+                except Exception as e:
+                    self.mirrors.penalise(m, min(2.0 * (a + 1), 15.0))
+                    last = e
+            else:
+                self.error = f"chunk {idx} failed after {attempts} tries: {last}"
+                self.stop.set()
+                return
+
+    def report(self, interval: float):
+        t0 = time.monotonic()
+        window: list[tuple[float, int]] = []
+        while not self.stop.is_set():
+            self.stop.wait(interval)
+            now = time.monotonic()
+            with self.blk_lock:
+                got = self.got
+            done = self.base + got
+            window.append((now, done))
+            window[:] = [w for w in window if now - w[0] <= 20][-40:]
+            if len(window) >= 2:
+                dt = window[-1][0] - window[0][0]
+                speed = (window[-1][1] - window[0][1]) / dt if dt > 0 else 0.0
+            else:
+                speed = got / max(now - t0, 0.001)
+            left = self.st.size - done
+            eta = left / speed if speed > 1 else float("inf")
+            pct = 100.0 * done / self.st.size if self.st.size else 0.0
+            payload = {"event": "progress", "file": self.out.name,
+                       "done": done, "total": self.st.size, "pct": round(pct, 2),
+                       "speed_bps": int(speed), "eta_sec": None if eta == float("inf") else int(eta),
+                       "conns": self.conns, "ts": time.time()}
+            try:
+                tmp = Path(str(self.st.progress_path) + ".tmp")
+                tmp.write_text(json.dumps(payload))
+                os.replace(tmp, self.st.progress_path)
+            except Exception:
+                pass
+            if self.as_json:
+                print(json.dumps(payload), flush=True)
+            else:
+                print(f"  {pct:5.1f}%  {human(done)} / {human(self.st.size)}"
+                      f"   {human(speed)}/s   ETA {hms(eta)}", flush=True)
+            if done >= self.st.size:
+                return
+
+    def run(self) -> None:
+        size = self.st.size
+        # create / size the output file without writing 3 GB of zeroes
+        flags = os.O_RDWR | os.O_CREAT
+        self.fd = os.open(self.out, flags, 0o644)
+        try:
+            if os.fstat(self.fd).st_size != size:
+                os.ftruncate(self.fd, size)
+            todo = self.st.pending()
+            self.base = self.st.bytes_done()
+            for i in todo:
+                self.q.put(i)
+            if not todo:
+                return
+            threads = [threading.Thread(target=self.worker, daemon=True)
+                       for _ in range(min(self.conns, len(todo)))]
+            rep = threading.Thread(target=self.report, args=(self.interval,), daemon=True)
+            for t in threads:
+                t.start()
+            rep.start()
+            try:
+                for t in threads:
+                    while t.is_alive():
+                        t.join(0.3)
+            except KeyboardInterrupt:
+                self.stop.set()
+                self.st.save()
+                raise
+            self.stop.set()
+            rep.join(1.0)
+            os.fsync(self.fd)
+            self.st.save()
+        finally:
+            os.close(self.fd)
+
+
+def sha256_file(path: Path, size: int, as_json: bool) -> str:
+    h = hashlib.sha256()
+    done = 0
+    t = time.monotonic()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1 << 22)
+            if not b:
+                break
+            h.update(b)
+            done += len(b)
+            if not as_json and time.monotonic() - t > 2:
+                t = time.monotonic()
+                print(f"  verifying… {100.0 * done / max(size, 1):5.1f}%", flush=True)
+    return h.hexdigest()
+
+
+# ----------------------------------------------------------------- --status
+
+def show_status(target: str) -> int:
+    out = Path(target).expanduser()
+    prog = Path(str(out) + STATE_SUFFIX + ".progress")
+    state = Path(str(out) + STATE_SUFFIX)
+    if prog.exists():
+        d = json.loads(prog.read_text())
+        age = time.time() - d.get("ts", 0)
+        if age <= 60:  # older than that means the run died; trust the state file
+            eta = d.get("eta_sec")
+            print(f"{d['file']}: {d['pct']:.1f}%  {human(d['done'])} / {human(d['total'])}"
+                  f"   {human(d['speed_bps'])}/s   ETA {hms(eta if eta is not None else float('inf'))}"
+                  f"   (sample {age:.0f}s old)")
+            return 0
+    if state.exists():
+        d = json.loads(state.read_text())
+        bits = d.get("done", "")
+        n, tot = bits.count("1"), len(bits)
+        print(f"{out.name}: paused — {n}/{tot} chunks done "
+              f"({100.0 * n / max(tot, 1):.1f}%), resumable")
+        return 0
+    if out.exists():
+        print(f"{out.name}: complete on disk — {human(out.stat().st_size)}")
+        return 0
+    print(f"{out}: nothing found")
+    return 1
+
+
+# --------------------------------------------------------------------- main
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("urls", nargs="*")
+    ap.add_argument("-o", "--out")
+    ap.add_argument("-d", "--dir", default=str(Path.home() / "Downloads"))
+    ap.add_argument("-c", "--conns", type=int, default=16)
+    ap.add_argument("-k", "--chunk", type=int, default=8)
+    ap.add_argument("--sha256", default="")
+    ap.add_argument("--mirrors-file")
+    ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--interval", type=float, default=0.0)
+    ap.add_argument("--no-resume", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--status")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args(argv)
+
+    if a.help or (not a.urls and not a.status):
+        print(__doc__.strip())
+        return 0 if a.help else 2
+    if a.status:
+        return show_status(a.status)
+
+    urls = list(a.urls)
+    if a.mirrors_file:
+        urls += [l.strip() for l in Path(a.mirrors_file).read_text().splitlines()
+                 if l.strip() and not l.startswith("#")]
+    if a.conns < 1:
+        return eprint("nhq-download: --conns must be >= 1") or 2
+    chunk = max(1, a.chunk) << 20
+    interval = a.interval or (2.0 if sys.stdout.isatty() else 10.0)
+
+    out = Path(a.out).expanduser() if a.out else \
+        Path(a.dir).expanduser() / os.path.basename(urllib.parse.urlparse(urls[0]).path)
+    if not out.name:
+        return eprint("nhq-download: cannot infer a filename, pass -o") or 2
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"nhq-download → {out}")
+    print(f"probing {len(urls)} source(s)…")
+    good, size = [], 0
+    for u in urls:
+        try:
+            p = probe(u, a.timeout)
+        except Exception as e:
+            print(f"  ✗ {urllib.parse.urlparse(u).netloc}: {e}")
+            continue
+        host = urllib.parse.urlparse(p["url"]).netloc
+        if not p["ranges"]:
+            print(f"  ✗ {host}: ignores Range — dropped (would corrupt segments)")
+            continue
+        if not p["size"]:
+            print(f"  ✗ {host}: no size reported — dropped")
+            continue
+        if size and p["size"] != size:
+            print(f"  ✗ {host}: size {p['size']} ≠ {size} — dropped")
+            continue
+        size = p["size"]
+        good.append(p["url"])
+        print(f"  ✓ {host}: {human(p['size'])}, ranges ok")
+
+    if not good:
+        eprint("nhq-download: no usable mirror (none supports Range requests)")
+        return 1
+
+    sha = resolve_sha256(a.sha256, urls[0], a.timeout)
+    if sha:
+        print(f"expected sha256: {sha}")
+
+    if out.exists() and out.stat().st_size == size and not Path(str(out) + STATE_SUFFIX).exists():
+        print("file already complete on disk")
+        if sha and sha256_file(out, size, a.json) != sha:
+            eprint("nhq-download: existing file FAILS checksum — delete it and rerun")
+            return 3
+        print(f"✅ {out}")
+        return 0
+
+    free = shutil.disk_usage(out.parent).free
+    if free < size - (out.stat().st_size if out.exists() else 0):
+        eprint(f"nhq-download: need {human(size)}, only {human(free)} free on {out.parent}")
+        return 1
+
+    st = State(out, size, chunk, sha)
+    resumed = (not a.no_resume) and st.load()
+    if a.no_resume:
+        st.cleanup()
+    if resumed and st.bytes_done():
+        print(f"resuming: {human(st.bytes_done())} of {human(size)} already on disk")
+
+    conns = min(a.conns, max(1, len(st.pending())))
+    print(f"{conns} connections × {len(good)} mirror(s), {a.chunk} MiB units, "
+          f"{len(st.pending())}/{st.total} units to go")
+
+    dl = Downloader(out, Mirrors(good), st, conns, a.timeout, a.json)
+    dl.interval = interval
+    t0 = time.monotonic()
+    try:
+        dl.run()
+    except KeyboardInterrupt:
+        eprint("\nnhq-download: interrupted — progress saved, rerun the same "
+               "command to resume")
+        return 130
+    dt = time.monotonic() - t0
+
+    if dl.error:
+        st.save()
+        eprint(f"nhq-download: {dl.error}")
+        eprint("progress saved — rerun the same command to resume")
+        return 1
+
+    got = dl.base + dl.got
+    print(f"transferred {human(dl.got)} in {hms(dt)} "
+          f"({human(dl.got / max(dt, 0.001))}/s average)")
+    if got < size:
+        eprint(f"nhq-download: incomplete ({human(got)}/{human(size)}) — rerun to resume")
+        return 1
+
+    if sha:
+        print("verifying sha256…")
+        actual = sha256_file(out, size, a.json)
+        if actual != sha:
+            eprint(f"nhq-download: CHECKSUM MISMATCH\n  expected {sha}\n  actual   {actual}")
+            eprint("the file is corrupt — delete it and rerun")
+            return 3
+        print("sha256 ok ✔")
+
+    st.cleanup()
+    print(f"✅ {out}  ({human(size)})")
+    if a.json:
+        print(json.dumps({"event": "done", "path": str(out), "size": size,
+                          "sha256": sha, "seconds": round(dt, 1)}), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

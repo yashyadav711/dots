@@ -1,0 +1,1097 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────────────
+# nhq-newbox — provision a fresh CachyOS machine into the NHQ fleet.
+#
+# Built for a box on mains power that dies 3–4× a day, reached mostly over SSH.
+# Everything here is therefore STAGED, IDEMPOTENT and RESUMABLE: if the power
+# goes mid-provision, re-run the same command and it continues from the last
+# completed stage instead of starting over.
+#
+#   nhq-newbox all              # run every remaining stage, in order
+#   nhq-newbox <stage> [...]    # run specific stages
+#   nhq-newbox verify           # smoke-test every layer, change nothing
+#   nhq-newbox status           # which stages are done
+#   nhq-newbox --dry-run all    # print what would happen, touch nothing
+#   nhq-newbox --redo <stage>   # forget a stage's marker and run it again
+#
+# Stages:
+#   base     mirrors, keyring, LTS fallback kernel, the CLI toolset
+#   ssh      sshd hardening + drop-in, sshguard, mosh
+#   shell    zsh + Oh My Zsh + powerlevel10k, aliases, tmux (+ OSC52 over SSH)
+#   gpu      nvidia-open (prebuilt, no DKMS), power limit, monitoring
+#   docker   docker + daemon.json (log caps, live-restore) + GPU via CDI
+#   storage  OPTIONAL: a real second disk, only if one is ever added + approved
+#   dirs     ~/Github + ~/ai layout; model caches on the SSD (no bulk disk here)
+#   share    NFS export, Syncthing, Tailscale, mDNS
+#   power    journald caps, snapper retention, grub-btrfs, WoL, hibernate wiring
+#
+# Deliberately NOT done here: key-based SSH (Yash wants password auth first),
+# UPS/nut (no UPS yet — `nhq-newbox power` prints the exact steps for when there
+# is one), HyDE/Hyprland (this box is headless; add it later if he sits at it),
+# and bulk storage (three other drives in this machine hold Windows data that
+# stays untouched — everything here runs off the one 500 GB OS SSD).
+# ──────────────────────────────────────────────────────────────────────────────
+set -uo pipefail
+
+VERSION=1.0
+STATE_DIR=/var/lib/nhq-newbox
+DRY=0
+REDO=0
+ALL_RUN=0
+RO=0            # read-only invocation (verify/status): never needs a password
+LOG=/var/log/nhq-newbox.log
+
+C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[1m'; C_D=$'\e[2m'; C_0=$'\e[0m'
+
+STAGES=(base ssh shell gpu docker storage dirs share power)
+
+say()  { printf '%s\n' "$*"; }
+head1() { printf '\n%s══ %s %s\n' "$C_B" "$*" "$C_0"; }
+ok()   { printf '  %s✓%s %s\n' "$C_G" "$C_0" "$*"; }
+warn() { printf '  %s!%s %s\n' "$C_Y" "$C_0" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$C_R" "$C_0" "$*"; }
+die()  { printf '%snhq-newbox: %s%s\n' "$C_R" "$*" "$C_0" >&2; exit 1; }
+
+# run <cmd...> — the single choke point for anything that changes the system.
+run() {
+  if (( DRY )); then printf '  %s[dry]%s %s\n' "$C_D" "$C_0" "$*"; return 0; fi
+  printf '  %s$ %s%s\n' "$C_D" "$*" "$C_0"
+  "$@" >>"$LOG" 2>&1 || { bad "failed: $*  (see $LOG)"; return 1; }
+}
+
+# wr <path> <<'EOF' … — write a file from stdin, backing up a real one once.
+wr() {
+  local dest=$1 tmp
+  tmp=$(mktemp)
+  cat >"$tmp"
+  if (( DRY )); then
+    printf '  %s[dry] write %s (%s lines)%s\n' "$C_D" "$dest" "$(wc -l <"$tmp")" "$C_0"
+    rm -f "$tmp"; return 0
+  fi
+  if [[ -e $dest ]] && ! cmp -s "$tmp" "$dest"; then
+    [[ -e $dest.nhq.bak ]] || cp -a "$dest" "$dest.nhq.bak"
+  fi
+  install -Dm"${WR_MODE:-644}" "$tmp" "$dest" && ok "wrote $dest"
+  rm -f "$tmp"
+}
+
+pkg() {  # pkg <packages…> — install only what is missing
+  local miss=()
+  for p in "$@"; do pacman -Qq "$p" &>/dev/null || miss+=("$p"); done
+  ((${#miss[@]})) || { ok "already installed: $*"; return 0; }
+  say "  installing: ${miss[*]}"
+  run sudo pacman -S --needed --noconfirm "${miss[@]}"
+}
+
+svc() {  # svc <unit…> — enable+start, idempotent
+  for u in "$@"; do
+    systemctl is-enabled --quiet "$u" 2>/dev/null && systemctl is-active --quiet "$u" 2>/dev/null \
+      && { ok "$u already enabled+active"; continue; }
+    run sudo systemctl enable --now "$u"
+  done
+}
+
+done_stage()  { [[ -e $STATE_DIR/$1 ]]; }
+mark_stage()  { (( DRY )) || { sudo mkdir -p "$STATE_DIR"; date -Is | sudo tee "$STATE_DIR/$1" >/dev/null; }; }
+
+lan_subnet() {  # best-effort LAN CIDR from the primary interface
+  ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -1 \
+    | awk -F/ '{split($1,a,"."); print a[1]"."a[2]"."a[3]".0/"$2}'
+}
+
+# fw_open <service-name> <port[/proto] …> — open ports through whichever host
+# firewall is active, trusting the WHOLE home LAN rather than fiddling with
+# one rule per service. Yash's call: ufw is his firewall of choice here, scoped
+# to the home subnet — every device on that LAN reaches every service on this
+# box; anything from outside the subnet still hits ufw's default deny.
+# firewalld gets the older per-service treatment since it has no LAN-trust verb.
+fw_open() {
+  local svcname=$1; shift
+  local subnet; subnet=$(lan_subnet)
+  if systemctl is-active --quiet firewalld 2>/dev/null; then
+    run sudo firewall-cmd --permanent --add-service="$svcname" 2>/dev/null || true
+    for p in "$@"; do run sudo firewall-cmd --permanent --add-port="$p"; done
+    run sudo firewall-cmd --reload
+    ok "firewalld: $svcname opened"
+  elif command -v ufw >/dev/null; then
+    [[ -n $subnet ]] || { warn "no LAN subnet detected — cannot scope ufw, leaving it alone"; return 0; }
+    run sudo ufw default deny incoming
+    run sudo ufw default allow outgoing
+    # idempotent: ufw silently no-ops re-adding a rule that already exists
+    run sudo ufw allow from "$subnet" comment 'nhq-newbox: trust the home LAN'
+    run sudo ufw --force enable
+    ok "ufw: whole home LAN ($subnet) trusted — $svcname and everything else on this box reachable from it"
+  else
+    ok "no host firewall present — nothing to open"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────── preflight
+
+preflight() {
+  head1 "preflight"
+  [[ $EUID -ne 0 ]] || die "run as your normal user, not root (it sudos where needed)"
+  command -v pacman >/dev/null || die "not an Arch/CachyOS system"
+  # Dry runs and `verify`/`status` change nothing, so they must never demand a
+  # password — being able to read the plan, and to health-check after a power cut,
+  # should not depend on having sudo cached. Checks that genuinely need root
+  # degrade to a warning instead (they use `sudo -n` and skip on failure).
+  if (( DRY || RO )); then
+    sudo -n true 2>/dev/null && ok "sudo available" \
+      || warn "no sudo cached — root-only checks will be skipped (run 'sudo -v' first for the full picture)"
+  else
+    sudo -v || die "need sudo"
+    sudo mkdir -p "$STATE_DIR"; sudo touch "$LOG"; sudo chmod 644 "$LOG"
+  fi
+
+  local id; id=$(. /etc/os-release && echo "$ID")
+  [[ $id == cachyos ]] || warn "os-release ID=$id (expected cachyos) — continuing anyway"
+  ok "os: $(. /etc/os-release && echo "$PRETTY_NAME")  kernel: $(uname -r)"
+
+  [[ -d /sys/firmware/efi ]] && ok "booted UEFI" || warn "booted in BIOS/CSM mode — snapshot boot + modern bootloaders expect UEFI"
+
+  local rootfs; rootfs=$(findmnt -no FSTYPE /)
+  [[ $rootfs == btrfs ]] && ok "root is btrfs (snapshots available)" \
+    || warn "root is $rootfs, not btrfs — the snapper/grub-btrfs parts of 'power' will be skipped"
+
+  ping -c1 -W3 1.1.1.1 &>/dev/null && ok "network up" || die "no network"
+
+  local free; free=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+  (( free > 15 )) && ok "root free: ${free}G" || warn "only ${free}G free on / — GPU+docker+models need room"
+
+  lspci -nn 2>/dev/null | grep -qi 'VGA.*NVIDIA' \
+    && ok "NVIDIA GPU: $(lspci | grep -i 'VGA.*NVIDIA' | sed 's/.*: //' | head -1)" \
+    || warn "no NVIDIA VGA device seen — the gpu stage will refuse to run"
+}
+
+# ─────────────────────────────────────────────────────────── base
+
+stage_base() {
+  head1 "base — mirrors, fallback kernel, CLI toolset"
+
+  run sudo pacman -Sy --noconfirm archlinux-keyring cachyos-keyring
+  command -v cachyos-rate-mirrors >/dev/null && run sudo cachyos-rate-mirrors
+
+  # A SECOND kernel is not a luxury here. If a power cut lands mid-`pacman -Syu`
+  # and the new kernel's initramfs is half-written, the LTS entry in the boot
+  # menu is the difference between an SSH session and carrying a monitor over.
+  pkg linux-cachyos-lts linux-cachyos-lts-headers
+
+  # The CLI set. eza and bat are called out because on the laptop they arrived
+  # only as dependencies of cachyos-fish-config — switching to zsh drops them,
+  # which silently breaks ls/la/ll/cat. Declared explicitly here so that cannot
+  # happen on this box.
+  pkg eza bat fd ripgrep fzf zoxide git-delta jq yq \
+      btop htop duf dust lazygit git git-lfs \
+      neovim vim yazi tmux zsh \
+      rsync aria2 wget curl openssh mosh \
+      man-db tealdeer unzip p7zip zip \
+      smartmontools lm_sensors pciutils usbutils \
+      pacman-contrib reflector expac \
+      base-devel dkms \
+      wl-clipboard xclip \
+      yt-dlp ffmpeg imagemagick \
+      cpuid hwinfo lshw fastfetch \
+      uv python-pipx nodejs go rustup \
+      earlyoom snapper btrfs-progs inotify-tools
+
+  command -v paru >/dev/null || warn "paru missing (CachyOS normally ships it) — AUR packages will be skipped"
+  svc paccache.timer 2>/dev/null || true
+  mark_stage base
+}
+
+verify_base() {
+  head1 "verify: base"
+  local n=0
+  for c in eza bat fd rg fzf zoxide delta jq btop duf lazygit nvim yazi tmux zsh mosh rsync aria2c uv; do
+    command -v "$c" >/dev/null && ok "$c" || { bad "$c MISSING"; ((n++)); }
+  done
+  ls /usr/lib/modules/ | grep -q lts && ok "LTS fallback kernel installed: $(ls /usr/lib/modules | grep lts)" \
+    || { bad "no LTS kernel — you have no fallback if an update dies mid-cut"; ((n++)); }
+  return $((n>0))
+}
+
+# ─────────────────────────────────────────────────────────── ssh
+
+stage_ssh() {
+  head1 "ssh — password auth now, hardened around it"
+  pkg openssh mosh sshguard
+
+  # Password auth is Yash's explicit choice until every client app is set up.
+  # That is fine on a LAN, but password auth + an open port is exactly what gets
+  # brute-forced, so sshguard bans repeat offenders and root login is closed.
+  # Swapping to keys later = flip two lines in this same drop-in file.
+  wr /etc/ssh/sshd_config.d/10-nhq.conf <<'EOF'
+# nhq-newbox — SSH policy for this box.
+#
+# PHASE 1 (now): password auth, so Yash can add the box to every client app
+# without juggling keys. Hardened everywhere else.
+# PHASE 2 (after keys are deployed): set PasswordAuthentication no and
+# KbdInteractiveAuthentication no, then `systemctl reload sshd`. Nothing else
+# needs to change.
+
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+
+PermitRootLogin no
+MaxAuthTries 4
+MaxSessions 10
+LoginGraceTime 30
+
+# Keep a session alive across the flaky Wi-Fi/AP hop, but reap truly dead ones
+# so a power cut does not leave phantom sessions holding the tty.
+ClientAliveInterval 30
+ClientAliveCountMax 6
+TCPKeepAlive yes
+
+AllowAgentForwarding yes
+AllowTcpForwarding yes
+X11Forwarding no
+PrintMotd no
+AcceptEnv COLORTERM TERM_PROGRAM
+EOF
+
+  # sshd must be ENABLED, not just started: this box reboots on its own several
+  # times a day and SSH is the only way in.
+  svc sshd sshguard
+
+  fw_open ssh 22 || true
+
+  local ip; ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[\d.]+' | head -1)
+  say ""
+  ok "reachable at: ${ip:-<unknown>}  port 22  user $USER"
+  say "  ${C_D}from the laptop:  ssh $USER@${ip:-<ip>}     (or: mosh $USER@${ip:-<ip>})${C_0}"
+  mark_stage ssh
+}
+
+verify_ssh() {
+  head1 "verify: ssh"
+  systemctl is-active --quiet sshd && ok "sshd active" || bad "sshd NOT active"
+  systemctl is-enabled --quiet sshd && ok "sshd enabled at boot" || bad "sshd NOT enabled — it will not come back after a power cut"
+  # `sshd -t` needs root. Without it, say so — never report a config as INVALID
+  # when the truth is that the check could not run. A false alarm here would send
+  # him hunting a broken sshd that was fine all along.
+  if sudo -n true 2>/dev/null; then
+    sudo -n sshd -t 2>/dev/null && ok "sshd config parses" || bad "sshd config INVALID — do not reboot until fixed"
+  else
+    warn "sshd config not checked (needs root: sudo -v, then re-run)"
+  fi
+  systemctl is-active --quiet sshguard && ok "sshguard active (brute-force bans)" || warn "sshguard inactive"
+  grep -q 'PermitRootLogin no' /etc/ssh/sshd_config.d/10-nhq.conf 2>/dev/null && ok "root login closed" || warn "root login not explicitly closed"
+  command -v mosh-server >/dev/null && ok "mosh-server present (survives router reboots)" || bad "mosh missing"
+
+  # A running sshd behind a closed firewall looks perfectly healthy from inside
+  # the box and is completely unreachable from outside it. This is the check that
+  # would have caught rig on day one: sshd enabled, port still dropped.
+  if systemctl is-active --quiet firewalld 2>/dev/null; then
+    if sudo -n firewall-cmd --list-services 2>/dev/null | grep -qw ssh; then
+      ok "firewalld allows ssh"
+    elif sudo -n true 2>/dev/null; then
+      bad "firewalld is ACTIVE and does NOT allow ssh — unreachable from the LAN. Fix: sudo firewall-cmd --permanent --add-service=ssh && sudo firewall-cmd --reload"
+    else
+      warn "firewalld active; cannot read its rules without root (sudo -v, then re-run)"
+    fi
+  elif command -v ufw >/dev/null && sudo -n ufw status 2>/dev/null | grep -q '^Status: active'; then
+    local subnet; subnet=$(lan_subnet)
+    if sudo -n ufw status 2>/dev/null | grep -qE "ALLOW.*${subnet:-\$^}|22(/tcp)?[[:space:]]+ALLOW"; then
+      ok "ufw active and allows the LAN/ssh"
+    else
+      bad "ufw is ACTIVE and does not appear to allow ssh/the LAN — unreachable. Fix: sudo ufw allow from ${subnet:-<your-subnet>}"
+    fi
+  elif command -v ufw >/dev/null && sudo -n true 2>/dev/null; then
+    warn "ufw installed but inactive — no firewall blocking ssh right now, but nothing will after a reboot enables it either. Run the ssh stage to configure it properly."
+  else
+    ok "no host firewall blocking ssh"
+  fi
+  ss -tlnH 'sport = :22' 2>/dev/null | grep -q . && ok "sshd listening on :22" || bad "nothing listening on :22"
+}
+
+# ─────────────────────────────────────────────────────────── shell
+
+stage_shell() {
+  head1 "shell — zsh + Oh My Zsh + powerlevel10k, and tmux that copies over SSH"
+
+  # OMZ from the repos, not the upstream curl|sh installer. Two reasons that
+  # matter here: pacman transactions are recoverable if power dies mid-install,
+  # and updates arrive with the rest of the system instead of a self-updating
+  # git clone. cachyos-zsh-config pulls oh-my-zsh-git, powerlevel10k,
+  # autosuggestions, syntax-highlighting, completions and history-search.
+  pkg cachyos-zsh-config zsh-theme-powerlevel10k ttf-meslo-nerd
+
+  # ~/.zshrc: CachyOS's config, then ours. Plugins are set BEFORE sourcing it,
+  # because cachyos-config.zsh only defaults them if the array is empty.
+  wr "$HOME/.zshrc" <<'EOF'
+# nhq-newbox — zsh entrypoint.
+#   plugins are chosen here, BEFORE cachyos-config.zsh, because that file does
+#   `[[ -z "${plugins[*]}" ]] && plugins=(git fzf extract)` — it only fills in a
+#   default. Setting it first is how you extend rather than fight it.
+plugins=(git fzf extract sudo docker docker-compose systemd tmux zoxide command-not-found)
+
+source /usr/share/cachyos-zsh-config/cachyos-config.zsh
+
+# ours: aliases, env, prompt override
+[[ -f ~/.config/zsh/nhq.zsh ]] && source ~/.config/zsh/nhq.zsh
+[[ -f ~/.config/zsh/private.zsh ]] && source ~/.config/zsh/private.zsh   # secrets, never in git
+EOF
+
+  # The alias set, ported from the laptop's fish aliases — but TRIAGED, not
+  # copied. The originals carried ~33 ArcoLinux/LeftWM/polybar/VMware/X11
+  # aliases (leftwm-theme, arcolinux-*, killall picom, xrdb) that cannot work on
+  # this box, plus yay wrappers when the AUR helper here is paru. Cargo-culting
+  # them would just mean 33 commands that fail differently.
+  wr "$HOME/.config/zsh/nhq.zsh" <<'EOF'
+# ─── nhq.zsh — env, aliases, keys ────────────────────────────────────────────
+export EDITOR=nvim VISUAL=nvim
+export PATH="$HOME/.local/bin:$PATH"
+export MANPAGER='nvim +Man!'
+
+# Model weights and caches. This box has no dedicated bulk-storage disk — the
+# other three drives here hold Windows data that is explicitly off-limits — so
+# everything lives under $HOME on the OS SSD by default. The 'storage' stage
+# repoints these onto a real second disk (symlinking ~/ai/store at it) only if
+# one is ever added and explicitly approved (NHQ_HDD=... nhq-newbox storage).
+export OLLAMA_MODELS="$HOME/ai/ollama"
+export HF_HOME="$HOME/ai/huggingface"
+export TORCH_HOME="$HOME/ai/torch"
+export UV_CACHE_DIR="$HOME/ai/uv-cache"
+
+# ── modern replacements (eza ships an `exa` compat symlink, but call eza) ──
+alias ls='eza --icons --color=always --group-directories-first'
+alias ll='eza -lghHi --icons --color=always --group-directories-first --time-style=long-iso'
+alias la='eza -laghH@ --icons --color=always --group-directories-first --time-style=long-iso --total-size'
+alias lt='eza --tree --level=2 --icons --group-directories-first'
+alias l.="eza -A | grep -E '^\.'"
+alias cat='bat --paging=never --style=plain --color=always'
+alias catp='bat'
+alias grep='grep --color=auto'
+alias df='duf'
+alias dfh='df -h'
+alias free='free -mth'
+alias cls='clear'
+alias tmp='cd ~/Downloads/tmp'
+
+# ── pacman / paru ──
+alias update='sudo pacman -Syu'
+alias upa='paru -Syu'
+alias pacsearch='pacman -Ss'
+alias pacinstall='sudo pacman -S'
+alias parusearch='paru -Ss'
+alias paruinstall='paru -S'
+alias unlock='sudo rm -f /var/lib/pacman/db.lck'
+alias cleanup='sudo pacman -Rns $(pacman -Qtdq)'
+alias list='pacman -Qqe'
+alias listaur='pacman -Qqem'
+alias big='expac -H M "%m\t%n" | sort -h | nl'
+alias rip="expac --timefmt='%Y-%m-%d %T' '%l\t%n %v' | sort | tail -200 | nl"
+alias lpacman='bat /var/log/pacman.log'
+alias mirrorx='sudo cachyos-rate-mirrors'
+
+# ── system / logs ──
+alias jctl='journalctl -p 3 -xb'
+alias sysfailed='systemctl list-units --failed'
+alias ip='ip -color'
+alias ff='fastfetch'
+alias hw='hwinfo --short'
+alias kernels='ls /usr/lib/modules'
+alias microcode='grep . /sys/devices/system/cpu/vulnerabilities/*'
+alias psgrep='ps aux | grep -v grep | grep -i -e VSZ -e'
+alias psa='ps auxf'
+
+# ── btrfs / snapshots ──
+alias btrfsfs='sudo btrfs filesystem df /'
+alias btrfsli='sudo btrfs subvolume list / -t'
+alias snapli='sudo snapper list'
+alias snapcr='sudo snapper -c root create --description'
+alias scrub='sudo btrfs scrub start -Bd /'
+
+# ── gpu ──
+alias gpu='nvidia-smi'
+alias gputop='nvtop'
+alias gputemp='nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw --format=csv'
+
+# ── docker ──
+alias dps='docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"'
+alias dcu='docker compose up -d'
+alias dcd='docker compose down'
+alias dcl='docker compose logs -f --tail=100'
+
+# ── git ──
+alias gs='git status -sb'
+alias gl='git log --oneline --graph --decorate -20'
+alias lg='lazygit'
+
+# ── the one to run after every power cut ──
+alias health='nhq-newbox verify'
+
+# fzf + zoxide, if present
+command -v zoxide >/dev/null && eval "$(zoxide init zsh)"
+command -v fzf    >/dev/null && source <(fzf --zsh) 2>/dev/null
+EOF
+
+  # p10k: use the packaged 'rainbow' preset rather than making him sit through
+  # `p10k configure` over SSH. Overwriting an existing hand-tuned ~/.p10k.zsh
+  # would be rude, so only seed it if absent.
+  if [[ ! -f $HOME/.p10k.zsh ]]; then
+    run cp /usr/share/zsh-theme-powerlevel10k/config/p10k-rainbow.zsh "$HOME/.p10k.zsh"
+  else
+    ok "~/.p10k.zsh exists — left alone"
+  fi
+
+  # ── tmux ────────────────────────────────────────────────────────────────────
+  # Same base as the laptop: gpakosz/.tmux + his tmux.conf.local.
+  [[ -d $HOME/.tmux ]] || run git clone --depth 1 https://github.com/gpakosz/.tmux.git "$HOME/.tmux"
+  run ln -sfn "$HOME/.tmux/.tmux.conf" "$HOME/.tmux.conf"
+
+  local dots=$HOME/Github/dots
+  if [[ -f $dots/tmux/tmux.conf.local ]]; then
+    run ln -sfn "$dots/tmux/tmux.conf.local" "$HOME/.tmux.conf.local"
+    ok "linked his tmux.conf.local from dots"
+  else
+    warn "dots not cloned yet — run the 'dirs' stage, then re-run 'shell' to link tmux.conf.local"
+  fi
+
+  # THE REMOTE CLIPBOARD FIX.
+  # His tmux.conf.local binds copy straight to `wl-copy`, and the gpakosz base
+  # picks its copy command from $XDG_SESSION_TYPE. Over SSH there is no Wayland
+  # display, so both paths fail and every copy dies in tmux's internal buffer —
+  # you select text and nothing reaches the laptop clipboard.
+  # OSC 52 is the fix: tmux hands the selection to the *terminal*, which is
+  # kitty on the laptop, so remote copies land in the local clipboard. Loaded
+  # after tmux.conf.local so it wins.
+  wr "$HOME/.tmux.conf.remote" <<'EOF'
+# nhq-newbox — remote/headless clipboard. Sourced last, overrides the
+# wl-copy bindings from tmux.conf.local which cannot work without a Wayland
+# session. OSC 52 sends the selection to the CLIENT terminal (kitty), so
+# copying inside a remote tmux reaches the laptop clipboard.
+set -g set-clipboard on
+set -g allow-passthrough on
+
+unbind -T copy-mode    MouseDragEnd1Pane
+unbind -T copy-mode-vi MouseDragEnd1Pane
+bind -T copy-mode    MouseDragEnd1Pane send -X copy-selection-and-cancel
+bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-selection-and-cancel
+bind -T copy-mode    y send -X copy-selection-and-cancel
+bind -T copy-mode-vi y send -X copy-selection-and-cancel
+
+# A headless box has no Wayland session; make that explicit for the base config.
+setenv -g XDG_SESSION_TYPE tty
+EOF
+  grep -q 'tmux.conf.remote' "$HOME/.tmux.conf.local" 2>/dev/null \
+    || say "  ${C_D}note: source ~/.tmux.conf.remote at the end of ~/.tmux.conf.local (or keep it separate and use -f)${C_0}"
+
+  # login shell
+  if [[ $SHELL != */zsh ]]; then
+    run sudo chsh -s /usr/bin/zsh "$USER"
+    ok "login shell → zsh (takes effect next login)"
+  else
+    ok "login shell already zsh"
+  fi
+  mark_stage shell
+}
+
+verify_shell() {
+  head1 "verify: shell"
+  [[ -d /usr/share/oh-my-zsh ]] && ok "Oh My Zsh at /usr/share/oh-my-zsh" || bad "OMZ missing"
+  [[ -f /usr/share/zsh-theme-powerlevel10k/powerlevel10k.zsh-theme ]] && ok "powerlevel10k present" || warn "p10k theme not found"
+  zsh -ic 'exit' &>/dev/null && ok "zsh starts clean (no startup errors)" || bad "zsh startup errors — run: zsh -ic exit"
+  zsh -ic 'alias ls' 2>/dev/null | grep -q eza && ok "ls → eza wired" || bad "ls alias not active"
+  command -v eza >/dev/null && ok "eza installed (ls/la/ll depend on it)" || bad "eza MISSING — ls/la/ll are broken"
+  command -v bat >/dev/null && ok "bat installed (cat depends on it)" || bad "bat MISSING — cat is broken"
+  [[ -f $HOME/.tmux.conf ]] && ok "tmux.conf linked" || bad "tmux.conf missing"
+  [[ -f $HOME/.tmux.conf.remote ]] && ok "OSC52 remote-clipboard override present" || warn "no remote clipboard override — copies will not reach the laptop"
+  tmux -f /dev/null new-session -d -s _nhqcheck 2>/dev/null && { ok "tmux can start a session"; tmux kill-session -t _nhqcheck 2>/dev/null; } || warn "tmux failed to start a test session"
+}
+
+# ─────────────────────────────────────────────────────────── gpu
+
+stage_gpu() {
+  head1 "gpu — nvidia-open, prebuilt for both kernels"
+  # No NVIDIA card: refuse loudly when this stage was asked for by name, but only
+  # skip when sweeping every stage — one absent GPU must not strand the rest of
+  # a provision run half-done on a box that may lose power at any moment.
+  if ! lspci -nn | grep -qi 'VGA.*NVIDIA'; then
+    if (( ALL_RUN )); then warn "no NVIDIA GPU present — skipping gpu stage"; return 0; fi
+    die "no NVIDIA GPU detected; refusing"
+  fi
+
+  # WHY the prebuilt modules and not nvidia-open-dkms:
+  # DKMS recompiles the module during the pacman transaction — minutes of CPU on
+  # this box. A power cut in that window leaves a kernel with no working nvidia
+  # module, i.e. no display and possibly no GPU after reboot. CachyOS ships
+  # modules prebuilt against its own kernels, so the install is just file
+  # extraction: far shorter, and recoverable by re-running pacman.
+  # One per kernel, so the LTS fallback also has a working GPU.
+  pkg linux-cachyos-nvidia-open linux-cachyos-lts-nvidia-open \
+      nvidia-utils nvidia-settings opencl-nvidia nvtop
+
+  # NOTE: nvidia_drm.modeset=1 is the default in current nvidia-utils, so it is
+  # deliberately NOT added to the kernel cmdline. Verified below instead of
+  # assumed — if modeset is off, add it rather than guessing.
+
+  # Cap the board a little under its 185 W stock limit. On a supply that browns
+  # out several times a day, shaving the transient peak costs a few percent of
+  # performance and reduces both heat and the chance that a load spike coincides
+  # with a sag. Non-fatal if the card refuses the value.
+  wr /etc/systemd/system/nvidia-powerlimit.service <<'EOF'
+[Unit]
+Description=Cap NVIDIA board power (kinder to an unstable mains supply)
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 150 W of a 185 W stock limit. `-pm 1` first: persistence mode keeps the
+# setting across the driver unloading when no client has the GPU open.
+ExecStart=/usr/bin/nvidia-smi -pm 1
+ExecStart=/usr/bin/nvidia-smi -pl 150
+# A card that rejects the limit must not fail the boot.
+SuccessExitStatus=0 2 3
+[Install]
+WantedBy=multi-user.target
+EOF
+  run sudo systemctl daemon-reload
+  svc nvidia-powerlimit.service
+  mark_stage gpu
+}
+
+verify_gpu() {
+  head1 "verify: gpu"
+  if ! command -v nvidia-smi >/dev/null; then bad "nvidia-smi missing — driver not installed"; return 1; fi
+  if nvidia-smi -L &>/dev/null; then
+    ok "driver up: $(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader)"
+  else
+    bad "nvidia-smi cannot talk to the GPU — module not loaded. Check: dmesg | grep -i nvidia"; return 1
+  fi
+  local ms; ms=$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null)
+  [[ $ms == Y ]] && ok "nvidia_drm.modeset=Y" || warn "modeset=$ms — add nvidia_drm.modeset=1 to the kernel cmdline if you want a Wayland session"
+  # a module for EVERY installed kernel, or the fallback boots blind
+  local k m=0
+  for k in $(ls /usr/lib/modules/); do
+    [[ -d /usr/lib/modules/$k/kernel ]] || continue
+    if find "/usr/lib/modules/$k" -name 'nvidia*.ko*' -print -quit 2>/dev/null | grep -q .; then
+      ok "nvidia module present for kernel $k"
+    else
+      bad "kernel $k has NO nvidia module — booting it gives you no GPU"; ((m++))
+    fi
+  done
+  nvidia-smi --query-gpu=power.limit --format=csv,noheader 2>/dev/null | grep -q . \
+    && ok "power limit: $(nvidia-smi --query-gpu=power.limit,power.max_limit --format=csv,noheader)"
+  return $((m>0))
+}
+
+# ─────────────────────────────────────────────────────────── docker
+
+stage_docker() {
+  head1 "docker — with log caps, live-restore, and GPU via CDI"
+  pkg docker docker-compose docker-buildx nvidia-container-toolkit
+
+  # log-opts is the setting that matters most on a 500 GB SSD: the json-file
+  # driver defaults to UNBOUNDED, so one chatty container fills the disk over
+  # weeks and a full root filesystem on a headless box is a recovery trip.
+  # storage-driver overlay2 (not the deprecated btrfs driver) is correct on btrfs.
+  wr /etc/docker/daemon.json <<'EOF'
+{
+  "storage-driver": "overlay2",
+  "live-restore": true,
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "20m", "max-file": "5" },
+  "default-address-pools": [ { "base": "172.30.0.0/16", "size": 24 } ],
+  "features": { "cdi": true }
+}
+EOF
+
+  svc docker.socket docker.service
+  id -nG "$USER" | tr ' ' '\n' | grep -qx docker && ok "$USER already in docker group" \
+    || { run sudo usermod -aG docker "$USER"; warn "added $USER to 'docker' — log out and back in. Note: docker group == root-equivalent."; }
+
+  # btrfs CoW under overlayfs CoW is pointless double work and fragments badly.
+  # chattr +C only affects NEWLY created files, so this is worth doing but is
+  # not retroactive — say so rather than implying the existing tree is covered.
+  if [[ -d /var/lib/docker ]]; then
+    run sudo chattr +C /var/lib/docker 2>/dev/null || true
+    ok "nodatacow set on /var/lib/docker (applies to new files only)"
+  fi
+
+  # GPU in containers: CDI, not the legacy runtime hook. The legacy hook patches
+  # runc and is the thing that breaks on a rolling distro.
+  run sudo nvidia-ctk runtime configure --runtime=docker --cdi.enabled
+  run sudo mkdir -p /etc/cdi
+  run sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+  systemctl list-unit-files 2>/dev/null | grep -q nvidia-cdi-refresh && svc nvidia-cdi-refresh.service \
+    || warn "no nvidia-cdi-refresh.service — re-run 'nvidia-ctk cdi generate' after each driver update"
+  run sudo systemctl restart docker
+  mark_stage docker
+}
+
+verify_docker() {
+  head1 "verify: docker"
+  command -v docker >/dev/null || { bad "docker missing"; return 1; }
+  systemctl is-enabled --quiet docker && ok "docker enabled at boot" || bad "docker NOT enabled — containers will not return after a power cut"
+  systemctl is-active  --quiet docker && ok "docker active" || { bad "docker not running"; return 1; }
+  local info; info=$(docker info 2>/dev/null)
+  grep -q 'Storage Driver: overlay2' <<<"$info" && ok "storage driver overlay2" || warn "storage driver: $(grep 'Storage Driver' <<<"$info")"
+  grep -q 'Live Restore Enabled: true' <<<"$info" && ok "live-restore on" || warn "live-restore off"
+  python3 - <<'PY' 2>/dev/null && ok "log rotation capped in daemon.json" || warn "log rotation NOT capped — a chatty container can fill the SSD"
+import json,sys; d=json.load(open('/etc/docker/daemon.json')); sys.exit(0 if d.get('log-opts',{}).get('max-size') else 1)
+PY
+  [[ -f /etc/cdi/nvidia.yaml ]] && ok "CDI spec present" || warn "no /etc/cdi/nvidia.yaml — GPU containers will fail"
+  say "  ${C_D}GPU-in-docker smoke test (pulls ~200 MB):${C_0}"
+  say "  ${C_D}  docker run --rm --device nvidia.com/gpu=all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi${C_0}"
+}
+
+# ─────────────────────────────────────────────────────────── storage (HDD)
+
+stage_storage() {
+  head1 "storage — OPTIONAL: only if a real second disk is added and approved"
+
+  local root_disk; root_disk=$(lsblk -no PKNAME "$(findmnt -no SOURCE / | sed 's/\[.*//')" 2>/dev/null | head -1)
+  say "  root/OS disk is /dev/${root_disk:-?} — this stage will never touch it."
+  say ""
+  say "  other disks seen on this box (NOT verified empty — check before naming one below):"
+  lsblk -dno NAME,SIZE,ROTA,TRAN,MODEL | awk -v r="$root_disk" '$1!=r {printf "    /dev/%s  %s  %s  %s %s\n",$1,$2,($3==1?"HDD":"SSD"),$4,$5}'
+  say "  ${C_D}run: sudo blkid   — a FSTYPE/LABEL on a disk below means it already holds data.${C_0}"
+  say ""
+
+  local dev=${NHQ_HDD:-}
+  if [[ -z $dev ]]; then
+    warn "set NHQ_HDD to choose the disk, e.g.:  NHQ_HDD=/dev/sdb nhq-newbox storage"
+    warn "skipping (nothing changed)"
+    return 0
+  fi
+  [[ -b $dev ]] || die "$dev is not a block device"
+  local base=${dev#/dev/}
+  [[ -d /sys/block/$base ]] || die "$dev is a partition; pass the whole disk"
+  [[ $base == "$root_disk" ]] && die "$dev is the OS disk — refusing"
+  for crit in / /home /boot /boot/efi; do
+    local h; h=$(findmnt -no SOURCE --target "$crit" 2>/dev/null) || continue
+    [[ $h == "$dev"* ]] && die "$dev backs $crit — refusing"
+  done
+
+  say "  ${C_Y}${C_B}about to ERASE $dev ($(lsblk -dno SIZE "$dev" | xargs), $(lsblk -dno MODEL "$dev" | xargs))${C_0}"
+  lsblk -no NAME,SIZE,FSTYPE,LABEL "$dev" | sed 's/^/    /'
+  if (( ! DRY )); then
+    read -r -p "  type ERASE-HDD to continue: " a
+    [[ $a == ERASE-HDD ]] || die "aborted"
+  fi
+
+  # ext4, not btrfs, on the spinning disk. btrfs would give checksums, but its
+  # CoW makes it slow on rust and repairing a damaged btrfs tree is a long
+  # manual job; `fsck.ext4 -y` fixes power-cut journal damage unattended, which
+  # is what you want on a disk that gets yanked mid-write several times a day.
+  # The tradeoff accepted: no checksums, so bit-rot is caught by smartd + scrubs
+  # of the SSD, not by the filesystem here.
+  run sudo wipefs -a "$dev"
+  run sudo sgdisk -Z -n 1:0:0 -t 1:8300 -c 1:nhq-data "$dev"
+  run sudo partprobe "$dev"
+  local part=${dev}1; [[ -b ${dev}p1 ]] && part=${dev}p1
+  run sudo mkfs.ext4 -L nhq-data -m1 -E lazy_itable_init=0,lazy_journal_init=0 "$part"
+
+  local uuid; uuid=$( (( DRY )) && echo "<uuid>" || sudo blkid -s UUID -o value "$part")
+  run sudo mkdir -p /mnt/hdd
+
+  # nofail + automount is the whole point: a headless box must boot even if this
+  # disk is dying, absent or slow. With a bare fstab entry, systemd waits on the
+  # device and you get an emergency shell you cannot reach over SSH.
+  local fstab_line
+  fstab_line=$(printf 'UUID=%s  /mnt/hdd  ext4  nofail,x-systemd.automount,x-systemd.device-timeout=10s,x-systemd.idle-timeout=180s,noatime  0  2' "$uuid")
+  if grep -q '/mnt/hdd' /etc/fstab 2>/dev/null; then
+    ok "fstab already references /mnt/hdd — left alone"
+  elif (( DRY )); then
+    printf '  %s[dry] append to /etc/fstab: %s%s\n' "$C_D" "$fstab_line" "$C_0"
+  else
+    sudo cp /etc/fstab /etc/fstab.nhq.bak
+    { printf '\n# nhq-newbox — data HDD. nofail + automount: a failing disk must never block a headless boot.\n'
+      printf '%s\n' "$fstab_line"; } | sudo tee -a /etc/fstab >/dev/null
+    # A bad fstab on a headless box means an emergency shell you cannot reach.
+    # Verify it parses BEFORE anything reboots.
+    if sudo findmnt --verify --fstab >/dev/null 2>&1; then
+      ok "fstab entry added for UUID=$uuid (verified parseable)"
+    else
+      sudo cp /etc/fstab.nhq.bak /etc/fstab
+      die "fstab did not verify — reverted. Nothing changed."
+    fi
+  fi
+  run sudo systemctl daemon-reload
+  run sudo mount -a
+
+  pkg smartmontools
+  wr /etc/smartd.conf <<'EOF'
+# nhq-newbox — watch every disk; on a SMART event run the notifier below.
+DEVICESCAN -a -o on -S on -n standby,q -s (S/../.././02|L/../../6/03) -m root -M exec /usr/local/bin/nhq-smart-alert
+EOF
+  WR_MODE=755 wr /usr/local/bin/nhq-smart-alert <<'EOF'
+#!/usr/bin/env bash
+# smartd hands us the failing device in $SMARTD_DEVICE and a message in
+# $SMARTD_MESSAGE. Mail on this box goes nowhere, so log it loudly and, if the
+# fleet notifier is installed, push it to Telegram.
+logger -t nhq-smart -p daemon.err "SMART: ${SMARTD_DEVICE:-?} ${SMARTD_MESSAGE:-event}"
+if command -v nhq-bot >/dev/null; then
+  nhq-bot notify --event failed --title "SMART alert on $(hostname)" \
+    --body "${SMARTD_DEVICE:-disk}: ${SMARTD_MESSAGE:-SMART event}. Check: smartctl -a ${SMARTD_DEVICE:-/dev/sda}" || true
+fi
+EOF
+  svc smartd
+  mark_stage storage
+}
+
+verify_storage() {
+  head1 "verify: storage"
+  if findmnt -no TARGET /mnt/hdd &>/dev/null; then
+    ok "/mnt/hdd mounted: $(findmnt -no SOURCE,FSTYPE,SIZE,USED /mnt/hdd)"
+  else
+    grep -q /mnt/hdd /etc/fstab 2>/dev/null && ok "/mnt/hdd is an automount (mounts on first access — this is correct)" \
+      || warn "no data disk configured — run: NHQ_HDD=/dev/sdX nhq-newbox storage"
+  fi
+  grep -q 'nofail' /etc/fstab 2>/dev/null && ok "fstab uses nofail (a dead disk cannot block boot)" || warn "no nofail in fstab — a failing disk WILL hang a headless boot"
+  grep -qE '^UUID=' /etc/fstab && ok "fstab references disks by UUID" || warn "fstab uses device names — these renumber between boots"
+  systemctl is-active --quiet smartd && ok "smartd watching disks" || warn "smartd inactive"
+  local d
+  for d in $(lsblk -dno NAME,TYPE | awk '$2=="disk"{print $1}'); do
+    sudo -n smartctl -A "/dev/$d" 2>/dev/null | awk -v D="$d" '
+      /Unsafe_Shutdown_Count|Power-Off_Retract_Count|Power_Cycle_Count/ {printf "    /dev/%s  %-28s %s\n", D, $2, $10}'
+  done
+}
+
+# ─────────────────────────────────────────────────────────── dirs
+
+stage_dirs() {
+  head1 "dirs — repo + AI layout"
+
+  # Mirrors the laptop's ~/Github/<org>/<repo> habit so muscle memory and the
+  # nhq tooling both work unchanged. AI weights/caches live under ~/ai on the
+  # OS SSD by default — there is no dedicated bulk-storage disk on this box
+  # (the other three drives hold Windows data that stays off-limits).
+  local d
+  for d in \
+    "$HOME/Github/nHQ" "$HOME/Github/Work" "$HOME/Github/Play" "$HOME/Github/forks" \
+    "$HOME/ai/labs" "$HOME/ai/envs" "$HOME/ai/scratch" \
+    "$HOME/ai/ollama" "$HOME/ai/huggingface" "$HOME/ai/torch" "$HOME/ai/uv-cache" \
+    "$HOME/ai/models" "$HOME/ai/datasets" \
+    "$HOME/.config/zsh" "$HOME/.local/bin" "$HOME/Downloads/tmp"
+  do run mkdir -p "$d"; done
+
+  # Bonus path, opt-in only: if a real second disk is ever added and approved
+  # via `NHQ_HDD=/dev/sdX nhq-newbox storage`, repoint the store onto it instead
+  # of leaving two copies of the layout around.
+  if mountpoint -q /mnt/hdd 2>/dev/null; then
+    for d in ai/ollama ai/huggingface ai/torch ai/uv-cache ai/models ai/datasets \
+             backups archive docker-volumes share; do
+      run sudo mkdir -p "/mnt/hdd/$d"
+    done
+    run sudo chown -R "$USER:$USER" /mnt/hdd/ai /mnt/hdd/share /mnt/hdd/archive /mnt/hdd/backups
+    run rm -rf "$HOME/ai/ollama" "$HOME/ai/huggingface" "$HOME/ai/torch" "$HOME/ai/uv-cache" "$HOME/ai/models" "$HOME/ai/datasets"
+    run ln -sfn /mnt/hdd/ai "$HOME/ai/store"
+    ok "bulk disk present — ~/ai/store repointed at /mnt/hdd/ai"
+  else
+    ok "no bulk-storage disk — AI weights/caches live on the SSD under ~/ai"
+  fi
+
+  # ~/ai/labs/<tool> is the disposable AI-tool sandbox: one uv venv per tool,
+  # nothing installed globally, `rm -rf` to undo a bad experiment.
+  WR_MODE=755 wr "$HOME/.local/bin/newlab" <<'EOF'
+#!/usr/bin/env bash
+# newlab <name> [pypi-packages…] — throwaway sandbox for trying an AI tool.
+# One uv venv per lab so a broken dependency tree never leaks into another
+# experiment or the system python. Delete the directory to undo everything.
+set -euo pipefail
+[[ $# -ge 1 ]] || { echo "usage: newlab <name> [packages…]"; exit 2; }
+name=$1; shift
+lab="$HOME/ai/labs/$name"
+mkdir -p "$lab"; cd "$lab"
+[[ -d .venv ]] || uv venv
+(($#)) && uv pip install "$@"
+cat > .envrc <<'RC'
+source .venv/bin/activate
+RC
+printf '# %s\n\nCreated %s\n\n    cd %s && source .venv/bin/activate\n' "$name" "$(date -I)" "$lab" > README.md
+echo "lab ready: $lab"
+EOF
+
+  if [[ ! -d $HOME/Github/dots/.git ]]; then
+    run git clone https://github.com/yashyadav711/dots "$HOME/Github/dots" \
+      && ok "dots cloned — re-run 'nhq-newbox shell' to link tmux.conf.local"
+  else
+    ok "dots already cloned"
+  fi
+  mark_stage dirs
+}
+
+verify_dirs() {
+  head1 "verify: dirs"
+  local d
+  for d in "$HOME/Github/nHQ" "$HOME/ai/labs" "$HOME/.local/bin"; do
+    [[ -d $d ]] && ok "$d" || bad "$d missing"
+  done
+  [[ -x $HOME/.local/bin/newlab ]] && ok "newlab helper installed" || warn "newlab missing"
+  if [[ -L $HOME/ai/store ]]; then
+    ok "~/ai/store → $(readlink "$HOME/ai/store") (bulk disk)"
+  else
+    [[ -d $HOME/ai/ollama ]] && ok "AI dirs on SSD under ~/ai (no bulk disk — expected on this box)" \
+      || bad "~/ai/ollama missing — dirs stage did not complete"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────── share
+
+stage_share() {
+  head1 "share — NFS (fast LAN), Syncthing (resilient), Tailscale (naming)"
+  pkg nfs-utils syncthing tailscale avahi nss-mdns rsync rclone sshfs
+
+  local subnet; subnet=$(ip -4 -o addr show scope global | awk '{print $4}' | head -1 \
+    | awk -F/ '{split($1,a,"."); print a[1]"."a[2]"."a[3]".0/"$2}')
+  ok "LAN detected as ${subnet:-unknown}"
+
+  # NFS for the big fast pulls. Exports whatever actually exists: /mnt/hdd/*
+  # when a bulk disk was added and approved, otherwise ~/ai and a plain ~/share
+  # on the SSD — this box has three drives that are explicitly hands-off, so
+  # there is no dedicated data disk to assume here.
+  local share_dir models_dir
+  if mountpoint -q /mnt/hdd 2>/dev/null; then
+    share_dir=/mnt/hdd/share; models_dir=/mnt/hdd/ai
+  else
+    share_dir="$HOME/share"; models_dir="$HOME/ai"
+    run mkdir -p "$share_dir"
+  fi
+  if [[ -n $subnet ]]; then
+    wr /etc/exports <<EOF
+# nhq-newbox — export this box's share to the LAN.
+# no_subtree_check: quieter and faster; this is a home LAN, not a bastion.
+${share_dir}  ${subnet}(rw,async,no_subtree_check,crossmnt)
+${models_dir}  ${subnet}(ro,async,no_subtree_check,crossmnt)
+EOF
+    run sudo exportfs -ra
+    svc nfs-server
+  fi
+
+  # mDNS so the laptop can say `box.local` instead of chasing a DHCP lease that
+  # changes every time the router reboots after a cut.
+  svc avahi-daemon
+  if ! grep -q 'mdns' /etc/nsswitch.conf 2>/dev/null; then
+    run sudo sed -i 's/^hosts:.*/hosts: mymachines mdns_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] files myhostname dns/' /etc/nsswitch.conf
+    ok "nsswitch: mDNS resolution enabled"
+  else
+    ok "nsswitch already has mDNS"
+  fi
+
+  # Syncthing as a SYSTEM unit for this user: a headless box boots with nobody
+  # logged in, and a --user unit would not start without enabling lingering.
+  svc "syncthing@$USER.service"
+  say "  ${C_D}web UI (it only listens on localhost):  ssh -L 8384:localhost:8384 $USER@$(hostname)  → http://localhost:8384${C_0}"
+
+  svc tailscaled
+  say "  ${C_D}then, once: sudo tailscale up --ssh --accept-routes${C_0}"
+
+  # ufw's LAN-trust rule from the ssh stage already covers this box's other
+  # services; fw_open is idempotent, so calling it again here just makes sure
+  # NFS/mosh/mdns are covered even if 'share' ever runs before 'ssh' does.
+  fw_open nfs 60000-61000/udp 2049/tcp || true
+  mark_stage share
+}
+
+verify_share() {
+  head1 "verify: share"
+  systemctl is-active --quiet nfs-server && ok "nfs-server active: $(exportfs -s 2>/dev/null | wc -l) export(s)" || warn "nfs-server inactive"
+  systemctl is-active --quiet "syncthing@$USER" && ok "syncthing running" || warn "syncthing not running"
+  systemctl is-active --quiet avahi-daemon && ok "avahi/mDNS up → $(hostname).local" || warn "avahi inactive"
+  if command -v tailscale >/dev/null; then
+    tailscale status &>/dev/null && ok "tailscale up: $(tailscale ip -4 2>/dev/null | head -1)" || warn "tailscale installed but not logged in (sudo tailscale up --ssh)"
+  fi
+  local remote_share; remote_share=$( mountpoint -q /mnt/hdd 2>/dev/null && echo /mnt/hdd/share || echo "\$HOME/share" )
+  say "  ${C_D}laptop-side fstab line for the fast path (automount = no hang when this box dies):${C_0}"
+  say "  ${C_D}  $(hostname).local:${remote_share} /mnt/box nfs noauto,x-systemd.automount,x-systemd.idle-timeout=60,soft,timeo=100,retrans=3,_netdev 0 0${C_0}"
+}
+
+# ─────────────────────────────────────────────────────────── power
+
+stage_power() {
+  head1 "power — surviving 3–4 cuts a day"
+  # cachyos-snapper-support is the CachyOS name; plain 'snapper-support' does not
+  # exist. Kept optional so a missing package cannot fail the whole stage.
+  pkg snapper grub-btrfs inotify-tools earlyoom ethtool wakeonlan
+  pacman -Ss '^cachyos-snapper-support$' &>/dev/null && pkg cachyos-snapper-support || true
+
+  # Bounded logs. Unbounded journald on a box that reboots constantly writes a
+  # new boot's worth of logs several times a day; capped so it can never be the
+  # reason the SSD fills.
+  wr /etc/systemd/journald.conf.d/10-nhq.conf <<'EOF'
+[Journal]
+Storage=persistent
+SystemMaxUse=300M
+SystemMaxFileSize=50M
+MaxRetentionSec=2week
+# Flush to disk more often than the 5min default: on this box the machine can
+# vanish at any second and the last minutes of log are exactly what explains why.
+SyncIntervalSec=30s
+EOF
+  run sudo systemctl restart systemd-journald
+
+  # Snapshots are the undo button for a cut landing mid-`pacman -Syu`. They do
+  # NOT protect data in flight — nothing in software does. Retention is kept
+  # tight because a box that reboots 4×/day otherwise buries the useful ones.
+  if [[ $(findmnt -no FSTYPE /) == btrfs ]]; then
+    sudo snapper -c root list &>/dev/null || run sudo snapper -c root create-config /
+    if [[ -f /etc/snapper/configs/root ]]; then
+      run sudo sed -i \
+        -e 's/^TIMELINE_LIMIT_HOURLY=.*/TIMELINE_LIMIT_HOURLY="5"/' \
+        -e 's/^TIMELINE_LIMIT_DAILY=.*/TIMELINE_LIMIT_DAILY="7"/' \
+        -e 's/^TIMELINE_LIMIT_WEEKLY=.*/TIMELINE_LIMIT_WEEKLY="2"/' \
+        -e 's/^TIMELINE_LIMIT_MONTHLY=.*/TIMELINE_LIMIT_MONTHLY="0"/' \
+        -e 's/^TIMELINE_LIMIT_YEARLY=.*/TIMELINE_LIMIT_YEARLY="0"/' \
+        /etc/snapper/configs/root
+      ok "snapper retention tightened (5 hourly / 7 daily / 2 weekly)"
+    fi
+    svc snapper-timeline.timer snapper-cleanup.timer
+    # grub-btrfsd turns each snapshot into a boot menu entry: that is what makes
+    # a broken root recoverable without a USB stick.
+    systemctl list-unit-files | grep -q grub-btrfsd && svc grub-btrfsd
+    run sudo grub-mkconfig -o /boot/grub/grub.cfg
+  else
+    warn "root is not btrfs — skipping snapper/grub-btrfs"
+  fi
+
+  svc earlyoom
+
+  # Wake-on-LAN: the second way back in if the BIOS 'restore on AC power loss'
+  # setting is missing or the board forgets it.
+  local nic; nic=$(ip -o -4 route show default | awk '{print $5}' | head -1)
+  if [[ -n ${nic:-} ]] && ethtool "$nic" 2>/dev/null | grep -q 'Supports Wake-on.*g'; then
+    wr /etc/systemd/system/wol@.service <<'EOF'
+[Unit]
+Description=Enable Wake-on-LAN on %i
+Requires=network.target
+After=network.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/ethtool -s %i wol g
+[Install]
+WantedBy=multi-user.target
+EOF
+    run sudo systemctl daemon-reload
+    svc "wol@${nic}.service"
+    ok "WoL armed on $nic — from the laptop: wakeonlan $(cat /sys/class/net/"$nic"/address 2>/dev/null)"
+  else
+    warn "WoL not supported/detected on ${nic:-no-nic} — rely on the BIOS AC-power-loss setting"
+  fi
+
+  # Hibernate wiring. VERIFIED on the laptop: Calamares creates the swapfile but
+  # writes NO resume= parameter and NO resume hook, so hibernate silently does
+  # not work. Printed rather than applied, because it edits the bootloader and
+  # initramfs and should be done with eyes on it.
+  say ""
+  if [[ -f /swap/swapfile ]] && ! grep -q resume= /proc/cmdline; then
+    warn "swapfile exists but hibernate is NOT wired up (no resume= on the cmdline, no resume hook)"
+    say "  ${C_D}to enable it — only useful once a UPS can trigger it:${C_0}"
+    say "  ${C_D}  offset=\$(sudo btrfs inspect-internal map-swapfile -r /swap/swapfile)${C_0}"
+    say "  ${C_D}  uuid=\$(findmnt -no UUID /)${C_0}"
+    say "  ${C_D}  # add to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub:${C_0}"
+    say "  ${C_D}  #   resume=UUID=\$uuid resume_offset=\$offset${C_0}"
+    say "  ${C_D}  # add 'resume' to HOOKS in /etc/mkinitcpio.conf after 'filesystems'${C_0}"
+    say "  ${C_D}  sudo mkinitcpio -P && sudo grub-mkconfig -o /boot/grub/grub.cfg${C_0}"
+  fi
+
+  say ""
+  warn "THE ACTUAL FIX IS A UPS. Everything above limits damage; only a UPS prevents it."
+  say "  ${C_D}A 1000–1500 VA line-interactive unit covers this box (~50 W idle, ~250 W with the 2070 loaded)${C_0}"
+  say "  ${C_D}for a few minutes — long enough to shut down cleanly instead of being cut off.${C_0}"
+  say "  ${C_D}When you have one:  sudo pacman -S nut  →  then run: nhq-newbox ups${C_0}"
+  mark_stage power
+}
+
+stage_ups() {
+  head1 "ups — nut (only useful once a UPS is plugged in)"
+  pkg nut
+  say "  1. plug in the UPS over USB, then:  sudo nut-scanner -U"
+  say "     (that prints the exact driver + port stanza for your model — do not guess it)"
+  say "  2. /etc/nut/nut.conf         → MODE=standalone"
+  say "  3. /etc/nut/ups.conf         → the stanza nut-scanner printed (usually driver=usbhid-ups, port=auto)"
+  say "  4. /etc/nut/upsd.users       → [upsmon]  password=<pick one>  upsmon primary"
+  say "  5. /etc/nut/upsmon.conf      → MONITOR <name>@localhost 1 upsmon <password> primary"
+  say "                                 SHUTDOWNCMD \"/usr/bin/systemctl poweroff\""
+  say "                                 (use 'systemctl hibernate' instead only after hibernate is verified working)"
+  say "  6. sudo systemctl enable --now nut-driver-enumerator nut-server nut-monitor"
+  say "  7. verify:  upsc <name>   → must print battery.charge and ups.status"
+  warn "not automated on purpose: the driver stanza is model-specific and a wrong one silently never triggers a shutdown."
+}
+
+verify_power() {
+  head1 "verify: power resilience"
+  local rootfs; rootfs=$(findmnt -no FSTYPE /)
+  say "  root fs: $rootfs   mount opts: $(findmnt -no OPTIONS / | cut -c1-90)"
+  if [[ $rootfs == btrfs ]]; then
+    sudo -n btrfs device stats / 2>/dev/null | grep -v ' 0$' | sed 's/^/    /' | grep . \
+      && bad "btrfs error counters are NON-ZERO above — the disk has had real errors" \
+      || ok "btrfs error counters all zero"
+    sudo -n snapper -c root list 2>/dev/null | tail -3 | sed 's/^/    /'
+    systemctl is-enabled --quiet snapper-timeline.timer && ok "snapshot timer enabled" || warn "snapper-timeline.timer not enabled"
+    systemctl is-active --quiet grub-btrfsd && ok "grub-btrfsd running (snapshots appear in the boot menu)" || warn "grub-btrfsd inactive — snapshots exist but you cannot boot them"
+  fi
+  ls /usr/lib/modules | grep -q lts && ok "LTS fallback kernel present" || bad "no fallback kernel"
+  systemctl is-active --quiet earlyoom && ok "earlyoom active" || warn "earlyoom inactive"
+  journalctl --disk-usage 2>/dev/null | sed 's/^/    /'
+  local unclean; unclean=$(journalctl --list-boots 2>/dev/null | wc -l)
+  ok "boot records on disk: $unclean"
+  say ""
+  say "  ${C_B}failed units:${C_0}"; systemctl --failed --no-legend --plain 2>/dev/null | sed 's/^/    /' | grep . || ok "none"
+  say "  uptime: $(uptime -p)"
+}
+
+# ─────────────────────────────────────────────────────────── driver
+
+usage() { sed -n '3,40p' "$0" | sed 's/^# \?//'; }
+
+main() {
+  local args=()
+  while (($#)); do
+    case $1 in
+      --dry-run|-n) DRY=1 ;;
+      --redo)       REDO=1 ;;
+      -h|--help)    usage; exit 0 ;;
+      --version)    echo "nhq-newbox $VERSION"; exit 0 ;;
+      -*)           die "unknown option $1" ;;
+      *)            args+=("$1") ;;
+    esac
+    shift
+  done
+  ((${#args[@]})) || { usage; exit 2; }
+
+  case ${args[0]} in
+    status)
+      head1 "stage status"
+      for s in "${STAGES[@]}"; do
+        if done_stage "$s"; then ok "$s  ($(cat "$STATE_DIR/$s" 2>/dev/null))"; else say "  ${C_D}·  $s  pending${C_0}"; fi
+      done
+      exit 0 ;;
+    verify)
+      RO=1
+      preflight
+      for s in base ssh shell gpu docker storage dirs share power; do
+        declare -F "verify_$s" >/dev/null && "verify_$s" || true
+      done
+      head1 "done"; exit 0 ;;
+    ups) preflight; stage_ups; exit 0 ;;
+  esac
+
+  preflight
+  local targets=()
+  if [[ ${args[0]} == all ]]; then targets=("${STAGES[@]}"); ALL_RUN=1; else targets=("${args[@]}"); fi
+
+  for s in "${targets[@]}"; do
+    declare -F "stage_$s" >/dev/null || die "no such stage: $s (have: ${STAGES[*]})"
+    if done_stage "$s" && (( ! REDO )) && [[ ${args[0]} == all ]]; then
+      ok "skip $s (already done — --redo to force)"; continue
+    fi
+    (( REDO )) && (( ! DRY )) && sudo rm -f "$STATE_DIR/$s"
+    "stage_$s" || { bad "stage '$s' failed — fix it, then re-run: nhq-newbox $s"; exit 1; }
+  done
+
+  head1 "summary"
+  for s in "${STAGES[@]}"; do done_stage "$s" && ok "$s" || say "  ${C_D}·  $s pending${C_0}"; done
+  say ""
+  say "next:  nhq-newbox verify      # smoke-test every layer"
+  (( DRY )) && warn "this was a dry run — nothing changed"
+}
+
+main "$@"
