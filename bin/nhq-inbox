@@ -378,53 +378,63 @@ PAGE = r"""<!doctype html>
   .who.small { margin-top:10px; }
   .who.small button { padding:8px 6px; font-size:13px; }
   .who.small .st { font-size:10px; }
+  .dup { background:var(--card); border:1px solid var(--line); border-radius:12px;
+         padding:11px 12px; margin-top:10px; }
+  .dup b { display:block; color:var(--bone); font-size:13.5px; font-weight:600;
+           margin-bottom:8px; }
+  .dup .who { margin:0; }
 </style></head><body><div class="wrap">
   <h1>NHQ Inbox</h1>
-  <p class="sub">Shared folder with the laptop: <code>~/Github/nhq-local-downloads</code></p>
+  <p class="sub">Files, text and prompts all go through the one box.
+     Shared folder: <code>~/Github/nhq-local-downloads</code></p>
 
+  <!-- ONE composer. It was three panels — an upload with its own note, a
+       "prompt an agent" with its own picker and box, and a clipboard box — so
+       there were two identical agent pickers and three places to type, and you
+       had to know which one your thought belonged in before you could start.
+       Yash: "thoda ux dekho yaar, cheeze combine ho sakti h".
+
+       Now: attach nothing or something, type or don't, pick a name or don't.
+       The Send button says what will happen with whatever you have given it. -->
   <div id="drop"><b>Tap to pick files</b><span>or drop them here</span></div>
   <input id="pick" type="file" multiple>
-  <!-- Only appears once something is queued: an empty box above an empty drop
-       zone is just clutter, and the note only means anything with a file. -->
-  <textarea id="note" class="note-in" hidden
-            placeholder="Say what this is (optional) — saved next to the file"></textarea>
-  <!-- Optional: hand the file to an agent as well as dropping it in the folder.
-       Tap the chosen one again to unpick it — the folder is still the default,
-       and most uploads are just files. -->
-  <div id="to" class="who small" hidden></div>
+  <div id="log"></div>
+  <!-- Only when a queued name already exists in the folder. Replace is
+       preselected: the usual reason to send the same filename twice is that
+       this is the newer one. -->
+  <div id="dup" class="dup" hidden>
+    <b></b>
+    <div class="who small">
+      <button data-m="replace">Replace</button>
+      <button data-m="skip">Skip</button>
+    </div>
+  </div>
+
+  <textarea id="msg" placeholder="Type a message — or attach files above and describe them"></textarea>
+  <div id="to" class="who"></div>
+
+  <div id="lockbox" class="lockbox" hidden>
+    <b>Locked</b>
+    <span>Sending to an agent runs commands on the laptop, so that needs the key
+          once per device. On the laptop run <code>nhq-inbox qr</code> and scan it
+          — or paste the key here. Files and clipboard work without it.</span>
+    <div class="row">
+      <input id="pkey" type="text" inputmode="latin" autocomplete="off" placeholder="key">
+      <button id="punlock" class="ghost">Unlock</button>
+    </div>
+  </div>
+
   <div class="row">
     <button id="send" disabled>Send</button>
     <button id="cam" class="ghost">Camera</button>
   </div>
   <input id="camin" type="file" accept="image/*,video/*" capture="environment">
   <div id="bar"><div></div></div>
-  <div id="log"></div>
-
-  <h2><span>Prompt an agent</span><span id="plock"></span></h2>
-  <div id="lockbox" class="lockbox" hidden>
-    <b>Locked</b>
-    <span>A prompt runs commands on the laptop, so this panel needs the key once per device.
-          On the laptop run <code>nhq-inbox qr</code> and scan it — or paste the key here.</span>
-    <div class="row">
-      <input id="pkey" type="text" inputmode="latin" autocomplete="off" placeholder="key">
-      <button id="punlock" class="ghost">Unlock</button>
-    </div>
+  <div id="hint" class="hint"></div>
+  <div id="sendlog"></div>
+  <div class="row" style="margin-top:2px">
+    <button id="tpull" class="ghost">Pull the laptop's clipboard</button>
   </div>
-  <div id="who" class="who"></div>
-  <textarea id="ptxt" placeholder="What should they do? This types straight into their session."></textarea>
-  <div class="row">
-    <button id="psend" disabled>Send prompt</button>
-  </div>
-  <div id="phint" class="hint"></div>
-  <div id="plog"></div>
-
-  <h2>Text</h2>
-  <textarea id="txt" placeholder="Paste here — it lands on the laptop's clipboard"></textarea>
-  <div class="row">
-    <button id="tsend">To laptop clipboard</button>
-    <button id="tpull" class="ghost">Pull laptop's</button>
-  </div>
-  <div id="tlog"></div>
 
   <h2><span>Files</span><span id="count"></span></h2>
   <div id="recent"></div>
@@ -436,106 +446,95 @@ PAGE = r"""<!doctype html>
 const $ = i => document.getElementById(i);
 const drop=$('drop'), pick=$('pick'), send=$('send'), cam=$('cam'), camin=$('camin'),
       bar=$('bar'), fill=bar.firstElementChild, log=$('log'), recent=$('recent'),
-      txt=$('txt'), tsend=$('tsend'), tpull=$('tpull'), tlog=$('tlog'), count=$('count');
-let queue=[];
-// Who this UPLOAD goes to, separate from the prompt panel's `target`. Null is
-// the normal case: the file lands in the folder and nobody is interrupted.
-const to=$('to');
-let upTo=null;
+      msg=$('msg'), to=$('to'), hint=$('hint'), sendlog=$('sendlog'), tpull=$('tpull'),
+      lockbox=$('lockbox'), pkey=$('pkey'), punlock=$('punlock'), count=$('count'),
+      dup=$('dup');
 
 const kb=n=>n<1024?n+' B':n<1048576?(n/1024).toFixed(0)+' KB':n<1073741824?(n/1048576).toFixed(1)+' MB':(n/1073741824).toFixed(2)+' GB';
 const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-// ---- prompting an agent -------------------------------------------------
-// The key arrives once, in the URL that the QR encodes, and is kept per device.
-// It is stripped from the address bar straight away so it does not sit in
-// screenshots or get shared when the page is sent to someone.
-const who=$('who'), ptxt=$('ptxt'), psend=$('psend'), plog=$('plog'), plock=$('plock'),
-      lockbox=$('lockbox'), pkey=$('pkey'), punlock=$('punlock'), phint=$('phint');
-let target=null, key=localStorage.getItem('nhq-key')||'', open_=false;
+
+let queue=[], upTo=null, agents=[], open_=false, here=new Set(), dupMode='replace';
+// The key arrives once, in the URL the QR encodes, and is kept per device. It
+// is stripped from the address bar straight away so it does not sit in
+// screenshots or travel when the page is shared.
+let key=localStorage.getItem('nhq-key')||'';
 const qk=new URLSearchParams(location.search).get('k');
 if(qk){ key=qk; localStorage.setItem('nhq-key',qk); history.replaceState({},'',location.pathname); }
+punlock.onclick=()=>{ const v=pkey.value.trim(); if(!v) return;
+  key=v; localStorage.setItem('nhq-key',v); pkey.value=''; refreshAgents(); };
 
-punlock.onclick=()=>{
-  const v=pkey.value.trim(); if(!v) return;
-  key=v; localStorage.setItem('nhq-key',v); pkey.value=''; whoList();
-};
+// ── what will Send actually do ───────────────────────────────────────────────
+// One button, one rule, decided by what you have given it. That is the point of
+// the merge: you should not have to work out which panel your thought belongs
+// in before you can start typing.
+function plan(){
+  const text=msg.value.trim();
+  if(queue.length) return {kind:'files', text, to:upTo};
+  if(!text)        return {kind:'none'};
+  return upTo ? {kind:'prompt', text, to:upTo} : {kind:'clip', text};
+}
+const nameOf=k=>(agents.find(a=>a.key===k)||{}).label||k;
+const liveOf=k=>!!(agents.find(a=>a.key===k)||{}).session;
+const clashes=()=>queue.filter(f=>here.has(f.name)).map(f=>f.name);
 
-async function whoList(){
+function paint(){
+  const p=plan(), locked=!key && !open_, dupes=clashes();
+  log.innerHTML=queue.map(f=>
+    `<div class="f"><div class="meta"><span class="nm">${esc(f.name)}</span>`
+    +`<span class="sz">${kb(f.size)}${here.has(f.name)?' · already there':''}</span></div></div>`).join('');
+
+  dup.hidden=!dupes.length;
+  if(dupes.length){
+    dup.querySelector('b').textContent = dupes.length===1
+      ? `${dupes[0]} is already in the folder`
+      : `${dupes.length} of these are already in the folder`;
+    [...dup.querySelectorAll('[data-m]')].forEach(b=>
+      b.classList.toggle('on', b.dataset.m===dupMode));
+  }
+
+  lockbox.hidden = !(locked && p.to);
+  let label='Send', off=false, why='';
+  if(p.kind==='none'){ off=true; }
+  else if(p.kind==='clip'){ label='Send to laptop clipboard'; }
+  else if(p.kind==='prompt'){ label=`Send to ${nameOf(p.to)}`; }
+  else {
+    const n = dupMode==='skip' ? queue.length-dupes.length : queue.length;
+    label = n ? `Send ${n} file${n>1?'s':''}${p.to?` → ${nameOf(p.to)}`:''}`
+              : 'Nothing to send';
+    if(!n) off=true;
+  }
+  if(p.to && locked){ off=true; why='Unlock below to send to an agent.'; }
+  else if(p.to && !liveOf(p.to)){ why=`${nameOf(p.to)} is offline — it will not arrive.`; }
+  else if(dupes.length && dupMode==='skip'){ why=`Skipping ${dupes.length} already there.`; }
+  else if(dupes.length){ why=`Replacing ${dupes.length} already there.`; }
+  else if(p.kind==='clip'){ why='No name picked, so this goes to the clipboard.'; }
+  send.textContent=label; send.disabled=off; hint.textContent=why;
+}
+msg.oninput=paint;
+[...dup.querySelectorAll('[data-m]')].forEach(b=>
+  b.onclick=()=>{ dupMode=b.dataset.m; paint(); });
+
+async function refreshAgents(){
   try{
     const j=await (await fetch('/agents')).json();
-    open_ = !!j.open;
-    // Default to whoever is actually live, so the common case is type-and-send
-    // rather than tap-then-type. Only ever picks for you when you have not.
-    if(!target){ const live=j.agents.find(a=>a.session); if(live) target=live.key; }
-    who.innerHTML=j.agents.map(a=>
-      `<button data-k="${a.key}" class="${a.session?'live':''}${a.key===target?' on':''}">
-         <span class="dot"></span>${esc(a.label)}
-         <span class="st">${a.session?'live':'offline'}</span>
-       </button>`).join('');
-    [...who.children].forEach(b=>b.onclick=()=>{ target=b.dataset.k; whoList(); });
-    const locked = !key && !open_;
-    lockbox.hidden = !locked;
-    plock.textContent = locked ? 'locked' : '';
-    ready(j.agents);
-    // The same roster, reused for "hand this upload to someone". Unset by
-    // default and toggled off by tapping the picked one again: the folder is
-    // the normal destination, and most uploads want nobody woken up.
-    to.innerHTML=j.agents.map(a=>
+    agents=j.agents; open_=!!j.open;
+    to.innerHTML=agents.map(a=>
       `<button data-k="${a.key}" class="${a.session?'live':''}${a.key===upTo?' on':''}">
          <span class="dot"></span>${esc(a.label)}
          <span class="st">${a.session?'live':'offline'}</span>
        </button>`).join('');
-    // show() as well as whoList(): the chip highlight says which one is picked,
-    // but the SEND button is what he is about to press, and it should say where
-    // the file is going before he presses it.
+    // Tapping the picked one again clears it — with nobody picked, text goes to
+    // the clipboard and files just land in the folder, which is the common case.
     [...to.children].forEach(b=>b.onclick=()=>{
-      upTo = (upTo===b.dataset.k) ? null : b.dataset.k; whoList(); show(); });
+      upTo = (upTo===b.dataset.k) ? null : b.dataset.k; refreshAgents(); });
+    paint();
   }catch(e){}
 }
+refreshAgents();
+setInterval(()=>{ if(document.visibilityState==='visible') refreshAgents(); }, 10000);
 
-// Say WHY the button is off. A dead button with no reason is what made this
-// look broken the first time.
-function ready(list){
-  const locked = !key && !open_;
-  const sel = list && list.find(a=>a.key===target);
-  psend.disabled = !(target && !locked && ptxt.value.trim());
-  phint.textContent =
-      locked                 ? 'Unlock above to send prompts.'
-    : !target                ? 'Pick who it goes to.'
-    : !ptxt.value.trim()     ? ''
-    : (sel && !sel.session)  ? 'That one is offline — sending will fail.'
-    : '';
-}
-ptxt.oninput=()=>ready();
-
-psend.onclick=async()=>{
-  const t=ptxt.value.trim(); if(!t||!target) return;
-  psend.disabled=true;
-  try{
-    const r=await fetch('/prompt',{method:'POST',headers:{'Content-Type':'application/json'},
-                                   body:JSON.stringify({target,text:t,k:key})});
-    const j=await r.json();
-    plog.innerHTML='<div class="f"><span class="'+(j.ok?'ok':'')+'">'+esc(j.ok?('Sent to '+j.session):(j.error||'Failed'))+'</span></div>';
-    if(j.ok) ptxt.value='';
-  }catch(e){ plog.innerHTML='<div class="f"><span>Failed</span></div>'; }
-  ready();
-};
-whoList();
-setInterval(()=>{ if(document.visibilityState==='visible') whoList(); }, 10000);
-
-
-const note=$('note');
-function show(){
-  log.innerHTML=queue.map(f=>`<div class="f"><div class="meta"><span class="nm">${esc(f.name)}</span><span class="sz">${kb(f.size)}</span></div></div>`).join('');
-  send.disabled=!queue.length;
-  note.hidden=!queue.length;
-  to.hidden=!queue.length;
-  send.textContent=queue.length
-    ? `Send ${queue.length} file${queue.length>1?'s':''}${upTo?' → '+upTo:''}`
-    : 'Send';
-}
-const add=fs=>{ queue=queue.concat([...fs]); show(); };
-
+// ── attaching ────────────────────────────────────────────────────────────────
+const add=fs=>{ queue=queue.concat([...fs]); paint(); };
 drop.onclick=()=>pick.click();
 pick.onchange=e=>add(e.target.files);
 cam.onclick=()=>camin.click();
@@ -544,46 +543,73 @@ camin.onchange=e=>add(e.target.files);
 ['dragleave','drop'].forEach(t=>drop.addEventListener(t,e=>{e.preventDefault();drop.classList.remove('hot');}));
 drop.addEventListener('drop',e=>add(e.dataTransfer.files));
 
-send.onclick=()=>{
-  if(!queue.length) return;
-  const fd=new FormData(); queue.forEach(f=>fd.append('files',f,f.name));
-  if(note.value.trim()) fd.append('note', note.value.trim());
-  if(upTo) fd.append('to', upTo);
-  if(key) fd.append('k', key);
+const said=(t,ok)=>{ sendlog.innerHTML=`<div class="f"><span class="${ok?'ok':''}">${esc(t)}</span></div>`; };
+function clearComposer(){
+  queue=[]; msg.value=''; upTo=null; dupMode='replace';
+  pick.value=''; camin.value=''; refreshAgents(); list();
+}
+
+// ── sending ──────────────────────────────────────────────────────────────────
+// Three destinations behind one button. The endpoints stay single-purpose and
+// separately testable; only the routing lives here.
+send.onclick=async()=>{
+  const p=plan(); if(p.kind==='none') return;
+  send.disabled=true;
+
+  if(p.kind==='clip'){
+    try{ const j=await (await fetch('/text',{method:'POST',
+           headers:{'Content-Type':'application/json'},
+           body:JSON.stringify({text:p.text})})).json();
+         said(j.ok?'On the laptop clipboard':'Clipboard unreachable', j.ok);
+         if(j.ok) msg.value='';
+    }catch(e){ said('Failed', false); }
+    paint(); return;
+  }
+
+  if(p.kind==='prompt'){
+    try{ const j=await (await fetch('/prompt',{method:'POST',
+           headers:{'Content-Type':'application/json'},
+           body:JSON.stringify({target:p.to, text:p.text, k:key})})).json();
+         said(j.ok?('Sent to '+j.session):(j.error||'Failed'), j.ok);
+         if(j.ok) clearComposer();
+    }catch(e){ said('Failed', false); }
+    paint(); return;
+  }
+
+  const fd=new FormData();
+  queue.forEach(f=>fd.append('files',f,f.name));
+  if(p.text) fd.append('note', p.text);
+  fd.append('dupes', dupMode);
+  if(p.to){ fd.append('to', p.to); if(key) fd.append('k', key); }
   const xhr=new XMLHttpRequest(); xhr.open('POST','/upload');
-  bar.style.display='block'; send.disabled=true;
+  bar.style.display='block';
   xhr.upload.onprogress=e=>{ if(e.lengthComputable) fill.style.width=(e.loaded/e.total*100)+'%'; };
-  xhr.onload=()=>{ bar.style.display='none'; fill.style.width='0';
-    let msg='Sent';
+  xhr.onload=()=>{
+    bar.style.display='none'; fill.style.width='0';
+    let text='Sent', ok=true;
     try{ const j=JSON.parse(xhr.responseText);
+         const n=(j.saved||[]).length, s=(j.skipped||[]).length;
+         text = `Sent ${n} file${n===1?'':'s'}` + (s?`, skipped ${s}`:'');
          // Say plainly whether the agent got it. A file that saved but was
          // never handed over, reported as a plain "Sent", is the kind of thing
-         // you only discover when nothing happens for an hour.
-         if(j.handoff) msg = j.handoff.ok ? ('Sent → '+esc(j.handoff.session))
-                                          : ('Saved, but '+esc(j.handoff.error||'not delivered'));
+         // you discover an hour later when nothing has happened.
+         if(j.handoff){ ok=!!j.handoff.ok;
+           text += ok ? ' → '+j.handoff.session
+                      : ' — but '+(j.handoff.error||'not delivered'); }
     }catch(e){}
-    log.innerHTML='<div class="f"><span class="ok">'+msg+'</span></div>';
-    queue=[]; note.value=''; note.hidden=true; to.hidden=true; upTo=null;
-    send.disabled=true; send.textContent='Send'; pick.value=''; camin.value=''; list(); };
-  xhr.onerror=()=>{ bar.style.display='none'; log.innerHTML='<div class="f"><span>Upload failed — retry</span></div>'; send.disabled=false; };
+    said(text, ok); clearComposer();
+  };
+  xhr.onerror=()=>{ bar.style.display='none'; said('Upload failed — retry', false); paint(); };
   xhr.send(fd);
 };
 
-tsend.onclick=async()=>{
-  const t=txt.value; if(!t.trim()) return;
-  tsend.disabled=true;
-  try{ const r=await fetch('/text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});
-       const j=await r.json();
-       tlog.innerHTML='<div class="f"><span class="'+(j.ok?'ok':'')+'">'+(j.ok?'On the laptop clipboard':'Clipboard unreachable')+'</span></div>';
-  }catch(e){ tlog.innerHTML='<div class="f"><span>Failed</span></div>'; }
-  tsend.disabled=false;
-};
 tpull.onclick=async()=>{
   tpull.disabled=true;
-  try{ const r=await fetch('/clip'); const j=await r.json();
-       txt.value=j.text||''; tlog.innerHTML='<div class="f"><span class="'+(j.text?'ok':'')+'">'+(j.text?'Pulled '+j.text.length+' chars':'Laptop clipboard is empty')+'</span></div>';
-  }catch(e){ tlog.innerHTML='<div class="f"><span>Failed</span></div>'; }
-  tpull.disabled=false;
+  try{ const j=await (await fetch('/clip')).json();
+       msg.value=j.text||'';
+       said(j.text?('Pulled '+j.text.length+' chars'):'Laptop clipboard is empty', !!j.text);
+  }catch(e){ said('Failed', false); }
+  tpull.disabled=false; paint();
 };
 
 async function del(name){
@@ -594,6 +620,12 @@ async function del(name){
 async function list(){
   try{
     const r=await fetch('/files'); const j=await r.json();
+    // The folder's current names, so a queued file can be flagged as a
+    // duplicate BEFORE it is sent rather than quietly renamed afterwards.
+    // Refreshed on the same poll, so a file the agent drops in while the page
+    // is open starts colliding immediately.
+    here=new Set(j.files.map(f=>f.name));
+    paint();
     count.textContent=j.files.length?j.files.length+' · '+kb(j.bytes):'';
     if(!j.files.length){ recent.innerHTML='<div class="f"><span class="empty">Empty — nothing waiting</span></div>'; return; }
     recent.innerHTML=j.files.map(f=>{
@@ -766,9 +798,29 @@ def serve() -> None:
         files = [v for v in form.getlist("files") if hasattr(v, "read")]
         if not files:
             return JSONResponse({"error": "no files in request"}, status_code=400)
-        saved = []
+        # What to do when the name is already in the folder. It used to always
+        # be a third thing — `unique_path` quietly appended a timestamp — which
+        # is the one answer nobody asks for: you send a corrected screenshot and
+        # end up with two, neither obviously the current one. Yash asked for the
+        # choice, so: replace, or skip. `keep` stays reachable for a caller that
+        # wants the old behaviour, but nothing in the UI offers it.
+        mode = str(form.get("dupes") or "replace")
+        saved, skipped = [], []
         for f in files:
-            target = unique_path(safe_name(f.filename or "file"))
+            name = safe_name(f.filename or "file")
+            existing = DEST / name
+            if existing.exists():
+                if mode == "skip":
+                    skipped.append(name)
+                    print(f"[{datetime.now():%H:%M:%S}] skipped {name} (already there)", flush=True)
+                    # Drain it anyway: an unread upload leaves the request body
+                    # half-consumed and the connection in an odd state.
+                    while await f.read(1024 * 1024):
+                        pass
+                    continue
+                target = existing if mode == "replace" else unique_path(name)
+            else:
+                target = existing
             written = 0
             with target.open("wb") as out:
                 while chunk := await f.read(1024 * 1024):
@@ -808,7 +860,9 @@ def serve() -> None:
         # handoff loses the notification and not the upload.
         handoff = None
         want = str(form.get("to") or "")
-        if want:
+        # Nothing saved means everything was skipped as a duplicate. Waking an
+        # agent to tell it about zero files is worse than saying nothing.
+        if want and saved:
             if want not in {k for k, _ in AGENTS}:
                 handoff = {"ok": False, "error": "unknown agent"}
             elif not open_mode() and not secrets.compare_digest(
@@ -831,7 +885,8 @@ def serve() -> None:
                            else {"ok": False, "error": detail})
             print(f"[{datetime.now():%H:%M:%S}] handoff -> {want}: "
                   f"{'ok' if handoff.get('ok') else handoff.get('error')}", flush=True)
-        return JSONResponse({"saved": saved, "note": bool(note), "handoff": handoff})
+        return JSONResponse({"saved": saved, "skipped": skipped,
+                             "note": bool(note), "handoff": handoff})
 
     p = int(os.environ.get("NHQ_INBOX_PORT") or port() or port(claim=True) or "3900")
     print(f"nhq-inbox -> http://{lan_ip()}:{p}  (sharing {DEST})", flush=True)
