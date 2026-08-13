@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vox — waveform, centre-origin options</title>
+<!--
+  Five candidate looks for the vox dictation overlay. Every one of them
+  ORIGINATES AT THE CENTRE and travels outward to both edges — the old strip
+  scrolled right-to-left like a chart recorder and Yash rejected that.
+
+  All six panels are driven by the same simulated speech envelope from the same
+  clock, so what you are comparing is the drawing and nothing else.
+
+  Grounded in how the real ones do it:
+    · siriwave.js attenuates with g(x) = (K/(K+x^2))^K so the wave pinches to
+      nothing at the edges instead of being sliced off — github.com/kopiro/siriwave
+    · Subtracting the phase term, sin(k|x-cx| - wt), makes the peaks travel AWAY
+      from the centre. Adding it would pull them inward.
+    · Siri and siriwave both draw overlapping curves with additive compositing,
+      so crossings brighten instead of muddying.
+
+  Colour, which is the part that usually goes wrong:
+    · Loudness NEVER rotates the hue. Green that turns yellow when you speak up
+      looks cheap and it also fights the state colours, which have to mean
+      something. Loudness drives LIGHTNESS, CHROMA and ALPHA only.
+    · State changes interpolate in OKLab, not sRGB — green to red through sRGB
+      goes via a muddy brown. OKLab is Cartesian so it cannot hue-loop the way
+      OKLCH can. 180 ms, easeOutQuart. bottosson.github.io/posts/oklab
+    · Nothing ever fades to black; it fades to transparent in its OWN colour, so
+      the wallpaper shows through instead of a dead grey smear.
+    · Alpha falls off quadratically from the centre, so the ends melt into the
+      desktop rather than stopping at a hard line.
+-->
+<style>
+  :root { --bg:#0a0a0b; --card:#141417; --line:#26262d; --teal:#2dd4bf;
+          --bone:#ECECEF; --mut:#8b8b95; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--bone); padding:26px 20px 60px;
+         font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+  .wrap { max-width:1180px; margin:0 auto; }
+  h1 { font-size:22px; margin:0 0 6px; }
+  .sub { color:var(--mut); margin:0 0 18px; font-size:14px; }
+  .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+         position:sticky; top:0; background:var(--bg); padding:10px 0 14px; z-index:5;
+         border-bottom:1px solid var(--line); margin-bottom:18px; }
+  .bar button { background:var(--card); color:var(--bone); border:1px solid var(--line);
+                border-radius:10px; padding:9px 14px; font:600 14px inherit; cursor:pointer; }
+  .bar button.on { border-color:var(--teal); color:var(--teal); background:#14201f; }
+  .bar .sp { flex:1; }
+  .opt { background:var(--card); border:1px solid var(--line); border-radius:14px;
+         margin-bottom:14px; overflow:hidden; }
+  .opt header { display:flex; align-items:baseline; gap:12px; padding:13px 16px 9px; }
+  .opt .n { font-size:12px; font-weight:700; color:var(--teal); letter-spacing:.1em; flex:none; }
+  .opt h2 { font-size:16px; margin:0; font-weight:600; flex:none; }
+  .opt p { margin:0; color:var(--mut); font-size:13.5px; }
+  /* Shown on a wallpaper, because that is what it actually sits on — a strip
+     that looks crisp on flat black can vanish on a photograph. */
+  .stage { height:74px; position:relative;
+           background:linear-gradient(115deg,#1b2430,#2a1f2e 45%,#101a1e);
+           border-top:1px solid rgba(255,255,255,.05); }
+  canvas { display:block; width:100%; height:74px; }
+  .note { color:var(--mut); font-size:13px; margin:22px 0 0; line-height:1.6; }
+  code { color:var(--teal); font-size:12.5px; }
+</style></head><body><div class="wrap">
+
+<h1>vox — waveform, 25 centre-origin alternatives</h1>
+<p class="sub">Every one starts in the middle and travels out to both ends. Same simulated speech into all of them, so you are comparing the drawing and nothing else. <b>NOW</b> at the bottom is the current one.</p>
+
+<div class="bar">
+  <button data-state="ready" class="on">Ready</button>
+  <button data-state="warming">Warming</button>
+  <button data-state="busy">Busy</button>
+  <button id="cycle">Auto-cycle colour</button>
+  <span class="sp"></span>
+  <button id="quiet">Silence</button>
+  <button id="pause">Pause</button>
+</div>
+
+<div id="list"></div>
+
+<p class="note">
+  Drawn at the real size — 74&nbsp;px tall, full width, pinned to the bottom edge, over your wallpaper.
+  <b>Auto-cycle colour</b> walks Ready&nbsp;→&nbsp;Warming&nbsp;→&nbsp;Busy so you can watch the
+  transition itself; it is interpolated in OKLab over 180&nbsp;ms, which is what stops green→red
+  passing through mud.
+</p>
+</div>
+
+<script>
+// ══════════════════════════════════════════════════════════ colour
+// sRGB ↔ OKLab. Straight from Björn Ottosson's reference implementation.
+const s2l = c => c > 0.04045 ? Math.pow((c+0.055)/1.055, 2.4) : c/12.92;
+const l2s = c => c >= 0.0031308 ? 1.055*Math.pow(c, 1/2.4) - 0.055 : 12.92*c;
+
+function rgb2lab(r,g,b){
+  r=s2l(r/255); g=s2l(g/255); b=s2l(b/255);
+  const l = Math.cbrt(0.4122214708*r + 0.5363325363*g + 0.0514459929*b);
+  const m = Math.cbrt(0.2119034982*r + 0.6806995451*g + 0.1073969566*b);
+  const s = Math.cbrt(0.0883024619*r + 0.2817188376*g + 0.9067466974*b);
+  return [0.2104542553*l + 0.7936177850*m - 0.0040720468*s,
+          1.9779984951*l - 2.4285922050*m + 0.4505937099*s,
+          0.0259040371*l + 0.7827717662*m - 0.8086757660*s];
+}
+function lab2rgb(L,A,B){
+  const l_=L + 0.3963377774*A + 0.2158037573*B;
+  const m_=L - 0.1055613458*A - 0.0638541728*B;
+  const s_=L - 0.0894841775*A - 1.2914855480*B;
+  const l=l_**3, m=m_**3, s=s_**3;
+  const r =  4.0767416621*l - 3.3077115913*m + 0.2309699292*s;
+  const g = -1.2684380046*l + 2.6097574011*m - 0.3413193965*s;
+  const b = -0.0041960863*l - 0.7034186147*m + 1.7076147010*s;
+  const k = x => Math.max(0, Math.min(255, Math.round(l2s(x)*255)));
+  return [k(r),k(g),k(b)];
+}
+
+const STATES = { ready:[92,242,140], warming:[250,184,64], busy:[255,59,71] };
+const ORDER = ['ready','warming','busy'];
+let labNow = rgb2lab(...STATES.ready), labFrom = labNow, labTo = labNow, tSwitch = -1;
+const EASE_MS = 180;
+const easeOutQuart = t => 1 - Math.pow(1-t, 4);
+
+function setState(name){
+  labFrom = labNow.slice(); labTo = rgb2lab(...STATES[name]);
+  tSwitch = performance.now();
+}
+function tickColour(now){
+  if (tSwitch < 0) return;
+  const t = Math.min(1, (now - tSwitch)/EASE_MS), e = easeOutQuart(t);
+  labNow = labFrom.map((v,i) => v + (labTo[i]-v)*e);
+  if (t >= 1) tSwitch = -1;
+}
+
+// Loudness drives lightness, chroma and alpha — never hue. Exponents from the
+// perceptual mapping: L rises as v^1.5, C as v^1.2, so quiet is a dim slate
+// version of the state colour rather than a washed-out grey.
+function col(v, alpha=1){
+  const [L,A,B] = labNow;
+  const C = Math.hypot(A,B), h = Math.atan2(B,A);
+  const Lv = 0.42 + (L - 0.42) * Math.pow(v, 1.5);
+  const Cv = C * (0.22 + 0.78 * Math.pow(v, 1.2));
+  const [r,g,b] = lab2rgb(Lv, Cv*Math.cos(h), Cv*Math.sin(h));
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+// ══════════════════════════════════════════════════════════ the signal
+const rnd = (a,b) => a + Math.random()*(b-a);
+let speaking = true, until = 1.6, syl = rnd(4,6), ph = rnd(0,9), smooth = 0, muted = false;
+function envelope(t, dt){
+  if (t > until){
+    speaking = !speaking;
+    until = t + (speaking ? rnd(1.4,3.2) : rnd(.35,1.0));
+    if (speaking){ syl = rnd(4,6); ph = rnd(0,9); }
+  }
+  let raw = 0;
+  if (speaking && !muted){
+    const breath = .55 + .45*Math.sin(t*0.7 + ph);
+    const syll   = .5  + .5 *Math.sin(t*syl*2*Math.PI + ph);
+    raw = Math.max(0, breath * (.35 + .65*syll) * rnd(.85,1.05));
+  }
+  raw = Math.min(1, raw);
+  const k = raw > smooth ? 1-Math.exp(-dt/0.035) : 1-Math.exp(-dt/0.220);
+  smooth += (raw - smooth)*k;
+  return smooth;
+}
+
+// Attenuation to the edges. siriwave uses (K/(K+x^2))^K, which is tuned for a
+// phone; on a strip this wide it collapses the wave into a narrow bump in the
+// middle. These are the same idea opened out: still exactly zero at both ends,
+// but with a flat shoulder so the outer thirds are visibly doing something.
+// The first pass used a plain 1-u^2 and everything huddled in the middle third
+// — which reads as "it does not reach the end", the opposite of the brief.
+const env  = u => Math.pow(Math.max(0, 1 - u*u*u*u), 0.85);
+// Alpha melts into the desktop rather than stopping at a line.
+const fade = u => Math.pow(Math.max(0, 1 - u*u*u*u), 0.7);
+
+function round(c,x,y,w,h,r){
+  r = Math.min(r, Math.abs(w)/2, Math.abs(h)/2);
+  c.beginPath();
+  c.moveTo(x+r,y); c.arcTo(x+w,y,x+w,y+h,r); c.arcTo(x+w,y+h,x,y+h,r);
+  c.arcTo(x,y+h,x,y,r); c.arcTo(x,y,x+w,y,r); c.closePath();
+}
+// Glow by stacked strokes, widest and faintest first. Cheaper than a real blur
+// and it brightens where strokes cross, which is the look we want.
+const GLOW = [[13,.07],[7,.14],[3.2,.34],[1.6,1]];
+function glowStroke(c, path, v){
+  c.globalCompositeOperation = 'lighter'; c.lineJoin = 'round'; c.lineCap = 'round';
+  for (const [w,a] of GLOW){ c.lineWidth = w; c.strokeStyle = col(v, a); c.stroke(path); }
+  c.globalCompositeOperation = 'source-over';
+}
+
+// ══════════════════════════════════════════════════════════ the options
+const OPTIONS = [
+
+{ id:'siri', name:'ONE', title:'Siri wave',
+  blurb:'Three attenuated sine layers, peaks travelling out from the middle. Tallest at the centre, pinched to nothing at both ends.',
+  draw(c,w,h,v,t){
+    const cx = w/2, cy = h*0.60, amp = h*0.42;
+    const L = [ {k:0.020, s:2.2, a:1.00}, {k:0.031, s:3.1, a:0.66}, {k:0.045, s:4.3, a:0.44} ];
+    L.forEach((l,i)=>{
+      const p = new Path2D();
+      for (let x=0;x<=w;x+=2){
+        const u = (x-cx)/cx;
+        // minus wt: the crests move AWAY from the centre.
+        const y = cy - Math.sin(l.k*Math.abs(x-cx) - t*l.s) * amp * l.a * env(u) * (0.10+0.90*v);
+        x ? p.lineTo(x,y) : p.moveTo(x,y);
+      }
+      c.globalCompositeOperation = 'lighter';
+      c.lineWidth = 2.4 - i*0.6; c.strokeStyle = col(v, 0.85 - i*0.22);
+      c.stroke(p);
+      c.globalCompositeOperation = 'source-over';
+    });
+  }},
+
+{ id:'outbars', name:'TWO', title:'Bars from the middle',
+  blurb:'One bar per sample, but the newest lands in the CENTRE and the older ones walk outward both ways. The literal answer to "origin in the middle".',
+  draw(c,w,h,v,t,hist){
+    const cx = w/2, pitch = 12, bw = 5.5, n = Math.ceil(cx/pitch);
+    for (let i=0;i<n;i++){
+      const s = hist[i] || 0, u = (i*pitch)/cx;
+      const bh = Math.max(2.5, s*h*0.80*(0.35+0.65*fade(u)));
+      const a = 0.25 + 0.75*fade(u);
+      c.fillStyle = col(s, a);
+      round(c, cx + i*pitch - bw/2, h-4-bh, bw, bh, bw/2); c.fill();
+      if (i) { round(c, cx - i*pitch - bw/2, h-4-bh, bw, bh, bw/2); c.fill(); }
+    }
+  }},
+
+{ id:'tube', name:'THREE', title:'Light tube',
+  blurb:'A lit line that grows out of the centre as you get louder, with pulses running outward along it. Quietest of the five — nearly invisible in silence.',
+  draw(c,w,h,v,t,hist){
+    const cx = w/2, y = h-14, reach = cx*(0.10 + 0.90*v);
+    const g = c.createLinearGradient(cx-reach, 0, cx+reach, 0);
+    g.addColorStop(0, col(v,0)); g.addColorStop(.5, col(v,.9)); g.addColorStop(1, col(v,0));
+    c.globalCompositeOperation = 'lighter';
+    [ [14,.10],[7,.20],[3,.55],[1.4,1] ].forEach(([lw,a])=>{
+      c.lineWidth = lw; c.globalAlpha = a; c.strokeStyle = g;
+      c.beginPath(); c.moveTo(cx-reach,y); c.lineTo(cx+reach,y); c.stroke();
+    });
+    c.globalAlpha = 1;
+    // Pulses leaving the centre, so it reads as emitting rather than just lit.
+    for (let k=0;k<3;k++){
+      const phase = ((t*0.55 + k/3) % 1);
+      const d = phase*reach, a = (1-phase)*v*0.9;
+      [d,-d].forEach(off=>{
+        const rg = c.createRadialGradient(cx+off,y,0,cx+off,y,26);
+        rg.addColorStop(0, col(1,a)); rg.addColorStop(1, col(1,0));
+        c.fillStyle = rg; c.fillRect(cx+off-26, y-26, 52, 52);
+      });
+    }
+    // The core, brightest exactly at the origin.
+    const core = c.createRadialGradient(cx,y,0,cx,y,20+40*v);
+    core.addColorStop(0, `rgba(255,255,255,${0.30+0.55*v})`);
+    core.addColorStop(.35, col(1,.45*v)); core.addColorStop(1, col(1,0));
+    c.fillStyle = core; c.fillRect(0,0,w,h);
+    c.globalCompositeOperation = 'source-over';
+  }},
+
+{ id:'puddle', name:'FOUR', title:'Liquid',
+  blurb:'One filled body of light pinned to the bottom edge, swelling out of the centre. No countable pieces at all — it reads as a single living thing.',
+  draw(c,w,h,v,t){
+    const cx = w/2, base = h + 6, rise = h*(0.30 + 0.66*v);
+    const p = new Path2D(); p.moveTo(0, base);
+    for (let x=0;x<=w;x+=3){
+      const u = (x-cx)/cx;
+      const ripple = Math.sin(0.017*Math.abs(x-cx) - t*2.6)*0.30
+                   + Math.sin(0.029*Math.abs(x-cx) - t*3.9)*0.18;
+      p.lineTo(x, base - rise*env(u)*(1 + ripple*(0.35+0.65*v)));
+    }
+    p.lineTo(w, base); p.closePath();
+    const g = c.createLinearGradient(0, h-rise*1.15, 0, h);
+    g.addColorStop(0, col(v,0)); g.addColorStop(.55, col(v,.42)); g.addColorStop(1, col(v,.92));
+    c.fillStyle = g; c.fill(p);
+    glowStroke(c, p, v);
+  }},
+
+{ id:'ripple', name:'FIVE', title:'Ripples',
+  blurb:'Arcs born at the centre that swim outward and fade. Loudness sets how often they are born and how tall they are — the most obviously "listening" of the five.',
+  draw(c,w,h,v,t,hist){
+    const cx = w/2, y = h-10;
+    // Twelve rings on a shared cycle; each one's size was fixed by the level at
+    // the moment it was born, so a loud syllable stays visible as it travels.
+    for (let k=0;k<12;k++){
+      const phase = ((t*0.42 + k/12) % 1);
+      const born = hist[Math.min(hist.length-1, Math.floor(phase*70))] || 0;
+      const d = phase*cx, a = (1-phase)*(0.20+0.80*born);
+      const rise = h*0.60*(0.25+0.75*born)*(1-phase*0.45);
+      if (a < 0.02) continue;
+      [1,-1].forEach(sgn=>{
+        c.beginPath();
+        c.ellipse(cx + sgn*d, y, 16+26*born, rise, 0, Math.PI, 2*Math.PI);
+        c.globalCompositeOperation = 'lighter';
+        c.lineWidth = 1.6 + 1.8*born; c.strokeStyle = col(born, a*0.9); c.stroke();
+        c.globalCompositeOperation = 'source-over';
+      });
+    }
+    const core = c.createRadialGradient(cx,y,0,cx,y,16+46*v);
+    core.addColorStop(0, col(v, .55+.35*v)); core.addColorStop(1, col(v,0));
+    c.fillStyle = core; c.fillRect(0,0,w,h);
+  }},
+
+{ id:'bars', name:'NOW', title:'Current — scrolling bars',
+  blurb:'What is there today, for comparison. Newest on the right, history sliding left.',
+  draw(c,w,h,v,t,hist){
+    const pitch = 11.7, bw = 6, n = Math.ceil(w/pitch);
+    for (let i=0;i<n;i++){
+      const s = hist[i] || 0;
+      const bh = Math.max(2, s*h*0.85);
+      c.fillStyle = col(s, .9);
+      round(c, w - i*pitch - bw, h-bh-3, bw, bh, bw/2); c.fill();
+    }
+  }},
+];
+
+// The four commissioned batches are concatenated in below this line at build
+// time; each one declares `const BATCH = [...]` and is wrapped so the names do
+// not collide. Anything they push onto EXTRA joins the list.
+const EXTRA = [];
+/* ===== BATCHES ===== */
+
+// ══════════════════════════════════════════════════════════ page
+// Current sits LAST so the new ideas are what you see first; everything else is
+// numbered 01.. in order, because "the third one" has to mean something when he
+// comes back and tells me which one won.
+const CURRENT = OPTIONS.pop();
+// Batches first, hand-written core after. The batch directory is read in name
+// order, so a file prefixed `0-` puts the newest round at the top of the page —
+// which is where the thing currently being decided belongs. Numbering is
+// generated, so it renumbers cleanly every build.
+const ALL = [...EXTRA, ...OPTIONS].map((o,i)=>({ ...o, name:String(i+1).padStart(2,'0') }));
+ALL.push({ ...CURRENT, name:'NOW' });
+
+const list = document.getElementById('list');
+const panels = ALL.map(o=>{
+  const el = document.createElement('div');
+  el.className = 'opt'; el.dataset.id = o.id;
+  el.innerHTML = `<header><span class="n">${o.name}</span><h2>${o.title}</h2><p>${o.blurb}</p></header>
+                  <div class="stage"><canvas></canvas></div>`;
+  list.appendChild(el);
+  const cv = el.querySelector('canvas');
+  return { o, cv, c: cv.getContext('2d'), el };
+});
+function size(){
+  const dpr = window.devicePixelRatio || 1;
+  panels.forEach(p=>{
+    const r = p.cv.getBoundingClientRect();
+    p.cv.width = Math.max(1, r.width*dpr); p.cv.height = Math.max(1, r.height*dpr);
+    p.c.setTransform(dpr,0,0,dpr,0,0);
+  });
+}
+addEventListener('resize', size); size();
+
+// Twenty-five canvases at 60 fps is more work than it is worth when you can see
+// four of them. rootMargin keeps the next screenful warm so nothing pops in
+// mid-animation as you scroll.
+const io = new IntersectionObserver(es=>es.forEach(e=>{
+  const p = panels.find(x=>x.el === e.target);
+  if (p) p.seen = e.isIntersecting;
+}), { rootMargin:'300px 0px' });
+panels.forEach(p=>io.observe(p.el));
+
+// hist[0] is the newest sample; index is age, which is also distance from the
+// centre for the outward designs.
+const hist = new Array(400).fill(0);
+// `last` is seeded on the FIRST FRAME, not at parse time. requestAnimationFrame
+// hands back the timestamp of the frame that was already in flight, which can
+// be EARLIER than a performance.now() taken while this script was still
+// parsing — and the bigger the script, the further behind it is. At 31 designs
+// that gap reached -33 ms, which made dt negative, which flipped the sign of
+// the smoothing coefficient, which drove the level to -1.05 and killed the
+// animation loop on frame one. Clamping dt at zero is the belt to that brace.
+let running = true, last = null, clock = 0, cycling = false, nextCycle = 0, ci = 0;
+
+function frame(now){
+  const sec = now/1000;
+  if (last === null) last = sec;
+  const dt = Math.min(0.05, Math.max(0, sec - last)); last = sec;
+  if (running){
+    clock += dt;
+    hist.unshift(envelope(clock, dt)); hist.pop();
+    if (cycling && clock > nextCycle){
+      ci = (ci+1) % ORDER.length; setState(ORDER[ci]); nextCycle = clock + 1.6;
+      document.querySelectorAll('[data-state]').forEach(x=>x.classList.toggle('on', x.dataset.state===ORDER[ci]));
+    }
+  }
+  tickColour(now);
+  const v = hist[0];
+  const dpr = window.devicePixelRatio || 1;
+  panels.forEach(p=>{
+    if (!p.seen) return;                   // offscreen panels cost nothing
+    const w = p.cv.width/dpr, h = p.cv.height/dpr;
+    p.c.clearRect(0,0,w,h);
+    // One bad design must not take the page down with it — twenty-five of
+    // these were written in parallel and a single thrown error inside the loop
+    // would blank every panel after it.
+    try { p.o.draw(p.c, w, h, v, clock, hist); }
+    catch (e){
+      if (!p.broke){ p.broke = true; console.error(p.o.id, e);
+        p.el.querySelector('h2').textContent += ' — broken'; }
+    }
+    // A design that forgot to put these back would poison its neighbours.
+    p.c.globalCompositeOperation = 'source-over';
+    p.c.globalAlpha = 1;
+    p.c.setTransform(dpr,0,0,dpr,0,0);
+  });
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+document.querySelectorAll('[data-state]').forEach(b=>b.onclick=()=>{
+  cycling = false; document.getElementById('cycle').classList.remove('on');
+  setState(b.dataset.state);
+  document.querySelectorAll('[data-state]').forEach(x=>x.classList.toggle('on', x===b));
+});
+const cb = document.getElementById('cycle');
+cb.onclick = ()=>{ cycling = !cycling; cb.classList.toggle('on', cycling); nextCycle = clock; };
+const qb = document.getElementById('quiet');
+qb.onclick = ()=>{ muted = !muted; qb.classList.toggle('on', muted);
+                   qb.textContent = muted ? 'Silenced' : 'Silence'; };
+const pb = document.getElementById('pause');
+pb.onclick = ()=>{ running = !running; pb.classList.toggle('on', !running);
+                   // null, not performance.now() — same trap: the next rAF
+                   // timestamp can predate a clock read taken here.
+                   pb.textContent = running ? 'Pause' : 'Paused'; last = null; };
+</script></body></html>

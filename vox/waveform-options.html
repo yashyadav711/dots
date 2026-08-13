@@ -1,0 +1,2958 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vox — waveform, centre-origin options</title>
+<!--
+  Five candidate looks for the vox dictation overlay. Every one of them
+  ORIGINATES AT THE CENTRE and travels outward to both edges — the old strip
+  scrolled right-to-left like a chart recorder and Yash rejected that.
+
+  All six panels are driven by the same simulated speech envelope from the same
+  clock, so what you are comparing is the drawing and nothing else.
+
+  Grounded in how the real ones do it:
+    · siriwave.js attenuates with g(x) = (K/(K+x^2))^K so the wave pinches to
+      nothing at the edges instead of being sliced off — github.com/kopiro/siriwave
+    · Subtracting the phase term, sin(k|x-cx| - wt), makes the peaks travel AWAY
+      from the centre. Adding it would pull them inward.
+    · Siri and siriwave both draw overlapping curves with additive compositing,
+      so crossings brighten instead of muddying.
+
+  Colour, which is the part that usually goes wrong:
+    · Loudness NEVER rotates the hue. Green that turns yellow when you speak up
+      looks cheap and it also fights the state colours, which have to mean
+      something. Loudness drives LIGHTNESS, CHROMA and ALPHA only.
+    · State changes interpolate in OKLab, not sRGB — green to red through sRGB
+      goes via a muddy brown. OKLab is Cartesian so it cannot hue-loop the way
+      OKLCH can. 180 ms, easeOutQuart. bottosson.github.io/posts/oklab
+    · Nothing ever fades to black; it fades to transparent in its OWN colour, so
+      the wallpaper shows through instead of a dead grey smear.
+    · Alpha falls off quadratically from the centre, so the ends melt into the
+      desktop rather than stopping at a hard line.
+-->
+<style>
+  :root { --bg:#0a0a0b; --card:#141417; --line:#26262d; --teal:#2dd4bf;
+          --bone:#ECECEF; --mut:#8b8b95; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--bone); padding:26px 20px 60px;
+         font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+  .wrap { max-width:1180px; margin:0 auto; }
+  h1 { font-size:22px; margin:0 0 6px; }
+  .sub { color:var(--mut); margin:0 0 18px; font-size:14px; }
+  .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+         position:sticky; top:0; background:var(--bg); padding:10px 0 14px; z-index:5;
+         border-bottom:1px solid var(--line); margin-bottom:18px; }
+  .bar button { background:var(--card); color:var(--bone); border:1px solid var(--line);
+                border-radius:10px; padding:9px 14px; font:600 14px inherit; cursor:pointer; }
+  .bar button.on { border-color:var(--teal); color:var(--teal); background:#14201f; }
+  .bar .sp { flex:1; }
+  .opt { background:var(--card); border:1px solid var(--line); border-radius:14px;
+         margin-bottom:14px; overflow:hidden; }
+  .opt header { display:flex; align-items:baseline; gap:12px; padding:13px 16px 9px; }
+  .opt .n { font-size:12px; font-weight:700; color:var(--teal); letter-spacing:.1em; flex:none; }
+  .opt h2 { font-size:16px; margin:0; font-weight:600; flex:none; }
+  .opt p { margin:0; color:var(--mut); font-size:13.5px; }
+  /* Shown on a wallpaper, because that is what it actually sits on — a strip
+     that looks crisp on flat black can vanish on a photograph. */
+  .stage { height:74px; position:relative;
+           background:linear-gradient(115deg,#1b2430,#2a1f2e 45%,#101a1e);
+           border-top:1px solid rgba(255,255,255,.05); }
+  canvas { display:block; width:100%; height:74px; }
+  .note { color:var(--mut); font-size:13px; margin:22px 0 0; line-height:1.6; }
+  code { color:var(--teal); font-size:12.5px; }
+</style></head><body><div class="wrap">
+
+<h1>vox — waveform, 25 centre-origin alternatives</h1>
+<p class="sub">Every one starts in the middle and travels out to both ends. Same simulated speech into all of them, so you are comparing the drawing and nothing else. <b>NOW</b> at the bottom is the current one.</p>
+
+<div class="bar">
+  <button data-state="ready" class="on">Ready</button>
+  <button data-state="warming">Warming</button>
+  <button data-state="busy">Busy</button>
+  <button id="cycle">Auto-cycle colour</button>
+  <span class="sp"></span>
+  <button id="quiet">Silence</button>
+  <button id="pause">Pause</button>
+</div>
+
+<div id="list"></div>
+
+<p class="note">
+  Drawn at the real size — 74&nbsp;px tall, full width, pinned to the bottom edge, over your wallpaper.
+  <b>Auto-cycle colour</b> walks Ready&nbsp;→&nbsp;Warming&nbsp;→&nbsp;Busy so you can watch the
+  transition itself; it is interpolated in OKLab over 180&nbsp;ms, which is what stops green→red
+  passing through mud.
+</p>
+</div>
+
+<script>
+// ══════════════════════════════════════════════════════════ colour
+// sRGB ↔ OKLab. Straight from Björn Ottosson's reference implementation.
+const s2l = c => c > 0.04045 ? Math.pow((c+0.055)/1.055, 2.4) : c/12.92;
+const l2s = c => c >= 0.0031308 ? 1.055*Math.pow(c, 1/2.4) - 0.055 : 12.92*c;
+
+function rgb2lab(r,g,b){
+  r=s2l(r/255); g=s2l(g/255); b=s2l(b/255);
+  const l = Math.cbrt(0.4122214708*r + 0.5363325363*g + 0.0514459929*b);
+  const m = Math.cbrt(0.2119034982*r + 0.6806995451*g + 0.1073969566*b);
+  const s = Math.cbrt(0.0883024619*r + 0.2817188376*g + 0.9067466974*b);
+  return [0.2104542553*l + 0.7936177850*m - 0.0040720468*s,
+          1.9779984951*l - 2.4285922050*m + 0.4505937099*s,
+          0.0259040371*l + 0.7827717662*m - 0.8086757660*s];
+}
+function lab2rgb(L,A,B){
+  const l_=L + 0.3963377774*A + 0.2158037573*B;
+  const m_=L - 0.1055613458*A - 0.0638541728*B;
+  const s_=L - 0.0894841775*A - 1.2914855480*B;
+  const l=l_**3, m=m_**3, s=s_**3;
+  const r =  4.0767416621*l - 3.3077115913*m + 0.2309699292*s;
+  const g = -1.2684380046*l + 2.6097574011*m - 0.3413193965*s;
+  const b = -0.0041960863*l - 0.7034186147*m + 1.7076147010*s;
+  const k = x => Math.max(0, Math.min(255, Math.round(l2s(x)*255)));
+  return [k(r),k(g),k(b)];
+}
+
+const STATES = { ready:[92,242,140], warming:[250,184,64], busy:[255,59,71] };
+const ORDER = ['ready','warming','busy'];
+let labNow = rgb2lab(...STATES.ready), labFrom = labNow, labTo = labNow, tSwitch = -1;
+const EASE_MS = 180;
+const easeOutQuart = t => 1 - Math.pow(1-t, 4);
+
+function setState(name){
+  labFrom = labNow.slice(); labTo = rgb2lab(...STATES[name]);
+  tSwitch = performance.now();
+}
+function tickColour(now){
+  if (tSwitch < 0) return;
+  const t = Math.min(1, (now - tSwitch)/EASE_MS), e = easeOutQuart(t);
+  labNow = labFrom.map((v,i) => v + (labTo[i]-v)*e);
+  if (t >= 1) tSwitch = -1;
+}
+
+// Loudness drives lightness, chroma and alpha — never hue. Exponents from the
+// perceptual mapping: L rises as v^1.5, C as v^1.2, so quiet is a dim slate
+// version of the state colour rather than a washed-out grey.
+function col(v, alpha=1){
+  const [L,A,B] = labNow;
+  const C = Math.hypot(A,B), h = Math.atan2(B,A);
+  const Lv = 0.42 + (L - 0.42) * Math.pow(v, 1.5);
+  const Cv = C * (0.22 + 0.78 * Math.pow(v, 1.2));
+  const [r,g,b] = lab2rgb(Lv, Cv*Math.cos(h), Cv*Math.sin(h));
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+// ══════════════════════════════════════════════════════════ the signal
+const rnd = (a,b) => a + Math.random()*(b-a);
+let speaking = true, until = 1.6, syl = rnd(4,6), ph = rnd(0,9), smooth = 0, muted = false;
+function envelope(t, dt){
+  if (t > until){
+    speaking = !speaking;
+    until = t + (speaking ? rnd(1.4,3.2) : rnd(.35,1.0));
+    if (speaking){ syl = rnd(4,6); ph = rnd(0,9); }
+  }
+  let raw = 0;
+  if (speaking && !muted){
+    const breath = .55 + .45*Math.sin(t*0.7 + ph);
+    const syll   = .5  + .5 *Math.sin(t*syl*2*Math.PI + ph);
+    raw = Math.max(0, breath * (.35 + .65*syll) * rnd(.85,1.05));
+  }
+  raw = Math.min(1, raw);
+  const k = raw > smooth ? 1-Math.exp(-dt/0.035) : 1-Math.exp(-dt/0.220);
+  smooth += (raw - smooth)*k;
+  return smooth;
+}
+
+// Attenuation to the edges. siriwave uses (K/(K+x^2))^K, which is tuned for a
+// phone; on a strip this wide it collapses the wave into a narrow bump in the
+// middle. These are the same idea opened out: still exactly zero at both ends,
+// but with a flat shoulder so the outer thirds are visibly doing something.
+// The first pass used a plain 1-u^2 and everything huddled in the middle third
+// — which reads as "it does not reach the end", the opposite of the brief.
+const env  = u => Math.pow(Math.max(0, 1 - u*u*u*u), 0.85);
+// Alpha melts into the desktop rather than stopping at a line.
+const fade = u => Math.pow(Math.max(0, 1 - u*u*u*u), 0.7);
+
+function round(c,x,y,w,h,r){
+  r = Math.min(r, Math.abs(w)/2, Math.abs(h)/2);
+  c.beginPath();
+  c.moveTo(x+r,y); c.arcTo(x+w,y,x+w,y+h,r); c.arcTo(x+w,y+h,x,y+h,r);
+  c.arcTo(x,y+h,x,y,r); c.arcTo(x,y,x+w,y,r); c.closePath();
+}
+// Glow by stacked strokes, widest and faintest first. Cheaper than a real blur
+// and it brightens where strokes cross, which is the look we want.
+const GLOW = [[13,.07],[7,.14],[3.2,.34],[1.6,1]];
+function glowStroke(c, path, v){
+  c.globalCompositeOperation = 'lighter'; c.lineJoin = 'round'; c.lineCap = 'round';
+  for (const [w,a] of GLOW){ c.lineWidth = w; c.strokeStyle = col(v, a); c.stroke(path); }
+  c.globalCompositeOperation = 'source-over';
+}
+
+// ══════════════════════════════════════════════════════════ the options
+const OPTIONS = [
+
+{ id:'siri', name:'ONE', title:'Siri wave',
+  blurb:'Three attenuated sine layers, peaks travelling out from the middle. Tallest at the centre, pinched to nothing at both ends.',
+  draw(c,w,h,v,t){
+    const cx = w/2, cy = h*0.60, amp = h*0.42;
+    const L = [ {k:0.020, s:2.2, a:1.00}, {k:0.031, s:3.1, a:0.66}, {k:0.045, s:4.3, a:0.44} ];
+    L.forEach((l,i)=>{
+      const p = new Path2D();
+      for (let x=0;x<=w;x+=2){
+        const u = (x-cx)/cx;
+        // minus wt: the crests move AWAY from the centre.
+        const y = cy - Math.sin(l.k*Math.abs(x-cx) - t*l.s) * amp * l.a * env(u) * (0.10+0.90*v);
+        x ? p.lineTo(x,y) : p.moveTo(x,y);
+      }
+      c.globalCompositeOperation = 'lighter';
+      c.lineWidth = 2.4 - i*0.6; c.strokeStyle = col(v, 0.85 - i*0.22);
+      c.stroke(p);
+      c.globalCompositeOperation = 'source-over';
+    });
+  }},
+
+{ id:'outbars', name:'TWO', title:'Bars from the middle',
+  blurb:'One bar per sample, but the newest lands in the CENTRE and the older ones walk outward both ways. The literal answer to "origin in the middle".',
+  draw(c,w,h,v,t,hist){
+    const cx = w/2, pitch = 12, bw = 5.5, n = Math.ceil(cx/pitch);
+    for (let i=0;i<n;i++){
+      const s = hist[i] || 0, u = (i*pitch)/cx;
+      const bh = Math.max(2.5, s*h*0.80*(0.35+0.65*fade(u)));
+      const a = 0.25 + 0.75*fade(u);
+      c.fillStyle = col(s, a);
+      round(c, cx + i*pitch - bw/2, h-4-bh, bw, bh, bw/2); c.fill();
+      if (i) { round(c, cx - i*pitch - bw/2, h-4-bh, bw, bh, bw/2); c.fill(); }
+    }
+  }},
+
+{ id:'tube', name:'THREE', title:'Light tube',
+  blurb:'A lit line that grows out of the centre as you get louder, with pulses running outward along it. Quietest of the five — nearly invisible in silence.',
+  draw(c,w,h,v,t,hist){
+    const cx = w/2, y = h-14, reach = cx*(0.10 + 0.90*v);
+    const g = c.createLinearGradient(cx-reach, 0, cx+reach, 0);
+    g.addColorStop(0, col(v,0)); g.addColorStop(.5, col(v,.9)); g.addColorStop(1, col(v,0));
+    c.globalCompositeOperation = 'lighter';
+    [ [14,.10],[7,.20],[3,.55],[1.4,1] ].forEach(([lw,a])=>{
+      c.lineWidth = lw; c.globalAlpha = a; c.strokeStyle = g;
+      c.beginPath(); c.moveTo(cx-reach,y); c.lineTo(cx+reach,y); c.stroke();
+    });
+    c.globalAlpha = 1;
+    // Pulses leaving the centre, so it reads as emitting rather than just lit.
+    for (let k=0;k<3;k++){
+      const phase = ((t*0.55 + k/3) % 1);
+      const d = phase*reach, a = (1-phase)*v*0.9;
+      [d,-d].forEach(off=>{
+        const rg = c.createRadialGradient(cx+off,y,0,cx+off,y,26);
+        rg.addColorStop(0, col(1,a)); rg.addColorStop(1, col(1,0));
+        c.fillStyle = rg; c.fillRect(cx+off-26, y-26, 52, 52);
+      });
+    }
+    // The core, brightest exactly at the origin.
+    const core = c.createRadialGradient(cx,y,0,cx,y,20+40*v);
+    core.addColorStop(0, `rgba(255,255,255,${0.30+0.55*v})`);
+    core.addColorStop(.35, col(1,.45*v)); core.addColorStop(1, col(1,0));
+    c.fillStyle = core; c.fillRect(0,0,w,h);
+    c.globalCompositeOperation = 'source-over';
+  }},
+
+{ id:'puddle', name:'FOUR', title:'Liquid',
+  blurb:'One filled body of light pinned to the bottom edge, swelling out of the centre. No countable pieces at all — it reads as a single living thing.',
+  draw(c,w,h,v,t){
+    const cx = w/2, base = h + 6, rise = h*(0.30 + 0.66*v);
+    const p = new Path2D(); p.moveTo(0, base);
+    for (let x=0;x<=w;x+=3){
+      const u = (x-cx)/cx;
+      const ripple = Math.sin(0.017*Math.abs(x-cx) - t*2.6)*0.30
+                   + Math.sin(0.029*Math.abs(x-cx) - t*3.9)*0.18;
+      p.lineTo(x, base - rise*env(u)*(1 + ripple*(0.35+0.65*v)));
+    }
+    p.lineTo(w, base); p.closePath();
+    const g = c.createLinearGradient(0, h-rise*1.15, 0, h);
+    g.addColorStop(0, col(v,0)); g.addColorStop(.55, col(v,.42)); g.addColorStop(1, col(v,.92));
+    c.fillStyle = g; c.fill(p);
+    glowStroke(c, p, v);
+  }},
+
+{ id:'ripple', name:'FIVE', title:'Ripples',
+  blurb:'Arcs born at the centre that swim outward and fade. Loudness sets how often they are born and how tall they are — the most obviously "listening" of the five.',
+  draw(c,w,h,v,t,hist){
+    const cx = w/2, y = h-10;
+    // Twelve rings on a shared cycle; each one's size was fixed by the level at
+    // the moment it was born, so a loud syllable stays visible as it travels.
+    for (let k=0;k<12;k++){
+      const phase = ((t*0.42 + k/12) % 1);
+      const born = hist[Math.min(hist.length-1, Math.floor(phase*70))] || 0;
+      const d = phase*cx, a = (1-phase)*(0.20+0.80*born);
+      const rise = h*0.60*(0.25+0.75*born)*(1-phase*0.45);
+      if (a < 0.02) continue;
+      [1,-1].forEach(sgn=>{
+        c.beginPath();
+        c.ellipse(cx + sgn*d, y, 16+26*born, rise, 0, Math.PI, 2*Math.PI);
+        c.globalCompositeOperation = 'lighter';
+        c.lineWidth = 1.6 + 1.8*born; c.strokeStyle = col(born, a*0.9); c.stroke();
+        c.globalCompositeOperation = 'source-over';
+      });
+    }
+    const core = c.createRadialGradient(cx,y,0,cx,y,16+46*v);
+    core.addColorStop(0, col(v, .55+.35*v)); core.addColorStop(1, col(v,0));
+    c.fillStyle = core; c.fillRect(0,0,w,h);
+  }},
+
+{ id:'bars', name:'NOW', title:'Current — scrolling bars',
+  blurb:'What is there today, for comparison. Newest on the right, history sliding left.',
+  draw(c,w,h,v,t,hist){
+    const pitch = 11.7, bw = 6, n = Math.ceil(w/pitch);
+    for (let i=0;i<n;i++){
+      const s = hist[i] || 0;
+      const bh = Math.max(2, s*h*0.85);
+      c.fillStyle = col(s, .9);
+      round(c, w - i*pitch - bw, h-bh-3, bw, bh, bw/2); c.fill();
+    }
+  }},
+];
+
+// The four commissioned batches are concatenated in below this line at build
+// time; each one declares `const BATCH = [...]` and is wrapped so the names do
+// not collide. Anything they push onto EXTRA joins the list.
+const EXTRA = [];
+/* ===== BATCHES ===== */
+
+// ── 0-right.js ──────────────────────────────────────────
+(function(){
+// Vernier — HUD, right-aligned. Yash picked the HUD variant and moved the
+// anchor: "but right aligned centre nhi right m accha lgega".
+//
+// "Right aligned" has three honest readings and they look quite different on a
+// 26:1 strip, so all three are here rather than me picking for him:
+//
+//   R1  the whole instrument shrinks into the right end, like a corner readout
+//   R2  the origin moves to the right edge and the scale sweeps the full width
+//       leftward from it — the centre design, re-anchored
+//   R3  the readout sits right and drags a history trail off to the left
+//
+// All three keep what he liked about the HUD: angular brackets rather than
+// boxes, a bracketed readout that opens with level, bold teeth, and scanlines
+// over the top. All three are heavier than the original caliper, which is the
+// other thing he asked for.
+//
+// Note these deliberately break the centre-origin rule that governs the other
+// thirty — on his instruction. The rule existed because a strip that scrolls
+// sideways reads as a chart recorder; an instrument anchored at one end and
+// measuring inward does not have that problem.
+
+const BATCH = [
+
+{ id:'hud-right-corner', name:'R1', title:'HUD right — corner readout',
+  blurb:'The whole instrument packed into the right end, like a gauge in the corner of a windscreen. The scale runs left out of it and the readout opens as you get louder; most of the strip stays empty.',
+  draw(c,w,h,v,t,hist){
+    const ox = w - 18, cy = h*0.54, lv = 0.05 + v*0.95;
+    const SPAN = Math.min(w - 40, 420);          // the instrument's own width
+
+    // Bracket, right end only. Two corners and air — never a closed box.
+    c.lineWidth = 2.6; c.strokeStyle = col(0.6, 0.5 + 0.3*lv);
+    c.beginPath();
+    c.moveTo(ox-18, 7); c.lineTo(ox, 7); c.lineTo(ox, h-7); c.lineTo(ox-18, h-7);
+    c.stroke();
+
+    // Fixed scale marching LEFT from the origin. Fades out well before the
+    // strip's left edge so the emptiness reads as deliberate, not as a bug.
+    const N = 30, sp = SPAN/N;
+    for (let i=1;i<=N;i++){
+      const x = ox - 10 - i*sp;
+      if (x < 6) break;
+      const maj = i%5===0, u = i/N;
+      c.lineWidth = maj ? 2.2 : 1.4;
+      c.strokeStyle = col(0.45, (0.30 + 0.22*(1-u)) * (1-u*0.85) + 0.04);
+      c.beginPath(); c.moveTo(x, cy-(maj?15:8)); c.lineTo(x, cy); c.stroke();
+    }
+
+    // Vernier comb rides leftward on the jaw; 29 against the fixed 30, which is
+    // the ratio that makes the two combs beat against each other.
+    const VN = 29, vsp = (sp*N)/VN, reach = lv*SPAN*0.9;
+    for (let i=0;i<=VN;i++){
+      const x = ox - 10 - reach + i*vsp;
+      if (x > ox-10 || x < 6) continue;
+      const maj = i%5===0, u = i/VN;
+      c.lineWidth = maj ? 2.4 : 1.5;
+      c.strokeStyle = col(lv, (maj?0.9:0.5) * lv * (1-u*0.6));
+      c.beginPath(); c.moveTo(x, cy); c.lineTo(x, cy+(maj?14:7)); c.stroke();
+    }
+
+    // The readout itself: a bracketed field of blocks that fills with level.
+    const bw = 34 + lv*120, bx = ox - 10 - bw;
+    c.lineWidth = 2.2; c.strokeStyle = col(lv, 0.72 + 0.24*lv);
+    c.beginPath();
+    c.moveTo(bx+9, cy-15); c.lineTo(bx, cy-15); c.lineTo(bx, cy+15); c.lineTo(bx+9, cy+15);
+    c.stroke();
+    const cells = 14, cw = (bw-12)/cells, on = Math.round(lv*cells);
+    for (let i=0;i<cells;i++){
+      c.fillStyle = col(lv, i<on ? 0.35+0.5*lv : 0.09);
+      c.fillRect(bx+7+i*cw, cy-4.5, Math.max(1.6, cw-2.4), 9);
+    }
+
+    // Jaw face at the origin, and the scanlines last.
+    c.lineWidth = 3; c.strokeStyle = col(lv, 0.6+0.35*lv);
+    c.beginPath(); c.moveTo(ox-10, cy-22); c.lineTo(ox-10, cy+21); c.stroke();
+    c.fillStyle = 'rgba(0,0,0,0.20)';
+    for (let y=(t*22)%3; y<h; y+=3) c.fillRect(0, y, w, 1);
+  }},
+
+{ id:'hud-right-sweep', name:'R2', title:'HUD right — full sweep',
+  blurb:'The same HUD with its origin moved to the right edge: the scale now spans the whole strip and the measurement sweeps left across all of it. The loudest version — it uses every pixel.',
+  draw(c,w,h,v,t,hist){
+    const ox = w - 12, cy = h*0.54, lv = 0.05 + v*0.95, SPAN = w - 30;
+
+    // Brackets at BOTH ends so the strip still reads as framed, but only the
+    // right one is heavy — that is where the instrument is anchored.
+    c.lineWidth = 2.6; c.strokeStyle = col(0.6, 0.5+0.3*lv);
+    c.beginPath();
+    c.moveTo(ox-18, 6); c.lineTo(ox, 6); c.lineTo(ox, h-6); c.lineTo(ox-18, h-6);
+    c.stroke();
+    c.lineWidth = 1.6; c.strokeStyle = col(0.5, 0.22);
+    c.beginPath();
+    c.moveTo(10+14, 6); c.lineTo(10, 6); c.lineTo(10, h-6); c.lineTo(10+14, h-6);
+    c.stroke();
+
+    const N = 56, sp = SPAN/N;
+    for (let i=1;i<=N;i++){
+      const x = ox - i*sp; if (x < 8) break;
+      const maj = i%5===0, u = i/N;
+      c.lineWidth = maj ? 2.2 : 1.4;
+      c.strokeStyle = col(0.45, (0.26 + 0.24*(1-u)) * fade(u*0.92) + 0.05);
+      c.beginPath(); c.moveTo(x, cy-(maj?15:8)); c.lineTo(x, cy); c.stroke();
+    }
+
+    const VN = 55, vsp = (sp*N)/VN, reach = lv*SPAN*0.92;
+    for (let i=0;i<=VN;i++){
+      const x = ox - reach + i*vsp;
+      if (x > ox || x < 8) continue;
+      const maj = i%5===0, u = i/VN;
+      c.lineWidth = maj ? 2.4 : 1.5;
+      c.strokeStyle = col(lv, (maj?0.9:0.5) * lv * fade(u*0.9));
+      c.beginPath(); c.moveTo(x, cy); c.lineTo(x, cy+(maj?14:7)); c.stroke();
+    }
+
+    // The measuring bar: a bracket at the travelling jaw, blocks filling back to
+    // the origin, so the eye reads a quantity and not just a pattern.
+    const jx = ox - reach;
+    c.lineWidth = 2.4; c.strokeStyle = col(lv, 0.75+0.22*lv);
+    c.beginPath();
+    c.moveTo(jx+10, cy-16); c.lineTo(jx, cy-16); c.lineTo(jx, cy+16); c.lineTo(jx+10, cy+16);
+    c.stroke();
+    const cells = 26, cw = reach/cells;
+    for (let i=0;i<cells;i++){
+      const a = 0.16 + 0.55*lv*(1 - i/cells*0.7);
+      c.fillStyle = col(lv, a);
+      c.fillRect(jx + 4 + i*cw, cy-4, Math.max(1.4, cw-2.6), 8);
+    }
+
+    c.lineWidth = 3; c.strokeStyle = col(lv, 0.62+0.34*lv);
+    c.beginPath(); c.moveTo(ox, cy-24); c.lineTo(ox, cy+23); c.stroke();
+    c.fillStyle = 'rgba(0,0,0,0.20)';
+    for (let y=(t*22)%3; y<h; y+=3) c.fillRect(0, y, w, 1);
+  }},
+
+{ id:'hud-right-trail', name:'R3', title:'HUD right — data trail',
+  blurb:'Readout locked at the right, and everything you have already said trailing off to the left as a ladder of samples. The instrument stays still; the record moves.',
+  draw(c,w,h,v,t,hist){
+    const ox = w - 16, cy = h*0.56, lv = 0.05 + v*0.95;
+
+    // The rail the record runs along — present even in silence, so the strip is
+    // never an empty rectangle.
+    c.lineWidth = 1.8; c.strokeStyle = col(0.35, 0.16);
+    c.beginPath(); c.moveTo(8, cy); c.lineTo(ox-56, cy); c.stroke();
+
+    // Sample i is drawn i steps to the LEFT of the readout: distance from the
+    // instrument is age, so the trail is a legible record of the last couple of
+    // seconds rather than decoration.
+    const step = 5.5, N = Math.floor((ox-70)/step);
+    for (let i=0;i<N;i++){
+      const x = ox - 62 - i*step; if (x < 6) break;
+      const s0 = hist[i] || 0, u = i/N;
+      const th = 2 + s0*26*(1-u*0.75);
+      c.fillStyle = col(s0, (0.20 + 0.7*s0) * (1-u*0.9) + 0.03);
+      c.fillRect(x-1.5, cy-th, 3, th);
+      if (i%10===0){
+        c.fillStyle = col(s0, 0.18*(1-u));
+        c.fillRect(x-1.5, cy+3, 3, 5);
+      }
+    }
+
+    // The instrument, locked at the right: bracket, jaw, and a block readout of
+    // the level right now.
+    c.lineWidth = 2.6; c.strokeStyle = col(0.6, 0.5+0.32*lv);
+    c.beginPath();
+    c.moveTo(ox-20, 7); c.lineTo(ox, 7); c.lineTo(ox, h-7); c.lineTo(ox-20, h-7);
+    c.stroke();
+
+    const bx = ox - 56, bw = 44;
+    c.lineWidth = 2.2; c.strokeStyle = col(lv, 0.72+0.24*lv);
+    c.beginPath();
+    c.moveTo(bx+8, cy-16); c.lineTo(bx, cy-16); c.lineTo(bx, cy+16); c.lineTo(bx+8, cy+16);
+    c.stroke();
+    const rows = 7, on = Math.round(lv*rows);
+    for (let i=0;i<rows;i++){
+      const y = cy + 13 - i*(26/rows);
+      c.fillStyle = col(lv, i<on ? 0.40+0.5*lv : 0.10);
+      c.fillRect(bx+6, y, bw-12, 2.6);
+    }
+
+    // Scan head where new samples enter the record.
+    c.globalCompositeOperation = 'lighter';
+    const g = c.createLinearGradient(bx-26, 0, bx+4, 0);
+    g.addColorStop(0, col(1,0));
+    g.addColorStop(1, `rgba(255,255,255,${0.12+0.30*lv})`);
+    c.fillStyle = g; c.fillRect(bx-26, cy-26, 30, 52);
+    c.globalCompositeOperation = 'source-over';
+
+    c.fillStyle = 'rgba(0,0,0,0.20)';
+    for (let y=(t*22)%3; y<h; y+=3) c.fillRect(0, y, w, 1);
+  }},
+
+];
+EXTRA.push(...BATCH);
+})();
+
+// ── a.js ──────────────────────────────────────────
+(function(){
+const BATCH = [
+
+  {
+    id: 'dispersion',
+    name: 'A1',
+    title: 'Beam Dispersion',
+    blurb: 'A collimated beam splits at centre into fine spectral hairlines that fan outward — the number of lines and their spread track the level.',
+    draw(c, w, h, v, t, hist) {
+      // WHY this geometry:
+      // A real prism disperses parallel light into a fan of rays with slightly
+      // different angles. Each ray is a hairline (1 px) and travels all the way
+      // to both ends of the strip. The fan angle grows with level so at silence
+      // the rays are nearly parallel (narrow fan, a single bright seam) and at
+      // peak they splay to fill the height. Lightness varies between lines — the
+      // outermost rays of the dispersed beam are the "farthest" wavelengths and
+      // are rendered dimmer, giving depth without hue change. The beam is
+      // symmetric left/right from x = w/2.
+
+      const cx = w / 2;
+      const cy = h / 2;
+
+      // Eased level so changes feel optical, not digital.
+      const lv = 0.08 + v * 0.92;   // floor keeps a quiet resting seam
+
+      // Number of hairlines: 3 at silence, up to 18 at peak.
+      const N = Math.round(3 + lv * 15);
+
+      // Max spread angle in radians. At full level the outermost ray hits the
+      // top/bottom edge well before the strip ends — that keeps all rays visible
+      // inside h=74, while still clearly fanning.
+      const maxAngle = Math.atan2(h * 0.45, cx * 0.1) * lv;
+
+      c.save();
+      c.globalCompositeOperation = 'lighter';
+
+      for (let i = 0; i < N; i++) {
+        // Normalised position of this ray in the fan: -1 (bottom) to +1 (top).
+        const t_frac = N === 1 ? 0 : (i / (N - 1)) * 2 - 1;
+        const angle = t_frac * maxAngle;
+
+        // Lightness: brightest at centre ray (t_frac ≈ 0), dims toward edges.
+        // This mirrors how a prism's centre wavelength carries more energy in
+        // a near-white-light source.
+        const brightness = 1 - Math.abs(t_frac) * 0.7;
+        const alpha = brightness * (0.35 + lv * 0.55);
+
+        // Ray goes from centre all the way to both edges (x = 0 and x = w).
+        // We draw it as two half-rays so the gradient fades toward the tips.
+        const grad = c.createLinearGradient(cx, cy, cx + Math.cos(angle) * cx, cy + Math.sin(angle) * cx);
+        grad.addColorStop(0, col(brightness * lv, alpha));
+        grad.addColorStop(0.55, col(brightness * lv, alpha * 0.6));
+        grad.addColorStop(1,   col(brightness * lv, 0));
+
+        // Right half
+        c.beginPath();
+        c.moveTo(cx, cy);
+        c.lineTo(cx + Math.cos(angle) * cx, cy + Math.sin(angle) * cx);
+        c.strokeStyle = grad;
+        c.lineWidth = 1;
+        c.stroke();
+
+        // Left half (mirror)
+        const gradL = c.createLinearGradient(cx, cy, cx - Math.cos(angle) * cx, cy + Math.sin(angle) * cx);
+        gradL.addColorStop(0, col(brightness * lv, alpha));
+        gradL.addColorStop(0.55, col(brightness * lv, alpha * 0.6));
+        gradL.addColorStop(1,   col(brightness * lv, 0));
+
+        c.beginPath();
+        c.moveTo(cx, cy);
+        c.lineTo(cx - Math.cos(angle) * cx, cy + Math.sin(angle) * cx);
+        c.strokeStyle = gradL;
+        c.lineWidth = 1;
+        c.stroke();
+      }
+
+      // Hot core at centre: a small bright node where the beam enters the prism.
+      // Only meaningful at non-zero level.
+      if (v > 0.01) {
+        c.globalCompositeOperation = 'lighter';
+        const coreAlpha = Math.min(0.5, v * 0.6);
+        c.beginPath();
+        c.arc(cx, cy, 1.5, 0, Math.PI * 2);
+        c.fillStyle = `rgba(255,255,255,${coreAlpha})`;
+        c.fill();
+      }
+
+      c.globalCompositeOperation = 'source-over';
+      c.restore();
+    }
+  },
+
+  {
+    id: 'anamorphic',
+    name: 'A2',
+    title: 'Anamorphic Streak',
+    blurb: 'A horizontal lens flare — bright tight core at centre, with gossamer streak wings whose length and luminance track level.',
+    draw(c, w, h, v, t, hist) {
+      // WHY this geometry:
+      // Anamorphic lenses produce a characteristic horizontal streak (not a
+      // starburst) because their cylindrical elements focus light differently
+      // on one axis. The streak is thinnest and brightest at the source, then
+      // falls off to near-zero over its full length. Here the "source" is always
+      // at x = w/2; the wings reach outward to both ends. At silence there is
+      // still a hairline seam — the lens always has some internal scatter. At
+      // peak the streak blooms: the core fattens slightly and the wings extend
+      // almost edge-to-edge. The classic look uses two or three stacked strokes
+      // of falling width, giving the airy disc effect without a blur call.
+
+      const cx = w / 2;
+      const cy = h / 2;
+
+      const lv = 0.04 + v * 0.96;
+
+      // Streak half-length grows with level. Reaches 100% of cx at full level.
+      const halfLen = cx * (0.2 + lv * 0.8);
+
+      c.save();
+      c.globalCompositeOperation = 'lighter';
+
+      // Three layers: widest/dimmest → narrow/bright → hairline core.
+      // Each is a horizontal gradient from the centre outward.
+      const layers = [
+        { width: 6, alphaScale: 0.15 },
+        { width: 2.5, alphaScale: 0.35 },
+        { width: 1,  alphaScale: 0.70 },
+      ];
+
+      for (const layer of layers) {
+        const baseAlpha = layer.alphaScale * lv;
+
+        // Build a gradient that is full-alpha at the centre and falls to 0 at
+        // the tip of the streak. Linear falloff on alpha gives the diffuse wing.
+        const gradR = c.createLinearGradient(cx, cy, cx + halfLen, cy);
+        gradR.addColorStop(0,   col(lv, baseAlpha));
+        gradR.addColorStop(0.3, col(lv, baseAlpha * 0.7));
+        gradR.addColorStop(1,   col(lv, 0));
+
+        const gradL = c.createLinearGradient(cx, cy, cx - halfLen, cy);
+        gradL.addColorStop(0,   col(lv, baseAlpha));
+        gradL.addColorStop(0.3, col(lv, baseAlpha * 0.7));
+        gradL.addColorStop(1,   col(lv, 0));
+
+        c.lineWidth = layer.width;
+        c.lineCap = 'butt';
+
+        // Right wing
+        c.beginPath();
+        c.moveTo(cx, cy);
+        c.lineTo(cx + halfLen, cy);
+        c.strokeStyle = gradR;
+        c.stroke();
+
+        // Left wing
+        c.beginPath();
+        c.moveTo(cx, cy);
+        c.lineTo(cx - halfLen, cy);
+        c.strokeStyle = gradL;
+        c.stroke();
+      }
+
+      // Hot white core — the actual point source behind the flare.
+      // Scales in brightness and radius with level but never gets large.
+      if (v > 0.005) {
+        const coreR = 1 + v * 2;
+        const coreA = Math.min(0.55, v * 0.7);
+        const coreGrad = c.createRadialGradient(cx, cy, 0, cx, cy, coreR * 3);
+        coreGrad.addColorStop(0,   `rgba(255,255,255,${coreA})`);
+        coreGrad.addColorStop(0.4, col(lv, coreA * 0.6));
+        coreGrad.addColorStop(1,   col(lv, 0));
+        c.beginPath();
+        c.arc(cx, cy, coreR * 3, 0, Math.PI * 2);
+        c.fillStyle = coreGrad;
+        c.fill();
+      }
+
+      c.globalCompositeOperation = 'source-over';
+      c.restore();
+    }
+  },
+
+  {
+    id: 'caustics',
+    name: 'A3',
+    title: 'Caustic Pool',
+    blurb: 'Shimmering refracted-light caustic lines radiate from the centre — the ripple frequency, density, and brightness all track level.',
+    draw(c, w, h, v, t, hist) {
+      // WHY this geometry:
+      // Caustics are the bright filaments at the bottom of a pool — places where
+      // refracted rays constructively interfere. Two incommensurate spatial
+      // frequencies (ratio ≈ 1/φ²) beat against each other to produce a never-
+      // repeating envelope, so the field is continuous rather than clustered.
+      // Each wave is phased by |x-cx| minus a time term, so maxima travel outward
+      // from the centre. Fine sampling (2 px) ensures no gaps survive the beat.
+      // Level controls the contrast and brightness; at v=0 a calm dim field
+      // remains so silence never looks broken.
+
+      const cx = w / 2;
+
+      c.save();
+      c.globalCompositeOperation = 'lighter';
+
+      // Floor keeps a quiet resting shimmer at silence.
+      const lv = 0.07 + v * 0.93;
+
+      // Two incommensurate spatial frequencies — ratio ≈ 0.618 (inverse golden
+      // ratio squared) so their beat period never aligns into visible blocks.
+      const k1 = 0.019;   // slower ripple
+      const k2 = 0.0307;  // faster ripple  (k2/k1 ≈ 1.616 ≈ φ)
+
+      // Outward travel speed: filaments move away from centre.
+      const sp1 = 1.3;
+      const sp2 = 0.85;
+
+      // Sample every 2 px — fine enough that even a narrow beat minimum is
+      // never wider than a single pixel gap.
+      const step = 2;
+
+      for (let x = 0; x <= w; x += step) {
+        // Signed distance from centre — used in phase so motion is outward.
+        const dx = Math.abs(x - cx);
+        // Normalised position for envelope helpers.
+        const u = (x - cx) / cx;   // -1..1
+
+        // Phase: distance-from-centre minus time × speed → maxima travel outward.
+        const wave1 = Math.sin(k1 * dx - t * sp1);
+        const wave2 = Math.sin(k2 * dx - t * sp2);
+
+        // Combine to [−1, 1]; shift to [0, 1].
+        const raw = (wave1 + wave2) * 0.5;           // [-1, 1]
+        const bright = (raw + 1) * 0.5;              // [0, 1]
+
+        // Contrast: at silence the field is softly lit; at peak the filaments
+        // sharpen and flare. Achieved by raising bright to a contrast power.
+        const contrast = 1.5 + lv * 3.0;            // 1.5 quiet → 4.5 loud
+        const intensity = Math.pow(bright, contrast); // emphasises peaks
+
+        // Envelope: brighter near centre, still visible at edges.
+        const envU = env(u) * 0.55 + 0.45;           // 0.45 floor at edges
+        const fadeU = fade(u) * 0.6 + 0.4;
+
+        const alpha = intensity * lv * fadeU * envU * 0.75;
+        if (alpha < 0.005) continue;
+
+        // Filament height follows intensity and envelope — tallest at hot spots.
+        const fH = h * (0.15 + intensity * 0.70) * (0.5 + 0.5 * envU);
+
+        const gy = h / 2;
+        c.beginPath();
+        c.moveTo(x, gy - fH / 2);
+        c.lineTo(x, gy + fH / 2);
+        c.strokeStyle = col(intensity * lv, alpha);
+        c.lineWidth = 1;
+        c.stroke();
+      }
+
+      c.globalCompositeOperation = 'source-over';
+      c.restore();
+    }
+  },
+
+  {
+    id: 'interference',
+    name: 'A4',
+    title: 'Interference Fringes',
+    blurb: 'Two wavefronts leave the centre and cross, producing moiré-like banding that breathes and sharpens with level.',
+    draw(c, w, h, v, t, hist) {
+      // WHY this geometry:
+      // Real double-slit interference (Young's experiment) produces bright
+      // fringes at positions x_n = n·λ·L/d from the optical axis, where λ
+      // is wavelength, L is screen distance, and d is slit separation. These
+      // fringes are DISCRETE bright lines on a dark background — not a gradient
+      // wash. We reproduce that: iterate over fringe order n, compute the
+      // canonical fringe x-position (symmetric left/right from cx), and draw a
+      // single 1.5 px hairline there. The cos² intensity formula gives each
+      // fringe its brightness naturally (central maximum brightest). Empty
+      // space between hairlines is the point — that emptiness is the
+      // destructive-interference dark bands.
+      //
+      // Fringe spacing grows with level (λ·L/d term): at low level fringes
+      // are far apart (only a few cross the strip); at high level they are
+      // closer-packed and more numerous. This is inverted from the physical
+      // slit-spacing relationship but matches the visual rule: louder → denser
+      // activity across the full width.
+      //
+      // The fringe order formula naturally produces wider spacing near the
+      // centre and tighter toward the edges — the opposite of a uniform comb —
+      // so the outer thirds always have something visible.
+
+      const cx = w / 2;
+      const cy = h / 2;
+
+      c.save();
+
+      // Quiet floor keeps a single dim hairline at v=0 (not dead).
+      const lv = v;
+
+      // Fringe spacing at the centre (n=1 position from cx), in pixels.
+      // At silence → ~80 px (only the zeroth fringe is on-screen at low v).
+      // At full level → ~18 px (many fringes visible across the strip).
+      const fringeSpacing = 80 - lv * 62;   // px for n=1 fringe position
+
+      // The n-th order fringe is at ±n·fringeSpacing from centre.
+      // We iterate outward until we've passed both edges.
+      const maxN = Math.ceil(cx / fringeSpacing) + 1;
+
+      c.globalCompositeOperation = 'lighter';
+      c.lineWidth = 1.5;
+
+      for (let n = 0; n <= maxN; n++) {
+        // cos² intensity for this fringe order — falls off from centre.
+        // Central max (n=0) has intensity 1; each successive fringe slightly
+        // lower due to the single-slit envelope (approximated here as a
+        // gentle 1/(1+n²·k) decay so outer fringes remain visible).
+        const envelope = 1 / (1 + n * n * 0.08);
+        const intensity = envelope;
+
+        // Both sides of centre (n=0 drawn once).
+        const sides = n === 0 ? [0] : [-1, 1];
+
+        for (const side of sides) {
+          const xFringe = cx + side * n * fringeSpacing;
+          // Skip if off-canvas.
+          if (xFringe < 0 || xFringe > w) continue;
+
+          // Lateral position 0..1 from centre.
+          const u = (xFringe - cx) / cx;
+          const f = fade(u);                          // dissolves near edges
+
+          // Alpha: cos² intensity × fade × level-driven master.
+          // At v=0, only n=0 fringe fires (because fringeSpacing is large,
+          // n=1 lands off-screen) and alpha is held to a small quiet floor.
+          const quietFloor = n === 0 ? 0.12 : 0;
+          const alpha = Math.max(quietFloor, intensity * f * (lv * 0.85 + 0.05));
+          if (alpha < 0.015) continue;
+
+          // Draw a vertical hairline spanning most of the strip height,
+          // fading to transparent at top and bottom via gradient.
+          const hairH = h * (0.7 + intensity * 0.28);
+          const grad = c.createLinearGradient(xFringe, cy - hairH / 2, xFringe, cy + hairH / 2);
+          grad.addColorStop(0,    col(lv, 0));
+          grad.addColorStop(0.15, col(lv, alpha));
+          grad.addColorStop(0.5,  col(lv, alpha * (n === 0 ? 1 : 0.9)));
+          grad.addColorStop(0.85, col(lv, alpha));
+          grad.addColorStop(1,    col(lv, 0));
+
+          const path = new Path2D();
+          path.moveTo(xFringe, cy - hairH / 2);
+          path.lineTo(xFringe, cy + hairH / 2);
+
+          c.strokeStyle = grad;
+          c.stroke(path);
+        }
+      }
+
+      c.globalCompositeOperation = 'source-over';
+      c.restore();
+    }
+  },
+
+  {
+    id: 'godrays',
+    name: 'A5',
+    title: 'Volumetric Shafts',
+    blurb: 'Thin light rays fan up and outward from the bottom-centre — the number, spread, and brightness track level.',
+    draw(c, w, h, v, t, hist) {
+      // WHY this geometry:
+      // Volumetric god rays (crepuscular shafts) in a strip that is 74 px tall
+      // and ~1100 px wide must be nearly HORIZONTAL — raking light from a source
+      // at the centre-left/right, not a vertical torch. The fan angle is tiny
+      // (±a few degrees from horizontal) so each ray travels most of the strip
+      // width before it exits the canvas. At v=0.8 the outermost ray tips must
+      // reach the left and right edges. Ray length = cx / cos(angle) so that
+      // every ray's x-projection hits cx. Source is at the strip's visual centre
+      // (cx, cy) to satisfy the centre-origin rule.
+      //
+      // We draw two mirrored half-fans — one going right, one going left —
+      // symmetric about x = w/2.  Each ray is a gradient line: bright at the
+      // source, transparent at the tip.
+
+      const cx = w / 2;
+      const cy = h / 2;
+
+      c.save();
+      c.globalCompositeOperation = 'lighter';
+
+      // lv: floor at 0.05 so silence is not empty.
+      const lv = 0.05 + v * 0.95;
+
+      // Number of rays per side: 2 at silence, 9 at full level.
+      const N = Math.round(2 + lv * 7);
+
+      // Max fan angle from horizontal (in radians). We want the outermost ray
+      // tip to land at y = 0 or y = h when x reaches the edge. That gives:
+      //   tan(maxAngle) = (h/2) / cx => maxAngle = atan(h/2, cx)
+      // We use ~85% of that at full level so tips stay inside the strip.
+      const absMax = Math.atan2(h * 0.42, cx);
+      // Scale by lv so spread grows with level.
+      const maxAngle = absMax * lv;
+
+      // Draw both left and right halves.
+      for (let side = -1; side <= 1; side += 2) {
+        for (let i = 0; i < N; i++) {
+          // Distribute rays from nearly-horizontal outward.
+          // frac=0 → horizontal centre ray, frac=1 → outermost ray.
+          const frac = N <= 1 ? 0 : i / (N - 1);
+          // Signed angle from horizontal toward top (negative dy = up) or bottom.
+          // Alternate above/below for each i to keep even spread.
+          const vertSign = i % 2 === 0 ? 1 : -1;
+          const ang = frac * maxAngle;
+
+          // Direction: side * cos(ang) in x, vertSign * sin(ang) in y.
+          const dx = side * Math.cos(ang);
+          const dy = vertSign * Math.sin(ang);
+
+          // Ray length: enough that the x-component reaches the edge.
+          // length = cx / |cos(ang)|, with a floor for the centre ray.
+          const rayLen = cx / (Math.cos(ang) + 0.001);
+
+          const tipX = cx + dx * rayLen;
+          const tipY = cy + dy * rayLen;
+
+          // Brightness: central rays (small frac, small ang) are brightest.
+          const centrality = 1 - frac;
+          const alpha = (0.08 + centrality * 0.45) * lv;
+
+          // Subtle per-ray flicker — crepuscular shafts breathe in real air.
+          const flicker = 0.85 + 0.15 * Math.sin(t * 1.6 + i * 1.7 + side * 2.3);
+          const finalAlpha = alpha * flicker;
+
+          // Gradient: bright at origin, transparent at tip.
+          const grad = c.createLinearGradient(cx, cy, tipX, tipY);
+          grad.addColorStop(0,    col(lv, finalAlpha));
+          grad.addColorStop(0.4,  col(lv * 0.85, finalAlpha * 0.6));
+          grad.addColorStop(1,    col(lv * 0.6, 0));
+
+          c.beginPath();
+          c.moveTo(cx, cy);
+          c.lineTo(tipX, tipY);
+          c.strokeStyle = grad;
+          c.lineWidth = 1;
+          c.stroke();
+        }
+      }
+
+      // Soft halo at the source — the diffuse glow of where the light originates.
+      // Scales with level; the lv floor keeps it faintly visible at silence.
+      const haloR = 3 + lv * 10;
+      const haloGrad = c.createRadialGradient(cx, cy, 0, cx, cy, haloR);
+      haloGrad.addColorStop(0, col(lv, 0.5 * lv));
+      haloGrad.addColorStop(1, col(lv, 0));
+      c.fillStyle = haloGrad;
+      c.beginPath();
+      c.arc(cx, cy, haloR, 0, Math.PI * 2);
+      c.fill();
+
+      c.globalCompositeOperation = 'source-over';
+      c.restore();
+    }
+  },
+
+];
+EXTRA.push(...BATCH);
+})();
+
+// ── b.js ──────────────────────────────────────────
+(function(){
+const BATCH = [
+
+  {
+    id: 'ticker',
+    name: 'B1',
+    title: 'Calibrated Scale',
+    blurb: 'A precision ruler radiates from the centre: fine tick marks at three scales light up progressively as level pushes further outward, like a backlit micrometer.',
+    draw(c, w, h, v, t, hist) {
+      // WHY this geometry:
+      // A real calibrated instrument (micrometer, Vernier gauge) has tick marks at
+      // three hierarchical densities: coarse (labelled), medium, and fine. The marks
+      // nearest the centre are the quietest and always visible — that satisfies the
+      // "silence must not look broken" rule. Marks further out only illuminate when
+      // level is high enough to reach them. The lighting rule is purely positional:
+      // a tick at fractional position u lights up when v > u, with a small soft
+      // transition zone so the illumination front feels physical rather than binary.
+      // Left/right symmetry is trivial: we loop once and draw at cx±offset.
+
+      const cx = w / 2;
+      // Baseline (horizontal spine): sits at cy because the strip is very short.
+      // Ticks project upward (above cy) by default, with a fine mirror below.
+      const cy = h / 2;
+
+      // Eased level — tiny floor so the centremost ticks always glow at silence.
+      const lv = 0.04 + v * 0.96;
+
+      // ── Spine hairline ──────────────────────────────────────────────────────
+      // Always present; dim at silence, bright at peak. Spans full width.
+      c.save();
+      c.lineWidth = 0.8;
+      c.strokeStyle = col(lv * 0.6, 0.35 + lv * 0.3);
+      c.beginPath();
+      c.moveTo(0, cy);
+      c.lineTo(w, cy);
+      c.stroke();
+
+      // ── Tick marks ─────────────────────────────────────────────────────────
+      // Three tiers (coarse / medium / fine) placed at uniform fractions of cx.
+      // We measure position as u = offset / cx ∈ [0,1], where 1 = the edge.
+      // A tick at position u lights up when lv > u (with soft shoulder ~0.04).
+
+      // coarse: every 1/10 of cx, 12 px tall (full, above+below), 1 px wide
+      // medium: every 1/20, 7 px tall, 0.8 px wide
+      // fine:   every 1/40, 4 px tall, 0.7 px wide
+      const tiers = [
+        { step: 1/10,  hUp: 14, hDn: 5,  lw: 1.0,  alphaBase: 0.9 },
+        { step: 1/20,  hUp: 8,  hDn: 3,  lw: 0.8,  alphaBase: 0.7 },
+        { step: 1/40,  hUp: 4,  hDn: 2,  lw: 0.65, alphaBase: 0.5 },
+      ];
+
+      // Transition softness — how many level-units the light-up ramp spans.
+      const SOFT = 0.05;
+
+      for (const tier of tiers) {
+        const count = Math.round(1 / tier.step);   // ticks per half-strip
+        for (let i = 1; i <= count; i++) {
+          const u = i * tier.step;                  // 0..1 fractional position
+          const offset = u * cx;                    // px from centre
+
+          // Brightness: 0 when lv << u, 1 when lv >> u, smooth ramp in between.
+          const lit = Math.max(0, Math.min(1, (lv - u + SOFT) / SOFT));
+          if (lit < 0.01) continue;
+
+          const alpha = tier.alphaBase * lit;
+          c.lineWidth = tier.lw;
+          c.strokeStyle = col(lv * lit, alpha);
+
+          // Draw tick at cx+offset and cx-offset (symmetric)
+          for (const sign of [-1, 1]) {
+            const x = cx + sign * offset;
+            c.beginPath();
+            c.moveTo(x, cy - tier.hUp);
+            c.lineTo(x, cy + tier.hDn);
+            c.stroke();
+          }
+        }
+      }
+
+      // ── Hot centre node ─────────────────────────────────────────────────────
+      // Small bright vertical bar at x=cx marking the instrument's origin.
+      // Uses white core (contract allows white as hot core at peak).
+      if (lv > 0.05) {
+        const coreH = 16 + lv * 10;
+        c.lineWidth = 1.2;
+        c.strokeStyle = col(lv, 0.95);
+        c.beginPath();
+        c.moveTo(cx, cy - coreH / 2);
+        c.lineTo(cx, cy + coreH / 2);
+        c.stroke();
+
+        if (v > 0.6) {
+          // White hot core at true peak
+          c.lineWidth = 0.8;
+          c.strokeStyle = `rgba(255,255,255,${(v - 0.6) / 0.4 * 0.45})`;
+          c.beginPath();
+          c.moveTo(cx, cy - 8);
+          c.lineTo(cx, cy + 8);
+          c.stroke();
+        }
+      }
+
+      c.restore();
+      // globalCompositeOperation was never changed from source-over — safe.
+    }
+  },
+
+  {
+    id: 'hudsweep',
+    name: 'B2',
+    title: 'Radar Arc',
+    blurb: 'Concentric arcs expand outward from the centre like a HUD range-finder, with faint graticule lines behind; the leading bright arc and filled zone track level.',
+    draw(c, w, h, v, t, hist) {
+      // WHY this geometry:
+      // A radar/rangefinder HUD shows concentric range rings. In a 74 px strip the
+      // rings cannot be full circles — they are clipped to the strip height, so they
+      // appear as shallow elliptic arcs (flattened horizontally to fill the width).
+      // The strip is treated as a cross-section: x is range, y is the tiny vertical
+      // slice. At silence a faint graticule grid is always visible. As level rises,
+      // the "illuminated zone" expands outward from cx and the leading arc brightens.
+      // The arcs are drawn as horizontal ellipses so they span the full width yet fit
+      // in 74 px height — that is the only shape that works in this geometry.
+
+      const cx = w / 2;
+      const cy = h / 2;
+      const lv = 0.05 + v * 0.95;
+
+      c.save();
+
+      // ── Graticule: horizontal scan lines ───────────────────────────────────
+      // Fine horizontal lines at fixed y positions — the "reticle" behind the arcs.
+      // Always present; very dim at silence.
+      const graticuleAlpha = 0.08 + lv * 0.06;
+      c.lineWidth = 0.5;
+      for (let row = 0; row <= 6; row++) {
+        const y = (row / 6) * h;
+        c.strokeStyle = col(0.3, graticuleAlpha);
+        c.beginPath();
+        c.moveTo(0, y);
+        c.lineTo(w, y);
+        c.stroke();
+      }
+
+      // ── Range rings (concentric arcs) ───────────────────────────────────────
+      // We draw NUM_RINGS concentric ellipses. The k-th ring has:
+      //   rx = k/NUM_RINGS * cx   (horizontal radius, grows with index)
+      //   ry = fixed small value  (vertical radius, fits in strip)
+      // A ring "illuminates" when lv > k/NUM_RINGS (same logic as ticker).
+      const NUM_RINGS = 12;
+      const RY = h * 0.38;   // vertical semi-axis: nearly fills the strip height
+
+      const SOFT = 0.07;
+      for (let k = 1; k <= NUM_RINGS; k++) {
+        const u = k / NUM_RINGS;
+        const rx = u * cx;                          // horizontal semi-axis
+        const lit = Math.max(0, Math.min(1, (lv - u + SOFT) / SOFT));
+        if (lit < 0.005) continue;
+
+        const isLeading = (k === Math.floor(lv * NUM_RINGS) + 1);
+        const lineAlpha = isLeading ? 0.9 * lit : 0.25 * lit;
+        const lineWidth = isLeading ? 1.2 : 0.7;
+
+        c.lineWidth = lineWidth;
+        c.strokeStyle = col(lv * (isLeading ? 1 : 0.5), lineAlpha);
+
+        // Draw arc at cx (and mirrored: since an ellipse centred at cx is already
+        // symmetric left/right, one ellipse covers both sides).
+        c.beginPath();
+        c.ellipse(cx, cy, rx, RY, 0, 0, Math.PI * 2);
+        c.stroke();
+      }
+
+      // ── Illuminated zone fill ──────────────────────────────────��────────────
+      // A very faint filled ellipse up to the current leading arc — gives the
+      // impression of a "swept" radar zone without clobbering the graticule.
+      if (lv > 0.06) {
+        const fillRx = Math.min(lv, 1) * cx * 0.96;
+        c.globalCompositeOperation = 'lighter';
+        c.beginPath();
+        c.ellipse(cx, cy, fillRx, RY, 0, 0, Math.PI * 2);
+        // Radial fill from transparent centre to dim edge
+        const grad = c.createRadialGradient(cx, cy, 0, cx, cy, fillRx);
+        grad.addColorStop(0, col(lv, 0));
+        grad.addColorStop(0.7, col(lv, 0));
+        grad.addColorStop(1, col(lv, 0.07 * lv));
+        c.fillStyle = grad;
+        c.fill();
+        c.globalCompositeOperation = 'source-over';
+      }
+
+      // ── Centre cross-hair ───────────────────────────────────────────────────
+      // A small crosshair at origin — instrument provenance.
+      const chSize = 5;
+      c.lineWidth = 0.7;
+      c.strokeStyle = col(lv, 0.7);
+      c.beginPath();
+      c.moveTo(cx - chSize, cy); c.lineTo(cx + chSize, cy);
+      c.moveTo(cx, cy - chSize); c.lineTo(cx, cy + chSize);
+      c.stroke();
+
+      c.restore();
+    }
+  },
+
+  {
+    id: 'microbars',
+    name: 'B3',
+    title: 'Micro Spectrum',
+    blurb: 'Around 200 hairline bars, 2 px wide, mirrored from the centre — a spectrum analyser at instrument density, each bar driven by the history buffer.',
+    draw(c, w, h, v, t, hist) {
+      // WHY this geometry:
+      // A professional spectrum analyser shows many very narrow bars. The contract
+      // asks for ~200 at 2 px each. We take the 200 most recent hist samples and
+      // map sample index directly to horizontal distance from centre: hist[0] (newest)
+      // lives nearest the centre, hist[199] lives at the outermost bar. Each bar's
+      // height = hist[i] × h × envelope(u), where u is the fractional position.
+      // Bars are mirrored: the left half is the mirror of the right half, enforcing
+      // the centre-origin contract. A 2 px bar with a 0 px gap means bars are
+      // contiguous, giving the appearance of a continuous spectral ribbon with fine
+      // vertical structure rather than chunky blocks.
+
+      const cx = w / 2;
+      const BAR_W = 2;                 // exactly 2 px per bar as specified
+      const N = Math.min(200, Math.floor(cx / BAR_W));  // bars per side
+      const lv = 0.04 + v * 0.96;
+
+      c.save();
+
+      // ── Bars ────────────────────────────────────────────────────────────────
+      for (let i = 0; i < N; i++) {
+        const u = i / N;                             // 0 at centre, 1 at edge
+        const x = i * BAR_W;                         // offset from centre (pixels)
+
+        // hist[i] = recent signal; older samples get the envelope falloff
+        // Envelope ensures outer bars still do something even for quiet signals
+        const sample = hist[i] !== undefined ? hist[i] : 0;
+        // Minimum bar height fraction: keeps a dim base bar visible at silence
+        const minH = 0.03 + (1 - u) * 0.04;
+        const barFrac = Math.max(minH, sample * (0.85 - u * 0.25));
+        const barH = barFrac * h;
+
+        // Brightness falls off toward edges — outer bars are "more distant"
+        const brightness = lv * (0.5 + 0.5 * (1 - u));
+        const alpha = 0.55 + (1 - u) * 0.35;
+
+        c.fillStyle = col(brightness, alpha);
+
+        // Centred vertical bar: drawn from the bottom up (barH from cy±)
+        // We centre each bar vertically for a more balanced instrument look.
+        const barTop = (h - barH) / 2;
+
+        // Right side
+        c.fillRect(cx + x, barTop, BAR_W - 0.5, barH);
+        // Left side (mirror)
+        c.fillRect(cx - x - BAR_W, barTop, BAR_W - 0.5, barH);
+      }
+
+      // ── Peak dot at outermost active bar ───────────────────────────────────
+      // A single bright pixel at the furthest illuminated column — the "peak
+      // hold" indicator common to real spectrum analysers.
+      if (v > 0.05) {
+        const peakIdx = Math.floor(lv * (N - 1));
+        const peakX = peakIdx * BAR_W;
+        const peakH = Math.max(0.15, hist[peakIdx] || lv) * h;
+        const peakTop = (h - peakH) / 2;
+
+        c.globalCompositeOperation = 'lighter';
+        c.fillStyle = col(1, 0.8);
+        c.fillRect(cx + peakX, peakTop, 1.5, 1.5);
+        c.fillRect(cx - peakX - 1.5, peakTop, 1.5, 1.5);
+        c.globalCompositeOperation = 'source-over';
+      }
+
+      c.restore();
+    }
+  },
+
+  {
+    id: 'pressurewire',
+    name: 'B4',
+    title: 'Pressure Grid',
+    blurb: 'A flat wireframe of horizontal hairlines deforms as a pressure wave passes outward from the centre — the wave amplitude and reach track level.',
+    draw(c, w, h, v, t, hist) {
+      // WHY this geometry:
+      // A physical wave on a taut string deforms the string perpendicular to the
+      // direction of propagation. Here the "strings" are horizontal hairlines at
+      // several y-positions, and the pressure source is at x=cx. At any x, the
+      // deformation is: dy = A(u) × sin(phase(x,t)) × envelope(u), where u = |x-cx|/cx.
+      // The amplitude A grows with level. At silence the lines are flat (a neat
+      // instrument grid at rest). As level rises, the wave bends the lines more
+      // dramatically. The wave front travels outward: lines near the edge lead,
+      // lines at centre are at the source (always zero deformation at cx itself).
+      // Using sinusoidal phase-shifted by distance from centre makes the wave look
+      // physically propagating rather than frozen or pumping in place.
+
+      const cx = w / 2;
+      const cy = h / 2;
+      const lv = 0.05 + v * 0.95;
+
+      c.save();
+
+      // ── Wire lines ──────────────────────────────────────────────────────────
+      // We draw NUM_LINES horizontal hairlines at evenly-spaced y positions.
+      // Each line is subdivided into STEPS segments; each segment end point is
+      // displaced vertically by the wave function.
+      const NUM_LINES = 7;
+      const STEPS = 180;                // sub-divisions per line (smooth curve)
+
+      // Wave parameters:
+      //   amplitude   = level-driven, capped so the wave stays in the strip
+      //   frequency   = spatial frequency of the wave (cycles across cx)
+      //   phase speed = how fast the wavefront moves outward over time
+      const amp = lv * h * 0.28;       // max deformation height
+      const freq = 2.8;                 // spatial cycles across the half-strip
+      const phaseSpeed = 3.5;          // radians/second outward travel
+
+      for (let row = 0; row < NUM_LINES; row++) {
+        const y0 = (row / (NUM_LINES - 1)) * h;   // base y for this wire
+
+        // Lines close to the centre row are brighter (the "hot" wires)
+        const distFromMid = Math.abs(y0 - cy) / cy;
+        const wireAlpha = 0.3 + (1 - distFromMid) * 0.5 * lv + 0.12;
+        const wireWidth = 0.6 + (1 - distFromMid) * 0.4;
+
+        c.lineWidth = wireWidth;
+        c.strokeStyle = col(lv * (0.5 + (1 - distFromMid) * 0.5), wireAlpha);
+        c.beginPath();
+
+        for (let s = 0; s <= STEPS; s++) {
+          const x = (s / STEPS) * w;
+          const u = Math.abs(x - cx) / cx;   // 0 at centre, 1 at edge
+
+          // Wave displacement: zero exactly at cx, grows outward, then the
+          // envelope (env-like shape) tucks it back near the very edge.
+          // This prevents the lines from leaving the strip entirely.
+          // The sine argument encodes distance from origin (spatial) plus time
+          // (temporal phase shift) to make the wave appear to travel outward.
+          const envFactor = Math.sin(u * Math.PI) * (1 - u * 0.3);
+          const phase = u * freq * Math.PI * 2 - t * phaseSpeed;
+          const dy = amp * envFactor * Math.sin(phase) * lv;
+
+          const y = y0 + dy;
+          if (s === 0) c.moveTo(x, y);
+          else c.lineTo(x, y);
+        }
+        c.stroke();
+      }
+
+      // ── Vertical origin marker ──────────────────────────────────────────────
+      // A faint vertical line at cx — the "source" of the pressure, always still.
+      c.lineWidth = 0.7;
+      c.strokeStyle = col(lv, 0.35);
+      c.setLineDash([2, 4]);
+      c.beginPath();
+      c.moveTo(cx, 0);
+      c.lineTo(cx, h);
+      c.stroke();
+      c.setLineDash([]);
+
+      // ── Source pulse flash ──────────────────────────────────────────────────
+      // At high levels a bright small node pulses at cx to mark the source.
+      if (v > 0.35) {
+        const pulse = (v - 0.35) / 0.65;
+        c.globalCompositeOperation = 'lighter';
+        const grad = c.createRadialGradient(cx, cy, 0, cx, cy, 12 * pulse);
+        grad.addColorStop(0, col(1, 0.55 * pulse));
+        grad.addColorStop(1, col(1, 0));
+        c.fillStyle = grad;
+        c.beginPath();
+        c.arc(cx, cy, 14 * pulse, 0, Math.PI * 2);
+        c.fill();
+        c.globalCompositeOperation = 'source-over';
+      }
+
+      c.restore();
+    }
+  },
+
+  {
+    id: 'vernier',
+    name: 'B5',
+    title: 'Vernier Jaw',
+    blurb: 'Two caliper jaws open symmetrically from the centre as level rises; Vernier-scale teeth interleave at the interface, giving the readout a precision-instrument geometry.',
+    draw(c, w, h, v, t, hist) {
+      // WHY this geometry:
+      // A Vernier caliper has two parallel combs of fine teeth where the spacing
+      // between one comb and the other encodes a fractional measurement. Here the
+      // "main scale" teeth are fixed (their x-positions don't move), while the
+      // "Vernier scale" teeth ride on the jaw that opens with level. The jaw
+      // opening = lv × cx. At silence the jaws are almost closed and you see just
+      // the two combs nearly touching at centre. As level rises the jaws open
+      // wider, revealing more scale teeth as they pass the fixed reference line.
+      // The geometry is entirely made of thin vertical lines — correct for a
+      // precision-instrument aesthetic and trivially symmetric.
+
+      const cx = w / 2;
+      const cy = h / 2;
+      const lv = 0.04 + v * 0.96;
+
+      // Jaw opening: how far each jaw has moved from centre (in pixels).
+      // At silence = 0, at peak = cx * 0.85 (leaves a small margin).
+      const JAW_MAX = cx * 0.85;
+      const jawOpen = lv * JAW_MAX;
+
+      c.save();
+
+      // ── Fixed main scale ────────────────────────────────────────────────────
+      // 40 teeth per side, evenly spaced, extend from the jaw face to the strip edge.
+      // These represent the fixed jaw — they do not move.
+      const MAIN_TEETH = 40;
+      const mainSpacing = JAW_MAX / MAIN_TEETH;
+      // Heights: major tooth every 5, minor every 1
+      for (let i = 0; i <= MAIN_TEETH; i++) {
+        const offset = i * mainSpacing;   // distance from edge inward
+        // Fixed scale reads from the outer edge inward — teeth start at strip edge.
+        // A tooth at offset `offset` from the outer edge is at x = (cx ± (JAW_MAX - offset)).
+        // But to keep it simple: fixed teeth at positions measured from edges.
+        const xR = cx + (JAW_MAX - offset);  // right side: starts near edge, moves inward
+        const xL = cx - (JAW_MAX - offset);  // mirrored
+
+        const isMajor = (i % 5 === 0);
+        const toothH = isMajor ? 14 : 7;
+        const alpha = 0.2 + (1 - offset / JAW_MAX) * 0.25;  // dimmer toward centre
+        c.lineWidth = isMajor ? 0.9 : 0.6;
+        c.strokeStyle = col(0.4, alpha);
+
+        // Each tooth: from cy-toothH/2 upward only (upper jaw convention)
+        const toothTop = cy - toothH;
+        for (const x of [xR, xL]) {
+          c.beginPath();
+          c.moveTo(x, toothTop);
+          c.lineTo(x, cy);
+          c.stroke();
+        }
+      }
+
+      // ── Moving Vernier scale (rides on the jaw) ─────────────────────────────
+      // 39 teeth per side (one fewer than main → that IS the Vernier principle).
+      // Their zero-position is at cx; they ride outward by jawOpen.
+      const VERNIER_TEETH = 39;
+      // Vernier spacing is slightly different from main: 40 main gaps = 39 Vernier gaps.
+      const vernierSpacing = (mainSpacing * MAIN_TEETH) / VERNIER_TEETH;
+
+      for (let i = 0; i <= VERNIER_TEETH; i++) {
+        const localOffset = i * vernierSpacing;        // local position along Vernier scale
+        // In instrument coordinates, Vernier teeth sit just outside jawOpen.
+        const xR = cx + jawOpen + localOffset;
+        const xL = cx - jawOpen - localOffset;
+
+        // Only draw if inside the visible half (don't go past cx for the gap).
+        if (xR > w || xL < 0) continue;
+
+        const isMajor = (i % 5 === 0);
+        const toothH = isMajor ? 12 : 6;
+        const lit = Math.min(1, lv * 1.2);
+        const alpha = lit * (isMajor ? 0.85 : 0.5);
+        c.lineWidth = isMajor ? 1.0 : 0.65;
+        c.strokeStyle = col(lit, alpha);
+
+        // Vernier teeth hang below the centre line (lower jaw convention).
+        const toothBot = cy + toothH;
+        for (const x of [xR, xL]) {
+          if (x < 0 || x > w) continue;
+          c.beginPath();
+          c.moveTo(x, cy);
+          c.lineTo(x, toothBot);
+          c.stroke();
+        }
+      }
+
+      // ── Jaw faces ───────────────────────────────────────────────────────────
+      // A horizontal bar at cy showing the two jaw edges — the "measurement gap".
+      // Left jaw face: from 0 to cx-jawOpen. Right jaw face: from cx+jawOpen to w.
+      const jawAlpha = 0.5 + lv * 0.35;
+      c.lineWidth = 1.2;
+      c.strokeStyle = col(lv, jawAlpha);
+      c.beginPath();
+      c.moveTo(0, cy);
+      c.lineTo(cx - jawOpen, cy);
+      c.stroke();
+      c.beginPath();
+      c.moveTo(cx + jawOpen, cy);
+      c.lineTo(w, cy);
+      c.stroke();
+
+      // ── Gap indicator ───────────────────────────────────────────────────────
+      // The open gap between the jaws — two small facing arrows or vertical bars.
+      // Simple: two vertical bright bars at each jaw face.
+      if (jawOpen > 2) {
+        c.lineWidth = 1.5;
+        c.strokeStyle = col(lv, 0.9);
+        const faceBarH = 18;
+        for (const xFace of [cx - jawOpen, cx + jawOpen]) {
+          c.beginPath();
+          c.moveTo(xFace, cy - faceBarH / 2);
+          c.lineTo(xFace, cy + faceBarH / 2);
+          c.stroke();
+        }
+
+        // At high levels: white hot core on the face bars
+        if (v > 0.5) {
+          const wa = (v - 0.5) / 0.5 * 0.4;
+          c.lineWidth = 0.8;
+          c.strokeStyle = `rgba(255,255,255,${wa})`;
+          for (const xFace of [cx - jawOpen, cx + jawOpen]) {
+            c.beginPath();
+            c.moveTo(xFace, cy - 5);
+            c.lineTo(xFace, cy + 5);
+            c.stroke();
+          }
+        }
+      }
+
+      // ── Zero mark ───────────────────────────────────────────────────────────
+      // A dim tick at exact centre — the datum, always present.
+      c.lineWidth = 0.7;
+      c.strokeStyle = col(0.35, 0.3);
+      c.beginPath();
+      c.moveTo(cx, cy - 10);
+      c.lineTo(cx, cy + 10);
+      c.stroke();
+
+      c.restore();
+      // No globalCompositeOperation change left over; restore() is safe.
+    }
+  },
+
+];
+EXTRA.push(...BATCH);
+})();
+
+// ── c.js ──────────────────────────────────────────
+(function(){
+// WHY the file is structured this way:
+// Each draw() closes over its own state object so the particle system is
+// initialised once and mutated each frame — no per-frame heap allocation.
+// State is captured by the IIFE that returns the draw function.
+
+const BATCH = [
+
+  // ─────────────────────────────────────────────────────────────────────────
+  {
+    id: 'particle-stream',
+    name: 'C1',
+    title: 'Particle Stream',
+    blurb: 'A continuous stream of motes erupts from the centre and drifts outward — emission rate, velocity, and brightness all track the microphone level.',
+
+    draw: (() => {
+      // WHY a fixed pool of 120 particles:
+      // We pre-allocate exactly as many particles as can be visible at peak level.
+      // Each particle carries its own phase seed so their spread looks organic
+      // without being random each frame. Pool size = emitting 4/frame × 30 frames
+      // of visible lifetime = 120. Index cycles with a head pointer.
+      const N   = 120;
+      const px  = new Float32Array(N);   // x offset from centre (signed)
+      const py  = new Float32Array(N);   // y offset from strip centre
+      const pvx = new Float32Array(N);   // x velocity (px/s)
+      const pvy = new Float32Array(N);   // y velocity (px/s)
+      const page= new Float32Array(N);   // age in seconds; -1 = inactive
+      const plife = new Float32Array(N); // max lifetime for this particle (s)
+      const pseed= new Float32Array(N);  // per-particle deterministic seed
+      for (let i = 0; i < N; i++) { page[i] = -1; pseed[i] = (i * 1.6180339 % 1); }
+      let head = 0;
+      let lastT = -1;
+
+      return function draw(c, w, h, v, t, hist) {
+        const cx   = w / 2;
+        const cy   = h / 2;
+        const dt   = lastT < 0 ? 0.016 : Math.min(t - lastT, 0.1);
+        lastT = t;
+
+        // WHY emission rate scales quadratically:
+        // At low v a trickle (1 particle/frame) keeps silence alive.
+        // At peak, 6/frame fills the stream visibly. Quadratic gives a more
+        // perceptible difference than linear.
+        const emit = Math.round(1 + v * v * 5);
+        const speed = 60 + v * 320;   // px/s — faster when louder
+        const life  = 0.8 + (1 - v) * 0.6;  // quieter = longer lived, slower drift
+
+        // Emit new particles
+        for (let e = 0; e < emit; e++) {
+          // Deterministic seed using head and frame-count approximation
+          const seed = ((head * 7.3 + t * 3.7) % 1 + 1) % 1;
+          px[head]   = 0;
+          py[head]   = (seed - 0.5) * h * 0.55;
+          // Direction: left half of pool goes left, right half goes right —
+          // symmetric about centre as required
+          const dir  = (head % 2 === 0) ? 1 : -1;
+          pvx[head]  = dir * (speed * (0.7 + seed * 0.3));
+          pvy[head]  = (seed - 0.5) * 20;
+          page[head] = 0;
+          plife[head]= life * (0.7 + seed * 0.3);
+          pseed[head]= seed;
+          head = (head + 1) % N;
+        }
+
+        // Integrate and draw
+        c.save();
+        c.globalCompositeOperation = 'lighter';
+
+        for (let i = 0; i < N; i++) {
+          if (page[i] < 0) continue;
+          page[i] += dt;
+          if (page[i] > plife[i]) { page[i] = -1; continue; }
+
+          px[i] += pvx[i] * dt;
+          py[i] += pvy[i] * dt;
+
+          // WHY fade uses square of remaining life fraction:
+          // Tail-end fade should look like dissipation, not a hard cutoff.
+          // Squaring the fraction means the last 30% of life drops quickly —
+          // the mote seems to evaporate rather than blinking out.
+          const frac = 1 - page[i] / plife[i];
+          const alpha = frac * frac * (0.15 + v * 0.6);
+
+          // Distance from centre in [0,1] — use env() to attenuate alpha
+          // at the ends so motes near the edge are naturally dimmer.
+          const u = px[i] / cx;  // ∈ [-1,1] roughly
+          const envA = Math.max(0, 1 - Math.abs(u) * 0.4);
+
+          const brightness = 0.3 + frac * 0.7 * v;
+          c.fillStyle = col(brightness, alpha * envA);
+          const r = 1.2 + pseed[i] * 0.8;
+          c.beginPath();
+          c.arc(cx + px[i], cy + py[i], r, 0, Math.PI * 2);
+          c.fill();
+        }
+
+        // Hot core at centre — the emission point
+        if (v > 0.02) {
+          const coreA = Math.min(0.5, v * 0.7);
+          c.fillStyle = `rgba(255,255,255,${coreA})`;
+          c.beginPath();
+          c.arc(cx, cy, 2, 0, Math.PI * 2);
+          c.fill();
+        }
+
+        c.globalCompositeOperation = 'source-over';
+        c.restore();
+      };
+    })()
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────
+  {
+    id: 'ferrofluid',
+    name: 'C2',
+    title: 'Ferrofluid Spikes',
+    blurb: 'Magnetic spikes rise from a liquid baseline, tallest and densest at the centre — spike height and count grow with level.',
+
+    draw: (() => {
+      // WHY 48 spikes at fixed x positions:
+      // Ferrofluid spikes under a magnet form at quasi-periodic intervals
+      // determined by surface tension vs. magnetic force. We compute 48 spike
+      // positions once and keep them fixed — only the HEIGHT changes with v and
+      // position. Moving spikes laterally would look like a bar chart, not a fluid.
+      const NSPIKES = 48;
+      const spikes = new Float32Array(NSPIKES);  // normalised x in [0,1]
+      for (let i = 0; i < NSPIKES; i++) {
+        // Golden-ratio spacing gives quasi-periodic, non-uniform gaps
+        spikes[i] = (i / NSPIKES + (i * 0.6180339) % 1) % 1;
+      }
+      // Sort so we can draw left to right (not required but cleaner)
+      spikes.sort();
+      // Precompute distances from centre in [-1,1]
+      const sdist = new Float32Array(NSPIKES);
+      for (let i = 0; i < NSPIKES; i++) sdist[i] = spikes[i] * 2 - 1;
+
+      return function draw(c, w, h, v, t, hist) {
+        const cx = w / 2;
+        // WHY baseline sits at 0.78*h (lower ¾):
+        // The strip is 74 px. Spikes rise upward. A baseline at ~57 px from top
+        // (0.78*h) leaves room for tall spikes at peak while the liquid meniscus
+        // at silence sits convincingly low. The bottom 16 px is the "pool".
+        const base = h * 0.78;
+        const lv = 0.06 + v * 0.94;  // floor keeps the resting meniscus alive
+
+        c.save();
+
+        // Draw the liquid base first — a thin filled region
+        c.fillStyle = col(lv * 0.4, 0.18 + v * 0.12);
+        c.fillRect(0, base, w, h - base);
+
+        // Draw surface meniscus as a smooth curve
+        c.beginPath();
+        c.moveTo(0, base);
+        for (let i = 0; i <= 80; i++) {
+          const xn = i / 80;          // 0..1
+          const xu = xn * 2 - 1;     // -1..1
+          // WHY env() here: the magnetic field is centred, so surface tension
+          // distortion (meniscus rise) is strongest near centre and falls off.
+          const ripple = Math.sin(xn * Math.PI * 12 + t * 3) * 0.8 * lv * env(xu);
+          c.lineTo(xn * w, base - ripple);
+        }
+        c.lineTo(w, h);
+        c.lineTo(0, h);
+        c.closePath();
+        c.fillStyle = col(lv * 0.5, 0.12);
+        c.fill();
+
+        c.globalCompositeOperation = 'lighter';
+
+        // Draw spikes
+        for (let i = 0; i < NSPIKES; i++) {
+          const xn = spikes[i];
+          const xu = sdist[i];         // -1..1 from centre
+          const sx = xn * w;
+
+          // WHY env(xu) drives spike height:
+          // The magnetic field from a point source above the centre attenuates as
+          // ~1/r^2. env() approximates this falloff — central spikes are tall and
+          // the outer edge spikes are small, matching the real physics.
+          const envelope = env(xu);
+          const maxH = h * 0.72;      // maximum spike height = almost full strip
+          const spikeH = maxH * lv * envelope;
+
+          if (spikeH < 1) continue;
+
+          // WHY tapered triangle: a ferrofluid spike is sharp at the tip and
+          // widens at the base. A triangle of base 2–4 px nails this silhouette
+          // in 74 px without any arc primitives.
+          const baseW = 1.5 + envelope * lv * 2;
+          const alpha = 0.25 + envelope * lv * 0.65;
+
+          c.fillStyle = col(0.4 + envelope * lv * 0.6, alpha);
+          c.beginPath();
+          c.moveTo(sx, base - spikeH);          // tip
+          c.lineTo(sx - baseW, base);
+          c.lineTo(sx + baseW, base);
+          c.closePath();
+          c.fill();
+
+          // Tip highlight — a tiny bright node at the spike apex
+          if (spikeH > 4 && v > 0.1) {
+            c.fillStyle = col(1, alpha * 0.6);
+            c.beginPath();
+            c.arc(sx, base - spikeH, 0.8, 0, Math.PI * 2);
+            c.fill();
+          }
+        }
+
+        c.globalCompositeOperation = 'source-over';
+        c.restore();
+      };
+    })()
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────
+  {
+    id: 'vapour-plume',
+    name: 'C3',
+    title: 'Vapour Plume',
+    blurb: 'A soft plume of condensing vapour rises from the centre, spreading and thinning as it climbs — density, height, and spread track the level.',
+
+    draw: (() => {
+      // WHY 10 layered ellipses stacked vertically:
+      // A real vapour column is not uniform — it is a stack of mushrooming
+      // pockets of gas that spread as they cool. We model this with N ellipses
+      // that each represent a different altitude slice. Lower slices are narrow
+      // and bright (hot, dense); upper slices are wide and transparent (dispersed).
+      // The height of the stack and opacity both scale with v so at silence
+      // only a faint basal wisp is visible.
+      const NL = 10;
+
+      return function draw(c, w, h, v, t, hist) {
+        const cx = w / 2;
+        const lv = 0.05 + v * 0.95;
+
+        c.save();
+        // No composite trick needed — soft alpha layering reads naturally here.
+
+        for (let i = 0; i < NL; i++) {
+          // WHY layer index drives both vertical position and spread:
+          // Layer 0 is at the bottom (emission point), layer NL-1 is the top.
+          // The strip has y=0 at top and h at bottom — so layer 0 sits near h
+          // and layers rise upward as i increases.
+          const frac = i / (NL - 1);     // 0 = base, 1 = top
+
+          // WHY slow sinusoidal drift offset per layer:
+          // Real vapour billows — pockets shear and wander. A sin wave with
+          // different phase per layer at low amplitude (3 px max) prevents the
+          // stack from looking like a rigid pillar while still reading as one plume.
+          const drift = Math.sin(t * 0.8 + frac * Math.PI * 1.5) * 3 * lv;
+
+          // Stack height: at v=0 top layer barely clears h*0.4;
+          // at v=1 it reaches h*0.05 (near top of strip).
+          const topY  = h * (0.95 - lv * 0.85);
+          const y     = h - (h - topY) * frac;   // layer's centre y
+
+          // WHY width widens as frac increases:
+          // Vapour expands as pressure drops with altitude. Base width ~8 px,
+          // top width ~w*0.45 at full level so the plume reaches the outer thirds.
+          const baseW = 8;
+          const topW  = w * 0.46 * lv;
+          const rx    = baseW + (topW - baseW) * Math.pow(frac, 0.7);
+
+          // Height of each ellipse slice is proportional to its width (cigar shape)
+          const ry = Math.max(2, rx * 0.18);
+
+          // WHY alpha falls off both at the top (dispersed) and base (thin source):
+          // True plume density peaks in the lower middle. We model this with a
+          // bell-ish curve: highest alpha at frac~0.25, falling to near-zero at tips.
+          const densityCurve = Math.sin(frac * Math.PI) * (0.3 + frac * 0.3);
+          const alpha = densityCurve * lv * 0.55;
+
+          const brightness = 0.3 + (1 - frac) * 0.5 * lv;
+          c.fillStyle = col(brightness, alpha);
+
+          c.beginPath();
+          c.ellipse(cx + drift, y, rx, ry, 0, 0, Math.PI * 2);
+          c.fill();
+        }
+
+        // Basal hot core — a small bright point where the plume originates
+        if (v > 0.01) {
+          const cA = Math.min(0.45, v * 0.55);
+          c.fillStyle = `rgba(255,255,255,${cA * 0.6})`;
+          c.fillStyle = col(0.9, cA);
+          c.beginPath();
+          c.arc(cx, h - 2, 2.5, 0, Math.PI * 2);
+          c.fill();
+        }
+
+        c.restore();
+      };
+    })()
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────
+  {
+    id: 'mercury-bead',
+    name: 'C4',
+    title: 'Mercury Bead',
+    blurb: 'A bead of liquid metal at the centre stretches into a thread and sheds satellite droplets that travel outward — the stretch and count grow with level.',
+
+    draw: (() => {
+      // WHY a fixed array of 8 satellite beads per side:
+      // At peak level mercury breaks into multiple droplets — a real Plateau–
+      // Rayleigh instability. We pre-allocate 8 bead slots per side (16 total)
+      // so no allocation occurs per frame. Only beads whose threshold ≤ v are
+      // drawn, giving a natural progression: 1 bead at v=0.2, up to 8 at v=1.
+      const NBEADS = 8;
+      // Precompute each bead's activation threshold, x-fraction, and size factor
+      const bThresh = new Float32Array(NBEADS);
+      const bXfrac  = new Float32Array(NBEADS);
+      const bSize   = new Float32Array(NBEADS);
+      for (let i = 0; i < NBEADS; i++) {
+        bThresh[i] = 0.15 + (i / NBEADS) * 0.7;  // appear progressively
+        // WHY bead positions use sqrt spacing:
+        // Mercury droplets travel at ~v^2 (surface tension wins at low v,
+        // then kinetic energy dominates). sqrt gives tighter packing near
+        // centre and wider spacing at the ends — matching real fluid dynamics.
+        bXfrac[i] = Math.sqrt((i + 1) / NBEADS);
+        bSize[i]  = Math.max(1.5, 5 - i * 0.4);   // inner beads larger
+      }
+
+      return function draw(c, w, h, v, t, hist) {
+        const cx = w / 2;
+        const cy = h / 2;
+        const lv = Math.max(0.02, v);
+
+        c.save();
+        c.globalCompositeOperation = 'lighter';
+
+        // WHY the central bead squashes horizontally as level rises:
+        // A mercury bead under pressure stretches along the axis of force.
+        // At silence it is a circle; at peak it is flattened into an oblate
+        // sphere (ellipse) before the thread snaps and feeds the satellite beads.
+        // In 74 px we render this as an ellipse whose x-radius grows with v.
+        const coreRx = 4 + lv * lv * 18;   // up to ~22 px horizontal radius
+        const coreRy = Math.max(2, 8 - lv * 5);  // squashes vertically
+        const coreAlpha = 0.6 + lv * 0.3;
+
+        // Central bead fill
+        const grd = c.createLinearGradient(cx - coreRx, cy, cx + coreRx, cy);
+        grd.addColorStop(0, col(0.3, coreAlpha * 0.3));
+        grd.addColorStop(0.5, col(1, coreAlpha));
+        grd.addColorStop(1, col(0.3, coreAlpha * 0.3));
+        c.fillStyle = grd;
+        c.beginPath();
+        c.ellipse(cx, cy, coreRx, coreRy, 0, 0, Math.PI * 2);
+        c.fill();
+
+        // Hot specular highlight on bead (liquid metal reads flat without it)
+        if (lv > 0.05) {
+          c.fillStyle = `rgba(255,255,255,${Math.min(0.5, lv * 0.5)})`;
+          c.beginPath();
+          c.ellipse(cx - coreRx * 0.2, cy - coreRy * 0.25,
+                    coreRx * 0.22, coreRy * 0.28, -0.3, 0, Math.PI * 2);
+          c.fill();
+        }
+
+        // WHY the thread is a hairline connecting core to outermost active bead:
+        // The Plateau–Rayleigh thread is thin (surface tension holds it) and
+        // only exists where beads have pinched off. We draw it as a 1 px line
+        // whose opacity scales with v — it appears as level rises then fades as
+        // beads spread further apart and the thread breaks.
+        const outermost = bXfrac[Math.round((lv - 0.15) / 0.7 * (NBEADS - 1))] || 0;
+        const threadEnd = cx + outermost * (w / 2 - 10) * lv;
+        if (lv > 0.18) {
+          const ta = Math.min(0.4, (lv - 0.15) * 1.2);
+          c.strokeStyle = col(0.7, ta);
+          c.lineWidth = 0.8;
+          c.beginPath();
+          c.moveTo(cx + coreRx, cy);
+          c.lineTo(threadEnd, cy);
+          c.stroke();
+          c.beginPath();
+          c.moveTo(cx - coreRx, cy);
+          c.lineTo(w - threadEnd, cy);
+          c.stroke();
+        }
+
+        // Satellite beads — symmetric left/right
+        for (let i = 0; i < NBEADS; i++) {
+          if (lv < bThresh[i]) continue;
+
+          // WHY bead x uses the full half-width scaled by v:
+          // At low v beads cluster near centre; at high v they travel toward
+          // the strip ends. bXfrac[i] distributes them along that range.
+          const bx = bXfrac[i] * (w / 2 - 8) * Math.pow(lv, 0.6);
+          const br = bSize[i] * (0.4 + lv * 0.6);
+          // Tiny oscillation — mercury beads wobble as they slide
+          const wobble = Math.sin(t * 4 + i * 1.2) * 0.8 * lv;
+          const alpha = 0.35 + (lv - bThresh[i]) * 0.8;
+
+          c.fillStyle = col(0.7 + (1 - bXfrac[i]) * 0.3, Math.min(0.95, alpha));
+          // Right bead
+          c.beginPath();
+          c.ellipse(cx + bx, cy + wobble, br, Math.max(1, br * 0.7), 0, 0, Math.PI * 2);
+          c.fill();
+          // Left bead (mirrored)
+          c.beginPath();
+          c.ellipse(cx - bx, cy - wobble, br, Math.max(1, br * 0.7), 0, 0, Math.PI * 2);
+          c.fill();
+
+          // Specular on each satellite
+          if (br > 2.5 && lv > 0.3) {
+            c.fillStyle = `rgba(255,255,255,${Math.min(0.4, lv * 0.35)})`;
+            c.beginPath();
+            c.arc(cx + bx - br * 0.2, cy + wobble - br * 0.2, br * 0.25, 0, Math.PI * 2);
+            c.fill();
+            c.beginPath();
+            c.arc(cx - bx - br * 0.2, cy - wobble - br * 0.2, br * 0.25, 0, Math.PI * 2);
+            c.fill();
+          }
+        }
+
+        c.globalCompositeOperation = 'source-over';
+        c.restore();
+      };
+    })()
+  },
+
+  // ─────────────────────────────────────────────────────────────────────────
+  {
+    id: 'dust-motes',
+    name: 'C5',
+    title: 'Dust Motes',
+    blurb: 'Suspended motes drift in a column of light at the centre; each syllable disturbs them outward, the cloud thinning with distance.',
+
+    draw: (() => {
+      // WHY 80 motes in a fixed pool:
+      // A visible shaft of light might contain thousands of particles, but
+      // in 74 px we need each mote large enough to see (~2 px) so ≤ 100 is
+      // readable without becoming a solid fill. 80 fills the shaft convincingly.
+      // Positions are stored as normalised [0,1] and mapped to canvas each frame
+      // so the design works at any w without changing the pool.
+      const N     = 80;
+      const mx    = new Float32Array(N);   // x in [0,1]
+      const my    = new Float32Array(N);   // y in [0,1]
+      const mvx   = new Float32Array(N);  // x velocity in canvas-normalised units/s
+      const mvy   = new Float32Array(N);  // y velocity
+      const msize = new Float32Array(N);  // base radius [0.6..1.8]
+      let lastT = -1;
+      // Initialise motes clustered in the central shaft (x ∈ [0.3,0.7])
+      for (let i = 0; i < N; i++) {
+        const seed = (i * 0.6180339) % 1;
+        mx[i]    = 0.35 + seed * 0.30;        // start in shaft
+        my[i]    = (i / N);                    // spread vertically across strip
+        mvx[i]   = 0;
+        mvy[i]   = (seed - 0.5) * 0.005;      // gentle float up/down
+        msize[i] = 0.6 + seed * 1.2;
+      }
+
+      return function draw(c, w, h, v, t, hist) {
+        const cx = w / 2;
+        const lv = Math.max(0, v);
+        const dt = lastT < 0 ? 0.016 : Math.min(t - lastT, 0.1);
+        lastT = t;
+
+        c.save();
+
+        // WHY the light shaft is drawn first, behind the motes:
+        // A real light beam is visible because it illuminates the particles
+        // within it. We render the beam as a tall, narrow gradient ellipse
+        // centred at x=cx with soft edges — the motes are then drawn inside and
+        // outside it. The shaft narrows slightly at silence (fewer motes lit)
+        // and broadens at loud as disturbed motes carry light with them.
+        const shaftW = 38 + lv * 22;
+        const shaftGrd = c.createLinearGradient(cx - shaftW, 0, cx + shaftW, 0);
+        shaftGrd.addColorStop(0,   col(0.2, 0));
+        shaftGrd.addColorStop(0.3, col(0.5, 0.06 + lv * 0.07));
+        shaftGrd.addColorStop(0.5, col(0.8, 0.10 + lv * 0.10));
+        shaftGrd.addColorStop(0.7, col(0.5, 0.06 + lv * 0.07));
+        shaftGrd.addColorStop(1,   col(0.2, 0));
+        c.fillStyle = shaftGrd;
+        c.fillRect(cx - shaftW, 0, shaftW * 2, h);
+
+        c.globalCompositeOperation = 'lighter';
+
+        // WHY outward impulse grows with v:
+        // When sound hits a shaft of light the air pressure pushes motes
+        // outward from the disturbance source (centre). We apply a lateral
+        // acceleration proportional to v * displacement from centre each frame.
+        // Motes eventually drift back toward centre (soft restoring force) so
+        // at silence they re-cluster in the shaft over ~2 seconds.
+        const impulse   = lv * lv * 0.6;   // outward push strength
+        const restore   = 0.12;            // gentle return force
+        const damping   = 0.92;            // velocity decay per frame
+
+        for (let i = 0; i < N; i++) {
+          const dx = mx[i] - 0.5;  // signed distance from centre (normalised)
+
+          // Outward impulse: push away from centre proportional to v
+          mvx[i] += Math.sign(dx) * impulse * dt;
+          // Restoring force: mild pull back toward shaft
+          mvx[i] -= dx * restore * dt;
+          mvx[i] *= damping;
+          mvy[i] += (((i * 3.7) % 1 - 0.5) * 0.003) * Math.sin(t * 0.4 + i);
+          mvy[i] *= 0.98;
+
+          mx[i] += mvx[i] * dt;
+          my[i] += mvy[i] * dt;
+
+          // Wrap y so motes that drift off top/bottom reappear on the other side
+          if (my[i] < 0) my[i] += 1;
+          if (my[i] > 1) my[i] -= 1;
+          // Clamp x to strip — motes should not escape the canvas
+          mx[i] = Math.max(0.01, Math.min(0.99, mx[i]));
+
+          const sx = mx[i] * w;
+          const sy = my[i] * h;
+
+          // WHY brightness depends on proximity to shaft centreline:
+          // Motes in the beam are illuminated; motes outside it are in shadow.
+          // We measure normalised distance from cx and multiply alpha.
+          const distFromCentre = Math.abs(mx[i] - 0.5) * 2;  // 0..1
+          const inShaft = Math.max(0, 1 - distFromCentre * 2.2);
+          const brightness = 0.4 + inShaft * 0.5 + lv * 0.1;
+          const alpha = (0.08 + inShaft * 0.5 + lv * 0.25) * (0.5 + Math.random() * 0.5);
+
+          c.fillStyle = col(brightness, Math.min(0.9, alpha));
+          c.beginPath();
+          c.arc(sx, sy, msize[i], 0, Math.PI * 2);
+          c.fill();
+        }
+
+        c.globalCompositeOperation = 'source-over';
+        c.restore();
+      };
+    })()
+  },
+
+];
+EXTRA.push(...BATCH);
+})();
+
+// ── d.js ──────────────────────────────────────────
+(function(){
+const BATCH = [
+
+  // ─── D1 · SPECTROGRAM ────────────────────────────────────────────────────
+  // WHY this geometry:
+  // A real spectrogram maps time on one axis and frequency on the other, with
+  // intensity as brightness.  Here time = horizontal distance from centre (hist
+  // index doubles as age AND x-position as the contract says).  Frequency is
+  // mapped vertically across the 74 px strip — low bins near the centre of the
+  // strip, high bins at top and bottom.  The newest column of "spectrum" paints
+  // at x = w/2 and older columns paint further out toward the edges, so motion
+  // propagates outward naturally.  Each pixel column is a tiny slice of a FFT
+  // surrogate: we synthesise pseudo-spectrum from `v` and `t` rather than doing
+  // real FFT (no audio buffer available), but the visual read is unambiguous —
+  // bright bands cluster where energy is, dark gaps are silence.  At v = 0 a
+  // faint residual pattern shows the "noise floor", which is the correct
+  // resting state for a spectrogram.
+  (() => {
+    // Pre-allocate frequency-band descriptors once (closure, not per-frame).
+    // 18 bands spanning the strip height.  Each band has a centre frequency
+    // ratio and a resonant peak that determines how much energy it shows.
+    const BANDS = 18;
+    const bands = Array.from({ length: BANDS }, (_, i) => {
+      const norm = i / (BANDS - 1);          // 0 = lowest band, 1 = highest
+      // Higher bands need more level to light up — mimics how voice energy
+      // concentrates in low/mid frequencies.
+      const threshold = 0.12 + norm * 0.55;
+      // Slight random offset per band so they don't all pulse identically.
+      const phase = norm * Math.PI * 3.7 + i * 0.31;
+      return { norm, threshold, phase };
+    });
+
+    return {
+      id: 'spectrogram',
+      name: 'D1',
+      title: 'Spectrogram Flow',
+      blurb: 'A spectrogram growing outward from centre — frequency runs vertically, time runs left and right, intensity tracks level.',
+      draw(c, w, h, v, t, hist) {
+        // WHY additive here: the columns overlap at low opacity and the
+        // additive blend makes the brightest (newest) column naturally dominant
+        // without an explicit z-order.
+        const cx = w / 2;
+        const bandH = h / BANDS;
+
+        c.save();
+        c.globalCompositeOperation = 'lighter';
+
+        // Each hist sample is one column of the spectrogram.
+        // hist[0] = newest → paints at cx.  hist[i] → paints at cx ± i * colW.
+        // colW is chosen so hist[~200] reaches the strip ends.
+        const colW = cx / 200;   // 200 samples fill half-width to the edge
+
+        for (let age = 0; age < Math.min(hist.length, 200); age++) {
+          const sample = hist[age];                // level at this age
+          const xOff = age * colW;                 // distance from centre
+
+          for (let b = 0; b < BANDS; b++) {
+            const { norm, threshold, phase } = bands[b];
+
+            // Frequency energy: band responds to level above its threshold,
+            // modulated by a slow oscillation to mimic formant wobble.
+            const formant = 0.5 + 0.5 * Math.sin(t * (1.2 + norm * 2.4) + phase);
+            const energy = Math.max(0, (sample - threshold) / (1 - threshold)) * formant;
+
+            if (energy < 0.005) continue;   // skip dark cells — performance
+
+            // Vertical position: bands run top to bottom, with the lowest
+            // frequency band nearest the centre of the strip (cy) and the
+            // highest at the top and bottom edges.  We mirror so the strip
+            // reads symmetrically in y as well as x.
+            const distFromMid = Math.abs(norm - 0.5) * 2;   // 0 at mid, 1 at edge
+            const yTop = (h / 2) - (distFromMid * h / 2) - bandH / 2;
+            const yH   = bandH * 0.85;
+
+            const alpha = energy * (1 - age / 210);   // fade with age
+            c.fillStyle = col(energy * 0.9 + 0.1, alpha);
+
+            // Paint symmetric columns (left and right of centre).
+            c.fillRect(cx + xOff, yTop, colW, yH);
+            if (age > 0) c.fillRect(cx - xOff - colW, yTop, colW, yH);
+          }
+        }
+
+        // Bright centre seam — the "scanner line" that marks the present moment.
+        const seam = c.createLinearGradient(cx - 1, 0, cx + 1, 0);
+        seam.addColorStop(0, col(v * 0.7 + 0.3, 0));
+        seam.addColorStop(0.5, col(v * 0.7 + 0.3, 0.55 + v * 0.4));
+        seam.addColorStop(1, col(v * 0.7 + 0.3, 0));
+        c.fillStyle = seam;
+        c.fillRect(cx - 1, 0, 2, h);
+
+        c.globalCompositeOperation = 'source-over';
+        c.restore();
+      }
+    };
+  })(),
+
+  // ─── D2 · DOUBLE HELIX ───────────────────────────────────────────────────
+  // WHY this geometry:
+  // DNA's double helix is the canonical data/signal metaphor — information
+  // stored in intertwined strands.  The two strands are sinusoids 180° out of
+  // phase with each other, so they cross exactly twice per wavelength.  They
+  // sweep from the centre outward in both directions: the phase argument is
+  // (x - cx) so both halves mirror correctly.  The amplitude of the sine
+  // (vertical excursion of each strand) scales with `v`, so at silence the
+  // helix is nearly flat (a hairline pair close together) and at peak the
+  // strands sweep the full 74 px height.  The twist rate is fixed — a real
+  // helix has a fixed pitch — but `t` advances the phase, giving the sense
+  // of the helix slowly rotating about its axis.  The crossing points are
+  // the most energy-dense moments and get a tiny hot flare there via additive
+  // compositing, which reads as the bonds between strands.
+  (() => {
+    const STRAND_DOTS = 300;   // sample points per half (left + right mirrors)
+    return {
+      id: 'helix',
+      name: 'D2',
+      title: 'Double Helix',
+      blurb: 'Two sinusoidal strands intertwine outward from centre — amplitude is level, slow rotation is time, crossings flare.',
+      draw(c, w, h, v, t, hist) {
+        const cx = w / 2;
+        const cy = h / 2;
+
+        // Amplitude: even at v=0 keep a floor so the helix is visible.
+        const amp   = (0.08 + v * 0.92) * (h * 0.44);
+        // Spatial frequency of the helix: one full twist per ~120 px.
+        const freq  = (2 * Math.PI) / 120;
+        // Slow rotation: t advances phase at ~0.4 rad/s.
+        const rot   = t * 0.4;
+
+        c.save();
+
+        // Draw strands as polyline paths.  Two passes: dim background strand
+        // first (source-over), then bright foreground strand, then crossings
+        // via additive.
+        const drawStrand = (phaseOffset, alpha, lw) => {
+          c.beginPath();
+          let first = true;
+          for (let i = 0; i <= STRAND_DOTS; i++) {
+            // x runs from centre outward in both directions.  We parameterise
+            // 0..1 where 0 = centre, 1 = right edge; then mirror for left.
+            const u = i / STRAND_DOTS;            // 0..1
+            const xR = cx + u * cx;              // right half x
+            const phase = u * cx * freq + rot + phaseOffset;
+            const y = cy + Math.sin(phase) * amp;
+            // Fade alpha toward edges using env-like falloff.
+            const edgeFade = 1 - u * u * 0.3;
+
+            // Right strand segment.
+            if (first) { c.moveTo(xR, y); first = false; }
+            else c.lineTo(xR, y);
+          }
+          // Left half — mirror phase sign so it's truly symmetric.
+          for (let i = STRAND_DOTS; i >= 0; i--) {
+            const u = i / STRAND_DOTS;
+            const xL = cx - u * cx;
+            const phase = u * cx * freq + rot + phaseOffset;
+            const y = cy + Math.sin(phase) * amp;
+            c.lineTo(xL, y);
+          }
+          c.strokeStyle = col(0.3 + v * 0.7, alpha);
+          c.lineWidth = lw;
+          c.stroke();
+        };
+
+        // Strand A (phase 0) — slightly brighter as the "sense" strand.
+        drawStrand(0, 0.75, 1.5);
+        // Strand B (phase π) — complementary strand.
+        drawStrand(Math.PI, 0.55, 1.2);
+
+        // Crossing points: where sin(phase) ≈ 0 for both strands simultaneously,
+        // i.e. at integer half-wavelengths.  Mark them with a small hot node.
+        c.globalCompositeOperation = 'lighter';
+        const halfWave = Math.PI / freq;    // px between crossings
+        const nCrossings = Math.ceil(cx / halfWave) + 1;
+        for (let k = 0; k < nCrossings; k++) {
+          const xOff = k * halfWave - (rot / freq % halfWave);
+          // Both left and right crossings.
+          for (const sign of [1, -1]) {
+            const xc = cx + sign * (xOff % cx);
+            if (xc < 0 || xc > w) continue;
+            const r = 2 + v * 3;
+            const grd = c.createRadialGradient(xc, cy, 0, xc, cy, r);
+            grd.addColorStop(0, `rgba(255,255,255,${0.3 + v * 0.4})`);
+            grd.addColorStop(1, col(v, 0));
+            c.fillStyle = grd;
+            c.beginPath();
+            c.arc(xc, cy, r, 0, Math.PI * 2);
+            c.fill();
+          }
+        }
+        c.globalCompositeOperation = 'source-over';
+        c.restore();
+      }
+    };
+  })(),
+
+  // ─── D3 · PHASE-SHIFTED MOIRÉ ────────────────────────────────────────────
+  // WHY this geometry:
+  // Two combs of hairlines with slightly different spatial frequencies produce
+  // a moiré interference pattern.  The KEY is to make the *beat envelope*
+  // (the slow bright/dark banding) the subject, not the individual lines.
+  // We compute the envelope analytically: at distance d from centre the two
+  // combs have accumulated (1/pA - 1/pB)*d full cycles of relative phase,
+  // so the envelope is cos²(π·d·Δf + φ_drift).  Each line's alpha is scaled
+  // by the local envelope value, so bands of lines light up and fade.
+  // t drives φ_drift, making the bands slide outward from the centre.
+  // v controls Δf (line-count contrast) and the drift speed — at v=0 the
+  // two combs are nearly identical (Δf≈0), the beat wavelength is enormous,
+  // and the whole field is calm and dim.  At v=1 the beat wavelength is ~60 px
+  // and bands travel visibly outward.  Spacing is wide (≈20 px) so individual
+  // lines are resolvable and negative space remains.
+  {
+    id: 'moire',
+    name: 'D3',
+    title: 'Phase Moiré',
+    blurb: 'Two sparse grids interfere — the moiré beat bands travel outward from the centre at a speed set by level.',
+    draw(c, w, h, v, t, hist) {
+      const cx = w / 2;
+
+      // Wide base period — enough space between lines for the eye to resolve
+      // each one individually.  ~20 px gives ≈55 lines per side at w=1100.
+      const pA = 20;
+      // Level drives the frequency difference between the two combs.
+      // At v=0: Δf ≈ 0.003/px → beat wavelength ≈ 330 px (calm, near uniform).
+      // At v=1: Δf ≈ 0.030/px → beat wavelength ≈  33 px (tight, vivid bands).
+      const deltaF = 0.003 + v * 0.027;   // cycles per pixel
+      const pB = 1 / (1 / pA + deltaF);   // B slightly denser than A
+
+      // The beat envelope at distance d from centre:
+      //   phase = π * d * deltaF + drift
+      // cos²(phase) → 0 at a dark band, 1 at a bright band.
+      // Drift sweeps outward: NEGATIVE drift because d grows rightward, so
+      // subtracting drift from the phase means the constant-phase surface moves
+      // further from the centre as t grows → bands travel outward.
+      const driftSpeed = 8 + v * 40;       // px-equivalent/s
+      const drift = -t * driftSpeed * deltaF * Math.PI;
+
+      // Base alpha of individual lines — intentionally restrained so that the
+      // darkest band truly disappears and the brightest is still not garish.
+      const baseAlpha = 0.08 + v * 0.30;
+
+      c.save();
+      c.globalCompositeOperation = 'lighter';
+      c.lineWidth = 0.9;
+
+      // Draw one comb of vertical hairlines, with alpha modulated by the moiré
+      // envelope so that bright bands and dark gaps are clearly visible.
+      const drawComb = (period, phaseOffset) => {
+        let offset = phaseOffset % period;
+        // Ensure we start from ≥0
+        if (offset < 0) offset += period;
+
+        while (offset <= cx + period) {
+          // Envelope value at this distance from centre.
+          const envVal = Math.cos(Math.PI * offset * deltaF + drift) ** 2;
+          // Scale alpha by envelope — dark bands genuinely dark, bright vivid.
+          const alpha = baseAlpha * envVal;
+          if (alpha > 0.005) {
+            c.strokeStyle = col(0.35 + v * 0.65, alpha);
+            // Right side
+            if (offset > 0) {
+              c.beginPath();
+              c.moveTo(cx + offset, 0);
+              c.lineTo(cx + offset, h);
+              c.stroke();
+            }
+            // Left mirror
+            c.beginPath();
+            c.moveTo(cx - offset, 0);
+            c.lineTo(cx - offset, h);
+            c.stroke();
+          }
+          offset += period;
+        }
+      };
+
+      // Comb A — reference, no phase shift.
+      drawComb(pA, 0);
+      // Comb B — slightly denser, phase-shifted to track time, creating the
+      // sliding beat.  The small constant (pA/4) separates the two combs'
+      // starting positions so they don't collapse to one at silence.
+      drawComb(pB, pA / 4);
+
+      // Centre anchor — a soft vertical glow to pin the origin.
+      c.globalCompositeOperation = 'source-over';
+      const anchorAlpha = 0.10 + v * 0.20;
+      const grd = c.createLinearGradient(cx - 8, 0, cx + 8, 0);
+      grd.addColorStop(0,   col(0.5 + v * 0.5, 0));
+      grd.addColorStop(0.5, col(0.5 + v * 0.5, anchorAlpha));
+      grd.addColorStop(1,   col(0.5 + v * 0.5, 0));
+      c.fillStyle = grd;
+      c.fillRect(cx - 8, 0, 16, h);
+
+      c.restore();
+    }
+  },
+
+  // ─── D4 · OSCILLOSCOPE WITH PERSISTENCE ──────────────────────────────────
+  // WHY this geometry:
+  // An analog oscilloscope's phosphor screen has persistence: the beam's
+  // current position is brightly lit, and the trace decays exponentially as
+  // it ages.  Here `hist[0]` (newest) becomes the centre of the strip and
+  // `hist[i]` maps to x = cx ± i*(cx/200) — sweeping outward symmetrically.
+  // The y position of each sample is cy ± hist[i]*amp (a standard time-domain
+  // trace).  We render the trace with two overlapping passes: a wide, very dim
+  // "afterglow" (the phosphor tail) and a 1 px sharp bright line (the beam
+  // head).  The tail fades using a linear alpha falloff with age.  At v = 0
+  // the trace is a flat dim line — the classic oscilloscope "no signal" state,
+  // which is the correct quiet resting look.  The additive blend on the bright
+  // head makes it punch through the tail naturally.
+  {
+    id: 'phosphor',
+    name: 'D4',
+    title: 'Phosphor Trace',
+    blurb: 'An oscilloscope trace sweeping outward from centre — bright beam head, decaying phosphor tail, amplitude is level.',
+    draw(c, w, h, v, t, hist) {
+      const cx   = w / 2;
+      const cy   = h / 2;
+      // Amplitude: hist values are already 0..1; scale to use most of h.
+      const amp  = h * 0.42;
+      // Number of samples to show — fills to the strip edges.
+      const N    = Math.min(hist.length, 200);
+      // Pixel step per sample: N samples must reach cx.
+      const step = cx / N;
+
+      c.save();
+
+      // ── Pass 1: phosphor afterglow (source-over, wide, dim) ──
+      // Draw the tail as a series of short line segments, with alpha decaying
+      // with age.  The wide stroke is the glowing phosphor haze.
+      c.lineWidth = 3.5;
+      c.lineCap   = 'round';
+      c.lineJoin  = 'round';
+
+      for (let i = 1; i < N; i++) {
+        const age0 = (i - 1) / N;   // relative age 0..1
+        const age1 = i / N;
+        // Phosphor alpha decays as ~(1-age)^2 — bright near head, dark at tail.
+        const alpha = Math.pow(1 - age1, 2.2) * 0.28 * (0.2 + v * 0.8);
+
+        if (alpha < 0.008) break;
+
+        const y0  = cy - hist[i - 1] * amp;
+        const y1  = cy - hist[i] * amp;
+        const xR0 = cx + (i - 1) * step;
+        const xR1 = cx + i * step;
+        const xL0 = cx - (i - 1) * step;
+        const xL1 = cx - i * step;
+
+        c.strokeStyle = col(0.5 + hist[i] * 0.5, alpha);
+        // Right segment.
+        c.beginPath();
+        c.moveTo(xR0, y0);
+        c.lineTo(xR1, y1);
+        c.stroke();
+        // Left segment (mirror x, same y — the trace is symmetric about cx).
+        c.beginPath();
+        c.moveTo(xL0, y0);
+        c.lineTo(xL1, y1);
+        c.stroke();
+      }
+
+      // ── Pass 2: sharp beam trace (additive, 1 px) ──
+      // This is the actual electron beam — always 1 px, full brightness.
+      c.globalCompositeOperation = 'lighter';
+      c.lineWidth  = 1;
+      c.strokeStyle = col(0.6 + v * 0.4, 0.85);
+
+      c.beginPath();
+      let firstRight = true;
+      for (let i = 0; i < N; i++) {
+        const x = cx + i * step;
+        const y = cy - hist[i] * amp;
+        if (firstRight) { c.moveTo(x, y); firstRight = false; }
+        else c.lineTo(x, y);
+      }
+      c.stroke();
+
+      // Left mirror of the beam trace.
+      c.beginPath();
+      let firstLeft = true;
+      for (let i = 0; i < N; i++) {
+        const x = cx - i * step;
+        const y = cy - hist[i] * amp;
+        if (firstLeft) { c.moveTo(x, y); firstLeft = false; }
+        else c.lineTo(x, y);
+      }
+      c.stroke();
+
+      // ── Pass 3: hot beam head at centre ──
+      // The very newest point (hist[0]) at cx is the brightest point of the
+      // beam — the CRT electron gun at the present moment.
+      const headY = cy - hist[0] * amp;
+      const headR = 2.5 + v * 3;
+      const hgrd  = c.createRadialGradient(cx, headY, 0, cx, headY, headR);
+      hgrd.addColorStop(0, `rgba(255,255,255,${0.4 + v * 0.45})`);
+      hgrd.addColorStop(0.4, col(0.8 + v * 0.2, 0.6));
+      hgrd.addColorStop(1, col(v, 0));
+      c.fillStyle = hgrd;
+      c.beginPath();
+      c.arc(cx, headY, headR, 0, Math.PI * 2);
+      c.fill();
+
+      c.globalCompositeOperation = 'source-over';
+      c.restore();
+    }
+  },
+
+  // ─── D5 · PULSE TRAIN ────────────────────────────────────────────────────
+  // WHY this geometry:
+  // A pulse train is how digital data looks on an oscilloscope — rectangular
+  // pulses whose width and amplitude carry information.  The key insight is
+  // that each packet is BORN at the centre (youngest = index 0 of hist) and
+  // physically travels outward over time.  hist[i] is the level *at the moment
+  // that packet was emitted*, so its width and height directly encode what was
+  // said when the packet left the transmitter.  Packets near centre (young) are
+  // tight, sharp and bright; packets at the edges (old) are wider, dimmer and
+  // dissolve using fade(u) — the textbook behaviour of a transmitted burst.
+  // A faint carrier line at cy keeps the strip alive at v = 0.
+  {
+    id: 'pulsetrain',
+    name: 'D5',
+    title: 'Pulse Train',
+    blurb: 'Discrete data packets burst outward from centre — each one\'s width and brightness record the level at the moment it was born.',
+    draw(c, w, h, v, t, hist) {
+      const cx = w / 2;
+      const cy = h / 2;
+
+      c.save();
+
+      // ── Carrier line — always present, 1 px dim hairline ──
+      c.strokeStyle = col(0.18, 0.22);
+      c.lineWidth   = 1;
+      c.beginPath();
+      c.moveTo(0, cy);
+      c.lineTo(w, cy);
+      c.stroke();
+
+      // ── Packets driven directly from hist[] ──
+      // hist[i] is the smoothed level when that packet was i frames old.
+      // We space them by a fixed "cell" width so the train has a pulse-train
+      // rhythm; within each cell the actual pulse width is birth-level × cell.
+      // The packet at index i lives at distance i * CELL pixels from centre.
+      // CELL is chosen so ~200 packets span the half-width at 1100 px.
+      const CELL    = Math.max(1, cx / 200);   // px per hist slot
+      const maxIdx  = Math.min(hist.length, Math.ceil(cx / CELL));
+
+      c.globalCompositeOperation = 'lighter';
+
+      for (let i = 0; i < maxIdx; i++) {
+        const birthV = hist[i] ?? 0;           // level when this packet was born
+        if (birthV < 0.03) continue;           // silence — no packet to draw
+
+        // Fractional distance from centre (0 = centre, 1 = edge).
+        // fade() and env() both expect 0 at their "hot" end and 1 at their
+        // "zero" end — pass dist directly so the centre is brightest.
+        const dist = i * CELL / cx;            // 0..1
+
+        // fade(dist) → ~1 at centre (i=0, dist=0), 0 at edge — dissolves outward
+        const fadeA = fade(dist);
+        const alpha = birthV * fadeA * (0.6 + v * 0.35);
+        if (alpha < 0.01) continue;
+
+        // Packet width: narrow at birth (new = precise), widens as it ages
+        // (diffusion metaphor).  Clamped so it never exceeds the cell.
+        const ageSpreading = 1 + dist * 1.8;
+        const pulseW = Math.min(CELL * 0.9, birthV * CELL * 2.2 * ageSpreading);
+
+        // Pulse height: tallest at centre for young strong packets.
+        // env(dist) → ~1 at centre, 0 at edge, flat shoulder in between.
+        const envA   = env(dist);
+        const pulseH = Math.max(2, birthV * h * 0.82 * (0.4 + envA * 0.6));
+        const pulseY = cy - pulseH / 2;
+
+        // Brightness: fresh packets at centre are hottest; far ones are dim.
+        const brightness = 0.3 + birthV * 0.7;
+
+        // Draw the packet on BOTH sides (left mirror = -i)
+        for (const side of [1, -1]) {
+          const px = cx + side * (i * CELL + (CELL - pulseW) * 0.5);
+          c.fillStyle = col(brightness, alpha);
+          c.fillRect(px, pulseY, side * pulseW || pulseW, pulseH);
+
+          // Sharp bright top/bottom edges — the rise/fall of a real pulse.
+          // Only for packets close enough to be legible.
+          if (pulseW >= 1.5 && fadeA > 0.25) {
+            c.fillStyle = col(Math.min(1, brightness + 0.25), alpha * 0.8);
+            c.fillRect(px, pulseY, side * pulseW || pulseW, 1.2);
+            c.fillRect(px, pulseY + pulseH - 1.2, side * pulseW || pulseW, 1.2);
+          }
+        }
+      }
+
+      // ── Hot origin node — the transmitter; bright only when sending ──
+      // At v = 0 it collapses to nothing so silence stays quiet.
+      if (v > 0.02) {
+        const nodeR = 1.5 + v * 6;
+        const ngrd  = c.createRadialGradient(cx, cy, 0, cx, cy, nodeR + 6);
+        ngrd.addColorStop(0,   `rgba(255,255,255,${Math.min(0.55, v * 0.7)})`);
+        ngrd.addColorStop(0.4, col(0.85 + v * 0.15, v * 0.65));
+        ngrd.addColorStop(1,   col(v, 0));
+        c.fillStyle = ngrd;
+        c.beginPath();
+        c.arc(cx, cy, nodeR + 6, 0, Math.PI * 2);
+        c.fill();
+      }
+
+      c.globalCompositeOperation = 'source-over';
+      c.restore();
+    }
+  },
+
+
+];
+EXTRA.push(...BATCH);
+})();
+
+// ── e.js ──────────────────────────────────────────
+(function(){
+// Vernier Jaw — five variants. Yash picked the caliper out of the twenty-five:
+// "mast h isse thoda jo lines h wo bold krdo aur thoda aur cyberpunk 2077 type".
+//
+// So every one of these is heavier than the original — the first pass drew at
+// 0.6–1.0 px, which is correct for a real instrument and far too polite on a
+// desktop at arm's length. Base weights here are 1.6–3 px.
+//
+// What "Cyberpunk 2077" is taken to mean, concretely, rather than as a mood:
+//   · hard angular chrome — corner brackets, bracket ticks, nothing rounded
+//   · chromatic aberration — the same figure drawn twice, offset a pixel or two,
+//     additively, so edges fringe and the core goes hot
+//   · scanlines and tears — a CRT that is being driven slightly too hard
+//   · discrete steps over smooth motion — machinery, detents, snapping
+//   · readouts: things that look like they are measuring and reporting
+// The state colour still rules everything; nothing here invents a hue. The
+// aberration is the SAME colour offset from itself, which is what keeps the
+// green/amber/red signal legible while still fringing.
+
+const BATCH = [
+
+{ id:'vernier-heavy', name:'V1', title:'Vernier — Heavy',
+  blurb:'The caliper you picked, drawn with weight: thicker teeth, taller majors, solid jaw faces. Same geometry, no glitch — just legible from across the room.',
+  draw(c,w,h,v,t,hist){
+    const cx=w/2, cy=h*0.52, lv=0.05+v*0.95, JAW=cx*0.88, open=lv*JAW;
+
+    // Fixed outer scale: reads from each edge inward, so the ends always carry
+    // something even in silence.
+    const MAIN=40, sp=JAW/MAIN;
+    for (let i=0;i<=MAIN;i++){
+      const off=i*sp, d=JAW-off, u=d/cx;
+      const maj=i%5===0, th=maj?18:9;
+      c.lineWidth=maj?2.2:1.4;
+      c.strokeStyle=col(0.45, (0.22+0.30*(1-off/JAW))*fade(u)+0.06);
+      for (const x of [cx+d, cx-d]){
+        c.beginPath(); c.moveTo(x, cy-th); c.lineTo(x, cy); c.stroke();
+      }
+    }
+
+    // Moving vernier comb: 39 teeth against the main scale's 40 — that ratio IS
+    // the vernier principle, and it is why the two combs drift in and out of
+    // alignment as the jaw travels.
+    const VN=39, vsp=(sp*MAIN)/VN, lit=Math.min(1,lv*1.15);
+    for (let i=0;i<=VN;i++){
+      const lo=i*vsp;
+      for (const s of [1,-1]){
+        const x=cx+s*(open+lo); if (x<0||x>w) continue;
+        const maj=i%5===0, th=maj?16:8, u=(x-cx)/cx;
+        c.lineWidth=maj?2.4:1.5;
+        c.strokeStyle=col(lit, (maj?0.92:0.55)*lit*fade(u));
+        c.beginPath(); c.moveTo(x, cy); c.lineTo(x, cy+th); c.stroke();
+      }
+    }
+
+    // The jaw faces and the gap between them — the measurement itself.
+    c.lineWidth=2.6; c.strokeStyle=col(lit, 0.30+0.45*lv);
+    c.beginPath(); c.moveTo(0,cy); c.lineTo(cx-open,cy);
+    c.moveTo(cx+open,cy); c.lineTo(w,cy); c.stroke();
+    for (const s of [1,-1]){
+      const x=cx+s*open;
+      c.lineWidth=3; c.strokeStyle=col(lit, 0.55+0.40*lv);
+      c.beginPath(); c.moveTo(x, cy-22); c.lineTo(x, cy+20); c.stroke();
+    }
+    // Origin mark, so the eye knows where this is measured from.
+    c.globalCompositeOperation='lighter';
+    c.lineWidth=1.6; c.strokeStyle=col(lv, 0.25+0.5*lv);
+    c.beginPath(); c.moveTo(cx, cy-26); c.lineTo(cx, cy+24); c.stroke();
+    c.globalCompositeOperation='source-over';
+  }},
+
+{ id:'vernier-glitch', name:'V2', title:'Vernier — Glitch',
+  blurb:'The same caliper through a failing display: the scale is drawn three times a pixel apart so edges fringe, and loud syllables tear horizontal slices out of it.',
+  draw(c,w,h,v,t,hist){
+    const cx=w/2, cy=h*0.52, lv=0.05+v*0.95, JAW=cx*0.88, open=lv*JAW;
+
+    // The whole comb goes in a function so it can be stamped three times at
+    // different offsets. That triple-stamp IS the aberration — one figure, split
+    // from itself, rather than three colours invented for the look.
+    const comb=(dx, a, lw)=>{
+      c.lineWidth=lw;
+      const MAIN=40, sp=JAW/MAIN;
+      for (let i=0;i<=MAIN;i++){
+        const d=JAW-i*sp, u=d/cx, maj=i%5===0;
+        c.strokeStyle=col(0.5, a*(maj?1:0.55)*fade(u));
+        for (const x of [cx+d+dx, cx-d+dx]){
+          c.beginPath(); c.moveTo(x, cy-(maj?18:9)); c.lineTo(x, cy); c.stroke();
+        }
+      }
+      const VN=39, vsp=(sp*MAIN)/VN;
+      for (let i=0;i<=VN;i++){
+        for (const s of [1,-1]){
+          const x=cx+s*(open+i*vsp)+dx; if (x<0||x>w) continue;
+          const maj=i%5===0, u=(x-cx)/cx;
+          c.strokeStyle=col(lv, a*(maj?1:0.6)*lv*fade(u));
+          c.beginPath(); c.moveTo(x, cy); c.lineTo(x, cy+(maj?16:8)); c.stroke();
+        }
+      }
+    };
+
+    c.globalCompositeOperation='lighter';
+    const spread=1.2+2.2*v;            // aberration widens when it is driven hard
+    comb(-spread, 0.30, 2.0);
+    comb( spread, 0.30, 2.0);
+    comb( 0,      0.85, 2.2);
+    c.globalCompositeOperation='source-over';
+
+    // Tears. Deterministic from a quantised clock so they land as discrete
+    // events rather than shimmering every frame — a glitch you can see is a
+    // glitch that happened, not noise.
+    const seed=Math.floor(t*9);
+    const rndFor=n=>{ const s=Math.sin(seed*127.1+n*311.7)*43758.5453; return s-Math.floor(s); };
+    const tears=v>0.45?Math.floor(v*3.5):0;
+    for (let k=0;k<tears;k++){
+      const r=rndFor(k);
+      const y=r*h, hh=2+r*6, shift=(rndFor(k+9)-0.5)*46*v;
+      const slice=c.getImageData(0, Math.max(0,y|0), w, Math.min(h-(y|0), hh|0));
+      c.clearRect(0, y, w, hh);
+      c.putImageData(slice, shift|0, y|0);
+    }
+
+    // Hot core at the origin — the one place white is allowed.
+    const g=c.createRadialGradient(cx,cy,0,cx,cy,10+34*v);
+    g.addColorStop(0,`rgba(255,255,255,${0.10+0.34*v})`);
+    g.addColorStop(0.4, col(1, 0.28*v)); g.addColorStop(1, col(1,0));
+    c.globalCompositeOperation='lighter'; c.fillStyle=g; c.fillRect(0,0,w,h);
+    c.globalCompositeOperation='source-over';
+  }},
+
+{ id:'vernier-hud', name:'V3', title:'Vernier — HUD',
+  blurb:'The caliper mounted in a heads-up display: angular brackets at both ends, a readout frame at the centre that opens with the jaws, and scanlines over the whole thing.',
+  draw(c,w,h,v,t,hist){
+    const cx=w/2, cy=h*0.54, lv=0.05+v*0.95, JAW=cx*0.86, open=lv*JAW;
+
+    // Corner brackets. Nothing is a full rectangle — CP2077 chrome is always an
+    // implied frame, four corners and air in between.
+    const brk=(x,dir)=>{
+      c.lineWidth=2.4; c.strokeStyle=col(0.6, 0.45+0.3*lv);
+      c.beginPath();
+      c.moveTo(x+dir*16, 6); c.lineTo(x, 6); c.lineTo(x, 22);
+      c.moveTo(x+dir*16, h-6); c.lineTo(x, h-6); c.lineTo(x, h-22);
+      c.stroke();
+    };
+    brk(10,1); brk(w-10,-1);
+
+    // The scale, weighted.
+    const MAIN=34, sp=JAW/MAIN;
+    for (let i=0;i<=MAIN;i++){
+      const d=JAW-i*sp, u=d/cx, maj=i%5===0;
+      c.lineWidth=maj?2.2:1.4;
+      c.strokeStyle=col(0.45, (0.18+0.28*(1-i/MAIN))*fade(u)+0.05);
+      for (const x of [cx+d, cx-d]){
+        c.beginPath(); c.moveTo(x, cy-(maj?15:8)); c.lineTo(x, cy); c.stroke();
+      }
+    }
+    const VN=33, vsp=(sp*MAIN)/VN, lit=Math.min(1,lv*1.15);
+    for (let i=0;i<=VN;i++){
+      for (const s of [1,-1]){
+        const x=cx+s*(open+i*vsp); if (x<0||x>w) continue;
+        const maj=i%5===0, u=(x-cx)/cx;
+        c.lineWidth=maj?2.4:1.5;
+        c.strokeStyle=col(lit, (maj?0.9:0.5)*lit*fade(u));
+        c.beginPath(); c.moveTo(x, cy); c.lineTo(x, cy+(maj?14:7)); c.stroke();
+      }
+    }
+
+    // The readout: a bracketed box that IS the measurement, widening with level,
+    // with a block bar inside it standing in for a numeric value.
+    const bw=Math.max(26, open*0.85), bh=15;
+    c.lineWidth=2.2; c.strokeStyle=col(lit, 0.7+0.25*lv);
+    for (const s of [1,-1]){
+      const ex=cx+s*bw;
+      c.beginPath();
+      c.moveTo(ex-s*9, cy-bh); c.lineTo(ex, cy-bh); c.lineTo(ex, cy+bh); c.lineTo(ex-s*9, cy+bh);
+      c.stroke();
+    }
+    const blocks=Math.round(2+lv*13);
+    for (let i=0;i<blocks;i++){
+      const bwid=(bw*2-14)/16;
+      c.fillStyle=col(lit, 0.30+0.55*lv);
+      c.fillRect(cx-bw+7+i*bwid, cy-4.5, Math.max(1.6,bwid-2.2), 9);
+    }
+
+    // Scanlines last, over everything, dark not light — a screen, not a glow.
+    c.fillStyle='rgba(0,0,0,0.20)';
+    for (let y=(t*22)%3; y<h; y+=3) c.fillRect(0, y, w, 1);
+  }},
+
+{ id:'vernier-ratchet', name:'V4', title:'Vernier — Ratchet',
+  blurb:'The jaws no longer glide, they click. Level is quantised into detents, so the scale advances in hard steps and a block of teeth locks solid behind it.',
+  draw(c,w,h,v,t,hist){
+    const cx=w/2, cy=h*0.54, DET=16;                 // sixteen detents per side
+    // Quantising the level is the whole idea: machinery does not interpolate.
+    const step=Math.round((0.04+v*0.96)*DET)/DET;
+    const JAW=cx*0.9, open=step*JAW, sp=JAW/DET;
+
+    // The track the jaw runs in — always present, so silence is a machine at
+    // rest rather than an empty strip.
+    c.lineWidth=2; c.strokeStyle=col(0.3, 0.16);
+    c.beginPath(); c.moveTo(8,cy); c.lineTo(w-8,cy); c.stroke();
+
+    for (let i=0;i<=DET;i++){
+      const d=i*sp, u=d/cx, engaged=d<=open+0.5;
+      for (const s of [1,-1]){
+        const x=cx+s*d; if (x<4||x>w-4) continue;
+        // Engaged detents are solid blocks; the ones ahead of the jaw are just
+        // the empty notches waiting for it.
+        if (engaged){
+          const bh=9+13*fade(u)*step;
+          c.fillStyle=col(step, (0.42+0.5*step)*fade(u));
+          c.fillRect(x-3, cy-bh, 6, bh*2);
+          c.fillStyle=col(1, 0.5*step*fade(u));
+          c.fillRect(x-3, cy-1.5, 6, 3);
+        } else {
+          c.lineWidth=1.8; c.strokeStyle=col(0.3, 0.20*fade(u));
+          c.beginPath(); c.moveTo(x, cy-8); c.lineTo(x, cy+8); c.stroke();
+        }
+      }
+    }
+
+    // The pawl: a hard bracket sitting exactly on the last engaged detent.
+    for (const s of [1,-1]){
+      const x=cx+s*open;
+      c.lineWidth=3; c.strokeStyle=col(1, 0.75+0.25*step);
+      c.beginPath();
+      c.moveTo(x-s*7, cy-24); c.lineTo(x, cy-24); c.lineTo(x, cy+24); c.lineTo(x-s*7, cy+24);
+      c.stroke();
+    }
+    c.globalCompositeOperation='lighter';
+    const g=c.createRadialGradient(cx,cy,0,cx,cy,12+30*step);
+    g.addColorStop(0, col(1, 0.34*step)); g.addColorStop(1, col(1,0));
+    c.fillStyle=g; c.fillRect(0,0,w,h);
+    c.globalCompositeOperation='source-over';
+  }},
+
+{ id:'vernier-netrunner', name:'V5', title:'Vernier — Netrunner',
+  blurb:'The scale turned into a data ladder: every tooth is one sample of what you just said, and a bright scan head rides each jaw face outward leaving a decaying trail.',
+  draw(c,w,h,v,t,hist){
+    const cx=w/2, cy=h*0.56, lv=0.05+v*0.95, JAW=cx*0.9, open=lv*JAW;
+    const N=54, sp=JAW/N;
+
+    // Baseline rail, always lit — a bus with nothing on it still has a bus.
+    c.lineWidth=1.8; c.strokeStyle=col(0.35, 0.18);
+    c.beginPath(); c.moveTo(6,cy); c.lineTo(w-6,cy); c.stroke();
+
+    // Tooth i carries hist[i]: distance from the centre is age, so the ladder is
+    // a readable record of the last couple of seconds rather than decoration.
+    for (let i=0;i<=N;i++){
+      const d=i*sp, u=d/cx, s0=hist[i*2]||0;
+      const past=d<=open;
+      const th=3+ s0*24*fade(u);
+      for (const s of [1,-1]){
+        const x=cx+s*d; if (x<3||x>w-3) continue;
+        c.fillStyle=col(s0, (past?0.85:0.22)*(0.25+0.75*fade(u)));
+        c.fillRect(x-1.6, cy-th, 3.2, th);
+        // Every eighth tooth gets a foot, so the ladder has rhythm and you can
+        // count along it instead of reading a blur.
+        if (i%8===0){
+          c.fillStyle=col(s0, (past?0.6:0.18)*fade(u));
+          c.fillRect(x-1.6, cy+2, 3.2, 6);
+        }
+      }
+    }
+
+    // Scan heads on the jaw faces, with a short decaying trail behind each.
+    c.globalCompositeOperation='lighter';
+    for (const s of [1,-1]){
+      for (let k=0;k<7;k++){
+        const x=cx+s*(open - k*sp*1.6); if (x<0||x>w) continue;
+        const a=(1-k/7)**2 * (0.20+0.75*lv);
+        c.fillStyle=col(1, a*0.55);
+        c.fillRect(x-2, cy-26, 4, 52);
+      }
+      const x=cx+s*open;
+      const g=c.createLinearGradient(x-14,0,x+14,0);
+      g.addColorStop(0, col(1,0)); g.addColorStop(.5, `rgba(255,255,255,${0.16+0.30*lv})`); g.addColorStop(1, col(1,0));
+      c.fillStyle=g; c.fillRect(x-14, cy-28, 28, 56);
+    }
+    c.globalCompositeOperation='source-over';
+  }},
+
+];
+EXTRA.push(...BATCH);
+})();
+
+// ══════════════════════════════════════════════════════════ page
+// Current sits LAST so the new ideas are what you see first; everything else is
+// numbered 01.. in order, because "the third one" has to mean something when he
+// comes back and tells me which one won.
+const CURRENT = OPTIONS.pop();
+// Batches first, hand-written core after. The batch directory is read in name
+// order, so a file prefixed `0-` puts the newest round at the top of the page —
+// which is where the thing currently being decided belongs. Numbering is
+// generated, so it renumbers cleanly every build.
+const ALL = [...EXTRA, ...OPTIONS].map((o,i)=>({ ...o, name:String(i+1).padStart(2,'0') }));
+ALL.push({ ...CURRENT, name:'NOW' });
+
+const list = document.getElementById('list');
+const panels = ALL.map(o=>{
+  const el = document.createElement('div');
+  el.className = 'opt'; el.dataset.id = o.id;
+  el.innerHTML = `<header><span class="n">${o.name}</span><h2>${o.title}</h2><p>${o.blurb}</p></header>
+                  <div class="stage"><canvas></canvas></div>`;
+  list.appendChild(el);
+  const cv = el.querySelector('canvas');
+  return { o, cv, c: cv.getContext('2d'), el };
+});
+function size(){
+  const dpr = window.devicePixelRatio || 1;
+  panels.forEach(p=>{
+    const r = p.cv.getBoundingClientRect();
+    p.cv.width = Math.max(1, r.width*dpr); p.cv.height = Math.max(1, r.height*dpr);
+    p.c.setTransform(dpr,0,0,dpr,0,0);
+  });
+}
+addEventListener('resize', size); size();
+
+// Twenty-five canvases at 60 fps is more work than it is worth when you can see
+// four of them. rootMargin keeps the next screenful warm so nothing pops in
+// mid-animation as you scroll.
+const io = new IntersectionObserver(es=>es.forEach(e=>{
+  const p = panels.find(x=>x.el === e.target);
+  if (p) p.seen = e.isIntersecting;
+}), { rootMargin:'300px 0px' });
+panels.forEach(p=>io.observe(p.el));
+
+// hist[0] is the newest sample; index is age, which is also distance from the
+// centre for the outward designs.
+const hist = new Array(400).fill(0);
+// `last` is seeded on the FIRST FRAME, not at parse time. requestAnimationFrame
+// hands back the timestamp of the frame that was already in flight, which can
+// be EARLIER than a performance.now() taken while this script was still
+// parsing — and the bigger the script, the further behind it is. At 31 designs
+// that gap reached -33 ms, which made dt negative, which flipped the sign of
+// the smoothing coefficient, which drove the level to -1.05 and killed the
+// animation loop on frame one. Clamping dt at zero is the belt to that brace.
+let running = true, last = null, clock = 0, cycling = false, nextCycle = 0, ci = 0;
+
+function frame(now){
+  const sec = now/1000;
+  if (last === null) last = sec;
+  const dt = Math.min(0.05, Math.max(0, sec - last)); last = sec;
+  if (running){
+    clock += dt;
+    hist.unshift(envelope(clock, dt)); hist.pop();
+    if (cycling && clock > nextCycle){
+      ci = (ci+1) % ORDER.length; setState(ORDER[ci]); nextCycle = clock + 1.6;
+      document.querySelectorAll('[data-state]').forEach(x=>x.classList.toggle('on', x.dataset.state===ORDER[ci]));
+    }
+  }
+  tickColour(now);
+  const v = hist[0];
+  const dpr = window.devicePixelRatio || 1;
+  panels.forEach(p=>{
+    if (!p.seen) return;                   // offscreen panels cost nothing
+    const w = p.cv.width/dpr, h = p.cv.height/dpr;
+    p.c.clearRect(0,0,w,h);
+    // One bad design must not take the page down with it — twenty-five of
+    // these were written in parallel and a single thrown error inside the loop
+    // would blank every panel after it.
+    try { p.o.draw(p.c, w, h, v, clock, hist); }
+    catch (e){
+      if (!p.broke){ p.broke = true; console.error(p.o.id, e);
+        p.el.querySelector('h2').textContent += ' — broken'; }
+    }
+    // A design that forgot to put these back would poison its neighbours.
+    p.c.globalCompositeOperation = 'source-over';
+    p.c.globalAlpha = 1;
+    p.c.setTransform(dpr,0,0,dpr,0,0);
+  });
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+document.querySelectorAll('[data-state]').forEach(b=>b.onclick=()=>{
+  cycling = false; document.getElementById('cycle').classList.remove('on');
+  setState(b.dataset.state);
+  document.querySelectorAll('[data-state]').forEach(x=>x.classList.toggle('on', x===b));
+});
+const cb = document.getElementById('cycle');
+cb.onclick = ()=>{ cycling = !cycling; cb.classList.toggle('on', cycling); nextCycle = clock; };
+const qb = document.getElementById('quiet');
+qb.onclick = ()=>{ muted = !muted; qb.classList.toggle('on', muted);
+                   qb.textContent = muted ? 'Silenced' : 'Silence'; };
+const pb = document.getElementById('pause');
+pb.onclick = ()=>{ running = !running; pb.classList.toggle('on', !running);
+                   // null, not performance.now() — same trap: the next rAF
+                   // timestamp can predate a clock read taken here.
+                   pb.textContent = running ? 'Pause' : 'Paused'; last = null; };
+</script></body></html>
