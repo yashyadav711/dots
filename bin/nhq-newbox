@@ -151,7 +151,16 @@ preflight() {
     sudo -n true 2>/dev/null && ok "sudo available" \
       || warn "no sudo cached — root-only checks will be skipped (run 'sudo -v' first for the full picture)"
   else
-    sudo -v || die "need sudo"
+    # `sudo -n true` FIRST: with NOPASSWD in sudoers, `sudo -v` still wants a
+    # tty and fails over a non-interactive ssh command, which would abort a
+    # perfectly capable run. Fall back to -v only when -n genuinely cannot.
+    if sudo -n true 2>/dev/null; then
+      ok "sudo available without a password"
+    elif sudo -v; then
+      ok "sudo authenticated"
+    else
+      die "need sudo (no tty for a prompt? set up 'nhq-newbox nopasswd' or run with ssh -t)"
+    fi
     # run() appends to $LOG from the UNPRIVILEGED parent shell — the redirect
     # is set up before sudo/exec, even for `run sudo …` — so root:644 here
     # would make every single `run` call fail to even open its own log, and a
