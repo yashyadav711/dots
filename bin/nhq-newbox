@@ -1024,8 +1024,15 @@ stage_nopasswd() {
   warn "appropriate for a single-user LAN box you administer remotely; wrong for anything shared."
 
   # The drop-in is worthless if the main file does not include the directory.
-  if ! sudo grep -qE '^[@#]includedir /etc/sudoers.d' /etc/sudoers; then
-    die "/etc/sudoers has no includedir for /etc/sudoers.d — a drop-in would be silently ignored"
+  # Reading /etc/sudoers needs root, so a dry run reports instead of demanding it.
+  if sudo -n true 2>/dev/null; then
+    sudo -n grep -qE '^[@#]includedir /etc/sudoers.d' /etc/sudoers \
+      || die "/etc/sudoers has no includedir for /etc/sudoers.d — a drop-in would be silently ignored"
+    ok "/etc/sudoers honours drop-ins"
+  elif (( DRY )); then
+    warn "cannot read /etc/sudoers without root — the real run verifies the includedir first"
+  else
+    die "need sudo to verify /etc/sudoers includes the drop-in dir"
   fi
 
   # 99- prefix, deliberately. sudoers applies LAST MATCH WINS, and CachyOS's
