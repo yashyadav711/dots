@@ -24,7 +24,7 @@ threads         = 4             # inference threads
 # The source comes from dots/pipewire/99-input-denoising.conf, which had been
 # sitting symlinked as `.disabled` since hyprvoice was retired. Set to "" to go
 # back to the raw hardware mic.
-source         = "rnnoise_source"
+source         = ""
 max_record_sec = 300            # hard stop so a forgotten session cannot run forever
 min_record_sec = 0.35           # shorter than this is treated as a misfire
 
@@ -128,7 +128,16 @@ polish             = true
 polish_min_chars   = 0
 polish_model       = "gemini-3-flash"
 polish_url         = "http://127.0.0.1:51200/v1/chat/completions"
-# 25 -> 12. Measured median is 3-4 s, so twelve is already four times the
-# normal cost; past that the rotator is having a bad day and the raw transcript
-# is a better answer than a longer wait.
-polish_timeout_sec = 12.0
+# Back to 25 after briefly being 12. A timeout does not save time, it delivers
+# the RAW transcript — the exact thing he objected to — and the rotator's own
+# floor is not stable: measured 2026-08-13, a trivial "reply OK" round trip ran
+# 2.4 s in the morning and 9-14 s in the afternoon, with one polish call taking
+# 48 s. Waiting is the lesser harm.
+polish_timeout_sec = 25.0
+
+# Keep the last N dictations (wav + raw decode) in ~/.local/share/vox/samples,
+# so the transcription can be tuned against Yash's own voice rather than against
+# Common Voice clips — which decode perfectly at every setting and therefore
+# tell us nothing. Correct the `truth` field of any sample that came out wrong;
+# a wrong sample is worth more than a right one. 0 turns it off.
+keep_samples       = 20

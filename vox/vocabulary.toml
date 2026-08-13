@@ -120,3 +120,14 @@ anthropic                = "Anthropic"
 "notebook lm"      = "NotebookLM"
 "front ear"        = "frontier"
 colibri            = "Colibri"
+
+# ── keybinds and keys ─────────────────────────────────────────────────────────
+# Said out loud constantly and destroyed by both passes. Measured 2026-08-13:
+# whisper writes "alt alt", and the polish model then reads that as a
+# transcription error and "corrects" it to "alag alag" — which reverses the
+# meaning of the sentence. Naming them here fixes the spelling AND puts them in
+# front of the polish model as real words it must not touch.
+"alt alt"       = "Alt+Alt"
+"alt alt se"    = "Alt+Alt se"
+"ctrl ctrl"     = "Ctrl+Ctrl"
+"double tap alt" = "Alt+Alt"

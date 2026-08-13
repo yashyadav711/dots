@@ -57,15 +57,18 @@ link yazi/package.toml                  "$HOME/.config/yazi/package.toml"  # the
 # new machine. Untracked until 2026-08-13, which meant 1373 lines of voxd.py —
 # and weeks of measured tuning written into its comments — existed on exactly
 # one laptop.
-# The denoised mic. The HP Envy 13's internal mic sits by the fan, and on
-# 2026-08-13 an hour of whisper benchmarking raised the room floor enough that
-# dictation stopped working entirely — every session ended "abort: no speech".
-# Through rnnoise the same room measures a ~150x quieter floor. Needs
-# `noise-suppression-for-voice` for librnnoise_ladspa.so, and the gain unit
-# below, because rnnoise strips the room but does not amplify.
-mkdir -p "$HOME/.config/pipewire/pipewire.conf.d" "$HOME/.config/systemd/user"
-link pipewire/99-input-denoising.conf   "$HOME/.config/pipewire/pipewire.conf.d/99-input-denoising.conf"
-link vox/vox-mic-gain.service           "$HOME/.config/systemd/user/vox-mic-gain.service"
+# NO DENOISER. An rnnoise filter-chain and a gain unit sat here for one day —
+# 2026-08-13 — because an hour of whisper benchmarking spun the fan up and the
+# room floor rose until every session ended "abort: no speech". rnnoise fixed
+# that number and broke the thing the number was for: at 10 cm and normal speed
+# the transcript came back mangled, and only slowed-down, one-word-a-second
+# speech got through. Yash: "you should remove it entirely. It is interfering
+# with the mic."
+#
+# Measured after removal: the raw mic idles at -58.7 dBFS and steady, against
+# the rnnoise chain's bursty -42 with the fan running. It was never the room
+# that needed fixing; it was a laptop I had made hot.
+mkdir -p "$HOME/.config/systemd/user"
 
 mkdir -p "$HOME/.local/share/vox" "$HOME/.config/vox"
 link vox/voxd.py                        "$HOME/.local/share/vox/voxd.py"

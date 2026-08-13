@@ -42,6 +42,7 @@ from pathlib import Path
 HOME = Path.home()
 STATE_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "vox"
 SHARE_DIR = HOME / ".local/share/vox"
+SAMPLES_DIR = SHARE_DIR / "samples"
 CONFIG_PATH = HOME / ".config/vox/config.toml"
 VOCAB_PATH = HOME / ".config/vox/vocabulary.toml"
 SOCKET_PATH = STATE_DIR / "vox.sock"
@@ -126,10 +127,14 @@ DEFAULTS: dict = {
     "vad_threshold": 0.4,
     # Second pass — see class Polish for the measurements behind these numbers.
     "polish": True,
-    "polish_min_chars": 220,
+    "polish_min_chars": 0,
     "polish_model": "gemini-3-flash",
     "polish_url": "http://127.0.0.1:51200/v1/chat/completions",
     "polish_timeout_sec": 25.0,
+    # Keep the last N dictations as wav + raw decode, so the settings can be
+    # tuned against his own voice instead of Common Voice clips. See
+    # Vox._keep_sample.
+    "keep_samples": 20,
     "modifier_english": "Ctrl",
 }
 
@@ -155,6 +160,11 @@ class Vocabulary:
 
     def __init__(self, path: Path = VOCAB_PATH):
         self.rules: list[tuple[object, str]] = []
+        # The RIGHT spellings, handed to the polish pass so it stops "correcting"
+        # them back. Measured 2026-08-13: polish turned "alt alt" — the keybind —
+        # into "alag alag", which destroys the sentence. It cannot know these are
+        # real words unless it is told.
+        self.terms: list[str] = []
         if not path.exists():
             return
         try:
@@ -190,6 +200,7 @@ class Vocabulary:
             pattern = (r"\b" + r"[\s,.;:!?\-\u2013\u2014]+".join(
                 re.escape(w) for w in src.split()) + r"\b")
             self.rules.append((re.compile(pattern, re.IGNORECASE), str(dst)))
+            self.terms.append(str(dst))
         log(f"vocabulary: {len(self.rules)} fixes")
 
     def apply(self, text: str) -> str:
@@ -362,6 +373,37 @@ FORMAT — make it presentable Markdown:
 
 Return only the formatted text, nothing else."""
 
+# Appended when the line contains one of his terms. Two failures on 2026-08-13,
+# both from the model treating an unfamiliar real word as a transcription error
+# and "fixing" it:
+#
+#   "alt alt" (the keybind) -> "alag alag", which reverses the sentence
+#   a garbled clip -> "main toh kehta hoon" on one run and "main toh atka hoon"
+#   on the next: two confident, different inventions from the same input
+#
+# NAMING HIS WORDS FIXES THE FIRST. It does not fix the second, and the second
+# rule below is kept only because it costs nothing. Measured, three runs each,
+# on a line whose middle is genuinely unintelligible:
+#
+#     gemini-3-flash        kept the garbled phrase 0/3
+#     gemini-3.5-flash      0/3
+#     gemini-3.6-flash-low  0/3
+#
+# None of them will leave a mangled phrase alone; they are trained to produce
+# fluent text and they do, every time, differently. So this cannot be solved in
+# the prompt. The only real defence is not handing it garbage — which is why
+# the microphone chain matters more than any of these words do.
+POLISH_TERMS = """
+
+HIS WORDS — these are spelled correctly already. Never "correct" them:
+{terms}
+Keyboard and tool names stay literal: "alt alt" means the Alt key twice, not
+"alag alag".
+
+WHEN YOU CANNOT TELL: if a phrase is too garbled to be sure what he said, leave
+it exactly as it is. A visibly wrong word is honest; a fluent sentence he never
+said is not, and he cannot tell the difference by reading it."""
+
 
 class Polish:
     """Second pass: hand the transcript to a small model to punctuate and paragraph it.
@@ -389,7 +431,7 @@ class Polish:
     cleanup step that is, by definition, optional.
     """
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, terms: list[str] | None = None):
         self.enabled = bool(cfg.get("polish", True))
         # No polish_min_sec fallback. Nothing reads it any more, and the
         # selftest is right to fail a cfg.get for a key with no default — a
@@ -397,7 +439,31 @@ class Polish:
         self.min_chars = int(cfg.get("polish_min_chars", 0))
         self.model = str(cfg.get("polish_model", "gemini-3-flash"))
         self.url = str(cfg.get("polish_url", "http://127.0.0.1:51200/v1/chat/completions"))
-        self.timeout = float(cfg.get("polish_timeout_sec", 12.0))
+        self.timeout = float(cfg.get("polish_timeout_sec", 25.0))
+        # Only the terms a language model would plausibly "correct": proper
+        # nouns and anything with a symbol in it, like Alt+Alt. The vocabulary
+        # is mostly ordinary spelling fixes — "achchha" -> "accha" — which the
+        # model neither needs nor benefits from being told about.
+        #
+        # Sorted so the prompt is byte-identical between restarts; a prompt that
+        # changes shape every boot makes a regression impossible to bisect.
+        self.risky = sorted(
+            {t for t in (terms or [])
+             if t.strip() and (any(c.isupper() for c in t) or
+                               any(not c.isalnum() and not c.isspace() for c in t))})
+
+    def _system_for(self, text: str) -> str:
+        """The prompt, naming only the protected terms actually in this line.
+
+        Handing over the whole list took the system prompt to 2 KB and the round
+        trip from 3-4 s to 7-9 s — on the very thing Yash had already called too
+        slow — and the first request after it simply timed out. Naming the two
+        or three terms present instead costs a few dozen bytes and protects
+        exactly the words at risk in this sentence.
+        """
+        low = text.lower()
+        here = [t for t in self.risky if t.lower() in low]
+        return POLISH_SYSTEM + (POLISH_TERMS.format(terms=", ".join(here)) if here else "")
 
     def wanted(self, text: str) -> bool:
         """Should the second pass run? By default: yes, on everything.
@@ -429,7 +495,7 @@ class Polish:
         import urllib.request  # noqa: PLC0415
         body = json.dumps({
             "model": self.model,
-            "messages": [{"role": "system", "content": POLISH_SYSTEM},
+            "messages": [{"role": "system", "content": self._system_for(text)},
                          {"role": "user", "content": text}],
             "stream": False,
         }).encode()
@@ -1059,7 +1125,7 @@ class Vox:
         self.desktop = Desktop(cfg)
         self.overlay = OverlayProc(bool(cfg["overlay"]))
         self.vocab = Vocabulary()
-        self.polish = Polish(self.cfg)
+        self.polish = Polish(self.cfg, self.vocab.terms)
         self.vad = SpeechDetector(cfg)
         # Both engines stay available; each gesture picks one. Neither loads a
         # model until it is actually used, and both unload on the idle timer.
@@ -1399,6 +1465,49 @@ class Vox:
         self.overlay.send(phase="transcribing")
         threading.Thread(target=self._finish, args=(elapsed,), name="stt", daemon=True).start()
 
+    def _keep_sample(self, samples, text: str) -> None:
+        """Keep the audio and the raw decode of the last 20 dictations.
+
+        WHY THIS EXISTS: on 2026-08-13 Yash asked for the transcription to be
+        tuned against "the available samples of my voice", and there were none —
+        the recorder built for it had never been run, so this directory was
+        empty and every decision all day had been taken against four Common
+        Voice clips and a JFK speech. Those decode perfectly at every setting,
+        which is exactly why they could tell us nothing: sweeping beam size
+        1/2/5/8 across them moved the word error rate not at all, while his own
+        dictation was coming back mangled. Tuning without his voice was tuning
+        in the dark, and it had been all day.
+
+        "jo alt alt se bola jaye uski latest 20 files saved honi chaiye taki apn
+        cheeze catch aur improve kr paye" — so the corpus builds itself out of
+        ordinary use. The wav is exactly what the engine saw: post-trim, 16 kHz,
+        mono, so a replay is a true replay. The raw decode sits beside it in
+        samples.jsonl with `truth: null`, which is the field to correct when one
+        comes out wrong — a wrong sample is worth more than a right one.
+
+        Written AFTER the text has gone out, so it cannot cost him latency, and
+        wrapped, so a full disk loses a sample rather than a dictation. A 20 s
+        clip is 640 KB; twenty of them, 13 MB. keep_samples = 0 turns it off.
+        """
+        keep = int(self.cfg.get("keep_samples", 20))
+        if keep <= 0:
+            return
+        try:
+            import numpy as np  # noqa: PLC0415
+            SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+            path = SAMPLES_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}.wav"
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(SAMPLE_RATE)
+                w.writeframes((np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes())
+            with (SAMPLES_DIR / "samples.jsonl").open("a") as f:
+                f.write(json.dumps({"wav": path.name, "raw": text, "truth": None}) + "\n")
+            for stale in sorted(SAMPLES_DIR.glob("*.wav"))[:-keep]:
+                stale.unlink(missing_ok=True)
+        except Exception as exc:                       # never break a dictation
+            log(f"sample keep failed ({exc})")
+
     def _finish(self, elapsed: float) -> None:
         try:
             if elapsed < float(self.cfg["min_record_sec"]):
@@ -1427,6 +1536,7 @@ class Vox:
             took = time.time() - t0
             log(f"decoded {audio_s:.1f}s in {took:.2f}s "
                 f"(rtf {took / max(audio_s, .01):.2f}): {text!r}")
+            self._keep_sample(samples, text)
 
             if not text:
                 log(f"empty result for {audio_s:.1f}s of audio "
