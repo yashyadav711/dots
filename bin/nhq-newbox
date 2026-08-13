@@ -983,7 +983,9 @@ verify_share() {
   if command -v tailscale >/dev/null; then
     tailscale status &>/dev/null && ok "tailscale up: $(tailscale ip -4 2>/dev/null | head -1)" || warn "tailscale installed but not logged in (sudo tailscale up --ssh)"
   fi
-  local remote_share; remote_share=$( mountpoint -q /mnt/hdd 2>/dev/null && echo /mnt/hdd/share || echo "\$HOME/share" )
+  # Print the RESOLVED path — a copy-pasteable fstab line cannot contain $HOME,
+  # since it is the remote server's home, not the client's.
+  local remote_share; remote_share=$( mountpoint -q /mnt/hdd 2>/dev/null && echo /mnt/hdd/share || echo "$HOME/share" )
   say "  ${C_D}laptop-side fstab line for the fast path (automount = no hang when this box dies):${C_0}"
   say "  ${C_D}  $(hostname).local:${remote_share} /mnt/box nfs noauto,x-systemd.automount,x-systemd.idle-timeout=60,soft,timeo=100,retrans=3,_netdev 0 0${C_0}"
 }
