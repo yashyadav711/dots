@@ -373,6 +373,11 @@ PAGE = r"""<!doctype html>
   .note-in { min-height:52px; margin-top:12px; }
   .f .note { display:block; color:var(--teal); font-size:12.5px; margin-top:3px;
              white-space:normal; }
+  /* Same chips as the prompt panel, at half the weight — here they are an
+     afterthought to an upload, not the main event. */
+  .who.small { margin-top:10px; }
+  .who.small button { padding:8px 6px; font-size:13px; }
+  .who.small .st { font-size:10px; }
 </style></head><body><div class="wrap">
   <h1>NHQ Inbox</h1>
   <p class="sub">Shared folder with the laptop: <code>~/Github/nhq-local-downloads</code></p>
@@ -383,6 +388,10 @@ PAGE = r"""<!doctype html>
        zone is just clutter, and the note only means anything with a file. -->
   <textarea id="note" class="note-in" hidden
             placeholder="Say what this is (optional) — saved next to the file"></textarea>
+  <!-- Optional: hand the file to an agent as well as dropping it in the folder.
+       Tap the chosen one again to unpick it — the folder is still the default,
+       and most uploads are just files. -->
+  <div id="to" class="who small" hidden></div>
   <div class="row">
     <button id="send" disabled>Send</button>
     <button id="cam" class="ghost">Camera</button>
@@ -429,6 +438,10 @@ const drop=$('drop'), pick=$('pick'), send=$('send'), cam=$('cam'), camin=$('cam
       bar=$('bar'), fill=bar.firstElementChild, log=$('log'), recent=$('recent'),
       txt=$('txt'), tsend=$('tsend'), tpull=$('tpull'), tlog=$('tlog'), count=$('count');
 let queue=[];
+// Who this UPLOAD goes to, separate from the prompt panel's `target`. Null is
+// the normal case: the file lands in the folder and nobody is interrupted.
+const to=$('to');
+let upTo=null;
 
 const kb=n=>n<1024?n+' B':n<1048576?(n/1024).toFixed(0)+' KB':n<1073741824?(n/1048576).toFixed(1)+' MB':(n/1073741824).toFixed(2)+' GB';
 const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -464,6 +477,19 @@ async function whoList(){
     lockbox.hidden = !locked;
     plock.textContent = locked ? 'locked' : '';
     ready(j.agents);
+    // The same roster, reused for "hand this upload to someone". Unset by
+    // default and toggled off by tapping the picked one again: the folder is
+    // the normal destination, and most uploads want nobody woken up.
+    to.innerHTML=j.agents.map(a=>
+      `<button data-k="${a.key}" class="${a.session?'live':''}${a.key===upTo?' on':''}">
+         <span class="dot"></span>${esc(a.label)}
+         <span class="st">${a.session?'live':'offline'}</span>
+       </button>`).join('');
+    // show() as well as whoList(): the chip highlight says which one is picked,
+    // but the SEND button is what he is about to press, and it should say where
+    // the file is going before he presses it.
+    [...to.children].forEach(b=>b.onclick=()=>{
+      upTo = (upTo===b.dataset.k) ? null : b.dataset.k; whoList(); show(); });
   }catch(e){}
 }
 
@@ -503,7 +529,10 @@ function show(){
   log.innerHTML=queue.map(f=>`<div class="f"><div class="meta"><span class="nm">${esc(f.name)}</span><span class="sz">${kb(f.size)}</span></div></div>`).join('');
   send.disabled=!queue.length;
   note.hidden=!queue.length;
-  send.textContent=queue.length?`Send ${queue.length} file${queue.length>1?'s':''}`:'Send';
+  to.hidden=!queue.length;
+  send.textContent=queue.length
+    ? `Send ${queue.length} file${queue.length>1?'s':''}${upTo?' → '+upTo:''}`
+    : 'Send';
 }
 const add=fs=>{ queue=queue.concat([...fs]); show(); };
 
@@ -519,12 +548,22 @@ send.onclick=()=>{
   if(!queue.length) return;
   const fd=new FormData(); queue.forEach(f=>fd.append('files',f,f.name));
   if(note.value.trim()) fd.append('note', note.value.trim());
+  if(upTo) fd.append('to', upTo);
+  if(key) fd.append('k', key);
   const xhr=new XMLHttpRequest(); xhr.open('POST','/upload');
   bar.style.display='block'; send.disabled=true;
   xhr.upload.onprogress=e=>{ if(e.lengthComputable) fill.style.width=(e.loaded/e.total*100)+'%'; };
   xhr.onload=()=>{ bar.style.display='none'; fill.style.width='0';
-    log.innerHTML='<div class="f"><span class="ok">Sent</span></div>';
-    queue=[]; note.value=''; note.hidden=true;
+    let msg='Sent';
+    try{ const j=JSON.parse(xhr.responseText);
+         // Say plainly whether the agent got it. A file that saved but was
+         // never handed over, reported as a plain "Sent", is the kind of thing
+         // you only discover when nothing happens for an hour.
+         if(j.handoff) msg = j.handoff.ok ? ('Sent → '+esc(j.handoff.session))
+                                          : ('Saved, but '+esc(j.handoff.error||'not delivered'));
+    }catch(e){}
+    log.innerHTML='<div class="f"><span class="ok">'+msg+'</span></div>';
+    queue=[]; note.value=''; note.hidden=true; to.hidden=true; upTo=null;
     send.disabled=true; send.textContent='Send'; pick.value=''; camin.value=''; list(); };
   xhr.onerror=()=>{ bar.style.display='none'; log.innerHTML='<div class="f"><span>Upload failed — retry</span></div>'; send.disabled=false; };
   xhr.send(fd);
@@ -756,7 +795,43 @@ def serve() -> None:
                 (DEST / f"{name}.note.md").write_text(body + "\n")
             print(f"[{datetime.now():%H:%M:%S}] note ({len(note)} chars) on "
                   f"{len(saved)} file(s)", flush=True)
-        return JSONResponse({"saved": saved, "note": bool(note)})
+
+        # Optionally hand it straight to an agent instead of leaving it to be
+        # found. The message carries ABSOLUTE paths, because the agent's working
+        # directory is its own repo and a bare filename would mean nothing
+        # there — and the note, because "look at this screenshot" without the
+        # sentence that goes with it is the problem this whole feature exists
+        # to solve.
+        #
+        # Same key as /prompt, for the same reason: this reaches something that
+        # runs commands. Files still land in the folder either way, so a refused
+        # handoff loses the notification and not the upload.
+        handoff = None
+        want = str(form.get("to") or "")
+        if want:
+            if want not in {k for k, _ in AGENTS}:
+                handoff = {"ok": False, "error": "unknown agent"}
+            elif not open_mode() and not secrets.compare_digest(
+                    str(form.get("k") or ""), token()):
+                handoff = {"ok": False, "error": "locked — scan the QR on the laptop"}
+            else:
+                # ONE LINE, no newlines anywhere in it. nhq-tell types the
+                # message with `tmux send-keys -l`, and a literal newline in
+                # there arrives as Enter — which submits the prompt half-typed
+                # and scatters the rest across the next turns. Caught in
+                # testing 2026-08-13; a multi-line message looked fine in the
+                # pane and would have broken a real session.
+                paths = " ".join(str(DEST / n) for n in saved)
+                body = f"From the NHQ inbox — {len(saved)} file(s): {paths}"
+                if note:
+                    body += f" — {note}"
+                body = " ".join(body.split())
+                ok, detail = agent_send(want, body)
+                handoff = ({"ok": True, "session": agent_where(want)} if ok
+                           else {"ok": False, "error": detail})
+            print(f"[{datetime.now():%H:%M:%S}] handoff -> {want}: "
+                  f"{'ok' if handoff.get('ok') else handoff.get('error')}", flush=True)
+        return JSONResponse({"saved": saved, "note": bool(note), "handoff": handoff})
 
     p = int(os.environ.get("NHQ_INBOX_PORT") or port() or port(claim=True) or "3900")
     print(f"nhq-inbox -> http://{lan_ip()}:{p}  (sharing {DEST})", flush=True)
