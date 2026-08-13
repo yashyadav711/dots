@@ -25,6 +25,10 @@
 #   share    NFS export, Syncthing, Tailscale, mDNS
 #   power    journald caps, snapper retention, grub-btrfs, WoL, hibernate wiring
 #
+# Opt-in stages (NOT run by `all` — each is a deliberate decision):
+#   nopasswd  persistent passwordless sudo for the current user
+#   ups       nut setup, once a UPS actually exists
+#
 # Deliberately NOT done here: key-based SSH (Yash wants password auth first),
 # UPS/nut (no UPS yet — `nhq-newbox power` prints the exact steps for when there
 # is one), HyDE/Hyprland (this box is headless; add it later if he sits at it),
@@ -68,10 +72,17 @@ wr() {
     printf '  %s[dry] write %s (%s lines)%s\n' "$C_D" "$dest" "$(wc -l <"$tmp")" "$C_0"
     rm -f "$tmp"; return 0
   fi
-  if [[ -e $dest ]] && ! cmp -s "$tmp" "$dest"; then
-    [[ -e $dest.nhq.bak ]] || cp -a "$dest" "$dest.nhq.bak"
+  # Most destinations are under /etc or /usr and need root; ~/-rooted ones do
+  # not. Decide by testing the nearest EXISTING ancestor directory for write
+  # access, rather than hardcoding a path prefix table that will drift out of
+  # sync with new callers.
+  local sudo_prefix="" check_dir; check_dir=$(dirname "$dest")
+  while [[ ! -e $check_dir && $check_dir != / ]]; do check_dir=$(dirname "$check_dir"); done
+  [[ -w $check_dir ]] || sudo_prefix=sudo
+  if [[ -e $dest ]] && ! cmp -s "$tmp" "$dest" 2>/dev/null; then
+    [[ -e $dest.nhq.bak ]] || $sudo_prefix cp -a "$dest" "$dest.nhq.bak"
   fi
-  install -Dm"${WR_MODE:-644}" "$tmp" "$dest" && ok "wrote $dest"
+  $sudo_prefix install -Dm"${WR_MODE:-644}" "$tmp" "$dest" && ok "wrote $dest"
   rm -f "$tmp"
 }
 
@@ -141,7 +152,12 @@ preflight() {
       || warn "no sudo cached — root-only checks will be skipped (run 'sudo -v' first for the full picture)"
   else
     sudo -v || die "need sudo"
-    sudo mkdir -p "$STATE_DIR"; sudo touch "$LOG"; sudo chmod 644 "$LOG"
+    # run() appends to $LOG from the UNPRIVILEGED parent shell — the redirect
+    # is set up before sudo/exec, even for `run sudo …` — so root:644 here
+    # would make every single `run` call fail to even open its own log, and a
+    # failed redirect means the wrapped command never executes at all. Owning
+    # it as the invoking user is what makes that work.
+    sudo mkdir -p "$STATE_DIR"; sudo touch "$LOG"; sudo chown "$USER:$USER" "$LOG"; chmod 644 "$LOG"
   fi
 
   local id; id=$(. /etc/os-release && echo "$ID")
@@ -1000,6 +1016,53 @@ EOF
   mark_stage power
 }
 
+# Opt-in, NOT part of `all`: passwordless sudo is a real security decision and
+# must never be applied silently just because someone ran the provisioner.
+stage_nopasswd() {
+  head1 "nopasswd — persistent passwordless sudo for $USER"
+  warn "this makes '$USER' root-equivalent with no password prompt, forever."
+  warn "appropriate for a single-user LAN box you administer remotely; wrong for anything shared."
+
+  # The drop-in is worthless if the main file does not include the directory.
+  if ! sudo grep -qE '^[@#]includedir /etc/sudoers.d' /etc/sudoers; then
+    die "/etc/sudoers has no includedir for /etc/sudoers.d — a drop-in would be silently ignored"
+  fi
+
+  # 99- prefix, deliberately. sudoers applies LAST MATCH WINS, and CachyOS's
+  # installer ships /etc/sudoers.d/10-installer containing `%wheel ALL=(ALL) ALL`.
+  # A file named 10-<user>-nopasswd sorts BEFORE that, so the wheel rule matches
+  # afterwards and puts the password prompt right back — which is exactly what
+  # happened on rig and looked, from every angle, like the rule "not working".
+  local dest=/etc/sudoers.d/99-${USER}-nopasswd tmp
+  tmp=$(mktemp)
+  printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$USER" > "$tmp"
+  if ! visudo -cqf "$tmp"; then rm -f "$tmp"; die "generated rule failed validation"; fi
+
+  if (( DRY )); then
+    printf '  %s[dry] install -m0440 root:root -> %s%s\n' "$C_D" "$dest" "$C_0"
+    rm -f "$tmp"; return 0
+  fi
+
+  run sudo install -m 0440 -o root -g root "$tmp" "$dest"
+  rm -f "$tmp"
+
+  # Validate the WHOLE tree, and roll back on failure. A broken sudoers file
+  # locks you out of root on a box you can only reach over SSH.
+  if ! sudo visudo -c >/dev/null 2>&1; then
+    run sudo rm -f "$dest"
+    die "full sudoers tree invalid — rolled back, nothing changed"
+  fi
+
+  sudo -K
+  if sudo -n true 2>/dev/null; then
+    ok "passwordless sudo active and persistent for $USER"
+  else
+    bad "installed but still prompting — check ordering: $(sudo -n ls -1 /etc/sudoers.d/ 2>/dev/null | tr '\n' ' ')"
+    return 1
+  fi
+  mark_stage nopasswd
+}
+
 stage_ups() {
   head1 "ups — nut (only useful once a UPS is plugged in)"
   pkg nut
@@ -1072,6 +1135,7 @@ main() {
       done
       head1 "done"; exit 0 ;;
     ups) preflight; stage_ups; exit 0 ;;
+    nopasswd) preflight; stage_nopasswd; exit 0 ;;
   esac
 
   preflight
