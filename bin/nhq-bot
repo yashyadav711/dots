@@ -20,7 +20,7 @@ Options:
   --title <text>                      Headline (required, non-empty)
   --body <text>                       Optional detail body
   --url <text>                        Optional reference URL
-  --agent <text>                      Optional agent name
+  --agent <text>                      Override the sender name (auto-detected otherwise)
   --runtime <text>                    Optional runtime identifier
   --help                              Show this help
 
@@ -246,15 +246,36 @@ main() {
     *) die_config "invalid --event: must be blocked, failed, or completed" ;;
   esac
 
+  # WHO SENT THIS, always, and first.
+  #
+  # --agent was optional and almost nobody passed it, so a whole day of
+  # notifications arrived from nobody in particular — with Director, Envy,
+  # Builder, HeyDaddy and Mirror all writing to the same chat, "it's done" from
+  # an anonymous sender is a riddle. Yash, 2026-08-13: "jo bhi msg bhejta h
+  # usme agent ka naam hamesha ana chaiye."
+  #
+  # Resolved from context when it is not given: nhq-agent-name maps the git
+  # repo root through fleet-registry.json, which is also why future agents need
+  # nothing here — add them to the registry and they name themselves. It falls
+  # back to the repo directory rather than to nothing, because a slightly wrong
+  # name still tells you which corner of the machine spoke, and a blank one
+  # tells you nothing at all.
+  if [ -z "$agent" ]; then
+    agent="$(nhq-agent-name 2>/dev/null | head -1)"
+  fi
+  if [ -z "$agent" ]; then
+    agent="$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")"
+  fi
+
   # Build only CLI-owned markup around HTML-escaped, caller-provided fields.
+  # The name leads the header: Telegram's preview shows the first line, so this
+  # is the part you read on a lock screen without opening anything.
   local message
-  message="<b>$header · $(html_escape "$title")</b>"
+  message="<b>$(html_escape "$agent") · $header · $(html_escape "$title")</b>"
 
   local meta=""
-  [ -n "$agent" ]   && meta="Agent: $(html_escape "$agent")"
   if [ -n "$runtime" ]; then
-    [ -n "$meta" ] && meta="$meta · "
-    meta="${meta}Runtime: $(html_escape "$runtime")"
+    meta="Runtime: $(html_escape "$runtime")"
   fi
   [ -n "$meta" ] && message="$message"$'\n'"$meta"
 

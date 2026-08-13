@@ -71,10 +71,24 @@ else
   if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
     name="$(from_session "$(tmux display-message -p '#S' 2>/dev/null || true)")"
   fi
-  # 2. git repo root of DIR → repo basename.
+  # 2. git repo root of DIR → the agent whose registry `repo` IS that path.
+  #
+  # Matched on the PATH, not the basename. Basename matching only worked when a
+  # directory happened to be named after its registry key: Director sits in
+  # `Github/nhq-agentic-os`, which is neither the key `director` nor an alias,
+  # so Director's own notifications went out signed "nhq-agentic-os" until
+  # 2026-08-13. Every agent added from here gets this for free — put the repo in
+  # fleet-registry.json and it names itself, whatever the folder is called.
+  # Basename stays as the fallback for repos that are not in the registry.
   if [[ -z "$name" ]]; then
     root="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null || true)"
-    [[ -n "$root" ]] && name="$(canon "$(basename "$root")")"
+    if [[ -n "$root" ]]; then
+      name="$(jq -r --arg h "$HOME/" --arg r "$root" '
+                .agents | to_entries
+                | map(select($h + .value.repo == $r))
+                | (.[0].value.name // "")' "$(nhq_registry)" 2>/dev/null)"
+      [[ -z "$name" ]] && name="$(canon "$(basename "$root")")"
+    fi
   fi
   # 3. Envy is the laptop operator — she runs from $HOME, which is not a git repo.
   [[ -z "$name" && "$DIR" == "$HOME" ]] && name="Envy"
