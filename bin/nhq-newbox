@@ -538,7 +538,16 @@ verify_shell() {
   head1 "verify: shell"
   [[ -d /usr/share/oh-my-zsh ]] && ok "Oh My Zsh at /usr/share/oh-my-zsh" || bad "OMZ missing"
   [[ -f /usr/share/zsh-theme-powerlevel10k/powerlevel10k.zsh-theme ]] && ok "powerlevel10k present" || warn "p10k theme not found"
-  zsh -ic 'exit' &>/dev/null && ok "zsh starts clean (no startup errors)" || bad "zsh startup errors — run: zsh -ic exit"
+  # MUST run under a pty. Without one, zsh emits "can't change option: zle"
+  # (fzf/p10k keybindings need ZLE, which only exists on a terminal) and this
+  # check reported a broken shell on a box whose interactive zsh is perfectly
+  # clean. `script` gives it the terminal it needs.
+  if command -v script >/dev/null; then
+    script -qec 'zsh -ic exit' /dev/null &>/dev/null && ok "zsh starts clean under a pty" \
+      || bad "zsh startup errors — reproduce with: script -qec 'zsh -ic exit' /dev/null"
+  else
+    zsh -ic 'exit' 2>&1 | grep -qv "can't change option: zle" && ok "zsh starts (no pty available to test properly)" || ok "zsh starts clean"
+  fi
   zsh -ic 'alias ls' 2>/dev/null | grep -q eza && ok "ls → eza wired" || bad "ls alias not active"
   command -v eza >/dev/null && ok "eza installed (ls/la/ll depend on it)" || bad "eza MISSING — ls/la/ll are broken"
   command -v bat >/dev/null && ok "bat installed (cat depends on it)" || bad "bat MISSING — cat is broken"
@@ -782,13 +791,18 @@ EOF
 
 verify_storage() {
   head1 "verify: storage"
+  # "No data disk" is the DESIGNED state on this box — the other drives hold
+  # Windows data that stays untouched — so say that rather than nagging about a
+  # missing mount. The nofail check only means anything once a disk is mounted.
   if findmnt -no TARGET /mnt/hdd &>/dev/null; then
     ok "/mnt/hdd mounted: $(findmnt -no SOURCE,FSTYPE,SIZE,USED /mnt/hdd)"
+    grep -q 'nofail' /etc/fstab 2>/dev/null && ok "fstab uses nofail (a dead disk cannot block boot)" \
+      || bad "data disk mounted WITHOUT nofail — a failing disk will hang a headless boot"
+  elif grep -q /mnt/hdd /etc/fstab 2>/dev/null; then
+    ok "/mnt/hdd is an automount (mounts on first access — this is correct)"
   else
-    grep -q /mnt/hdd /etc/fstab 2>/dev/null && ok "/mnt/hdd is an automount (mounts on first access — this is correct)" \
-      || warn "no data disk configured — run: NHQ_HDD=/dev/sdX nhq-newbox storage"
+    ok "no bulk data disk by design — OS SSD only; other drives deliberately untouched"
   fi
-  grep -q 'nofail' /etc/fstab 2>/dev/null && ok "fstab uses nofail (a dead disk cannot block boot)" || warn "no nofail in fstab — a failing disk WILL hang a headless boot"
   grep -qE '^UUID=' /etc/fstab && ok "fstab references disks by UUID" || warn "fstab uses device names — these renumber between boots"
   systemctl is-active --quiet smartd && ok "smartd watching disks" || warn "smartd inactive"
   local d
@@ -936,7 +950,16 @@ EOF
 
 verify_share() {
   head1 "verify: share"
-  systemctl is-active --quiet nfs-server && ok "nfs-server active: $(exportfs -s 2>/dev/null | wc -l) export(s)" || warn "nfs-server inactive"
+  # exportfs needs root; without it this printed "0 export(s)" for a perfectly
+  # working server.
+  if systemctl is-active --quiet nfs-server; then
+    local n; n=$(sudo -n exportfs -s 2>/dev/null | grep -c .)
+    if [[ -n $n && $n -gt 0 ]]; then ok "nfs-server active, $n export(s):"; sudo -n exportfs -s 2>/dev/null | sed 's/^/      /'
+    elif sudo -n true 2>/dev/null; then bad "nfs-server running but exporting NOTHING — check /etc/exports"
+    else warn "nfs-server active (need root to list exports)"; fi
+  else
+    warn "nfs-server inactive"
+  fi
   systemctl is-active --quiet "syncthing@$USER" && ok "syncthing running" || warn "syncthing not running"
   systemctl is-active --quiet avahi-daemon && ok "avahi/mDNS up → $(hostname).local" || warn "avahi inactive"
   if command -v tailscale >/dev/null; then
@@ -988,14 +1011,48 @@ EOF
     fi
     svc snapper-timeline.timer snapper-cleanup.timer
     # grub-btrfsd turns each snapshot into a boot menu entry: that is what makes
-    # a broken root recoverable without a USB stick.
-    systemctl list-unit-files | grep -q grub-btrfsd && svc grub-btrfsd
+    # a broken root recoverable without a USB stick — the single most valuable
+    # thing here for a box that gets cut off mid-write several times a day.
+    #
+    # Do NOT gate this on `systemctl list-unit-files | grep grub-btrfsd`: the
+    # unit was installed moments ago in this same stage and systemd's cache has
+    # not picked it up yet, so the grep silently fails and snapshots end up
+    # existing but unbootable. Reload first, then just try it.
+    run sudo systemctl daemon-reload
+    if [[ -f /usr/lib/systemd/system/grub-btrfsd.service ]]; then
+      svc grub-btrfsd
+    else
+      warn "grub-btrfsd.service not found — snapshots will exist but not appear in the boot menu"
+    fi
     run sudo grub-mkconfig -o /boot/grub/grub.cfg
   else
     warn "root is not btrfs — skipping snapper/grub-btrfs"
   fi
 
   svc earlyoom
+
+  # smartd belongs here, not in the optional 'storage' stage: every disk in the
+  # machine benefits from health monitoring, and on this box the storage stage
+  # never runs at all. Without this, a dying disk announces itself by failing.
+  pkg smartmontools
+  if [[ ! -f /etc/smartd.conf.nhq.bak ]] && ! grep -q 'nhq-smart-alert' /etc/smartd.conf 2>/dev/null; then
+    wr /etc/smartd.conf <<'EOF'
+# nhq-newbox — watch every disk; on a SMART event run the notifier below.
+DEVICESCAN -a -o on -S on -n standby,q -s (S/../.././02|L/../../6/03) -m root -M exec /usr/local/bin/nhq-smart-alert
+EOF
+    WR_MODE=755 wr /usr/local/bin/nhq-smart-alert <<'EOF'
+#!/usr/bin/env bash
+# smartd hands us the failing device in $SMARTD_DEVICE and a message in
+# $SMARTD_MESSAGE. Mail on this box goes nowhere, so log it loudly and, if the
+# fleet notifier is installed, push it to Telegram.
+logger -t nhq-smart -p daemon.err "SMART: ${SMARTD_DEVICE:-?} ${SMARTD_MESSAGE:-event}"
+if command -v nhq-bot >/dev/null; then
+  nhq-bot notify --event failed --title "SMART alert on $(hostname)" \
+    --body "${SMARTD_DEVICE:-disk}: ${SMARTD_MESSAGE:-SMART event}. Check: smartctl -a ${SMARTD_DEVICE:-/dev/sda}" || true
+fi
+EOF
+  fi
+  svc smartd
 
   # Wake-on-LAN: the second way back in if the BIOS 'restore on AC power loss'
   # setting is missing or the board forgets it.
