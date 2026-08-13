@@ -20,6 +20,13 @@
 #   nhq-voice-stop            stop it and keep it stopped
 #   nhq-voice-stop --on       start it again and re-enable it
 #   nhq-voice-stop --status   what is running right now
+#
+# ON THE NAME: nhq-lint wants `nhq-<noun> <verb>` and will warn about this file
+# forever. Leave it. Yash asked for `nhq-voice-stop` by name, and the two homes
+# the convention would suggest are both wrong — `nhq-voice` is the sample
+# recorder and bench, nothing to do with the daemon's state, and `vox stop`
+# already means something narrower than this does. A name someone reaches for
+# without thinking beats a name that satisfies a linter.
 set -uo pipefail
 
 BITS=(whisper-server voxbar.py parecord)
