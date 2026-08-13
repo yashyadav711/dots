@@ -371,17 +371,13 @@ class Polish:
     exactly the ones only context can catch — "mic bilkul mere munh se" came back
     as "main ek bilkul mere munh se", which no literal rule could ever fix.
 
-    WHY ONLY ON LONG ONES: measured 2026-08-13 against the local agy rotator, the
-    round trip is ~2.5 s of transport plus ~4 s of generation, and it is FLAT —
-    350 characters and 1050 characters both land around 6-8 s. Against 14 days of
-    real usage (41 dictations, median 10.6 s, p90 53.5 s, max 135.5 s) that means:
-
-        10 s dictation ->  4 s becomes 11 s   (2.7x, not worth it)
-        53 s dictation -> 20 s becomes 27 s   (1.35x, clearly worth it)
-
-    So it runs only past `polish_min_chars`. Short replies stay instant; long
-    dictations — the ones that actually need paragraphs — pay proportionally
-    least for them.
+    WHY ON EVERYTHING: re-measured 2026-08-13 against the local agy rotator, the
+    round trip is 3-4 s and FLAT — 33 characters and 277 characters both land
+    there, because it is transport bound rather than length bound. An earlier
+    note here said 6-8 s and concluded short lines were not worth it; that was
+    wrong on both counts. A one-line reply is precisely where a missing capital
+    or a mangled word is obvious, and it is fixed for the same 3 s a paragraph
+    costs. See `wanted` for the numbers and for the two gates that came off.
 
     WHY THE LOCAL ROTATOR: `localhost:51200` is the agy router already running on
     this box. Zero quota across 8 accounts, no auth, and no process to start.
@@ -398,33 +394,34 @@ class Polish:
         # No polish_min_sec fallback. Nothing reads it any more, and the
         # selftest is right to fail a cfg.get for a key with no default — a
         # half-removed knob is worse than either keeping it or deleting it.
-        self.min_chars = int(cfg.get("polish_min_chars", 220))
+        self.min_chars = int(cfg.get("polish_min_chars", 0))
         self.model = str(cfg.get("polish_model", "gemini-3-flash"))
         self.url = str(cfg.get("polish_url", "http://127.0.0.1:51200/v1/chat/completions"))
-        self.timeout = float(cfg.get("polish_timeout_sec", 25.0))
+        self.timeout = float(cfg.get("polish_timeout_sec", 12.0))
 
     def wanted(self, text: str) -> bool:
-        """Is this transcript long enough for the second pass to earn its seconds?
+        """Should the second pass run? By default: yes, on everything.
 
-        Measured on 2026-08-13, from his own dictations:
+        Two gates have been tried here and both were mine and both were wrong.
+        First 25 seconds of audio, reasoned from usage stats; Yash overruled it,
+        he wanted every line cleaned up. Then, when he reported the whole thing
+        felt slow, 220 characters of transcript — on the belief that the pass
+        cost 6-8 s and left short text unchanged. Timed against his own lines on
+        2026-08-13, both halves were false:
 
-            290 chars ->  294  in 4.6 s     nothing changed, five seconds gone
-            361 chars ->  379  in 7.1 s     added the markdown emphasis
-            830 chars ->  805  in 9.8 s     restructured into paragraphs
+             33 chars ->  34  in 4.3 s   "porti" -> "Poori", capital, full stop
+             74 chars ->  91  in 3.3 s   spelling, punctuation, bold emphasis
+            277 chars -> 288  in 3.7 s   punctuation and capitals
 
-        The pass costs the same 5-8 s whatever it is given — it is round-trip
-        bound, not length bound. So on a short reply it is pure wait for a
-        result that is, measurably, the same text back.
+        3-4 s, flat, and short lines are where it shows MOST: a one-line reply
+        is exactly where a missing capital and a mangled word are obvious. He
+        caught the regression within minutes — "choti line sahi se nhi ari h".
 
-        The gate was on AUDIO SECONDS at 25, which I had picked from usage
-        stats. Yash overruled it to 1.5 — polish everything — and was then
-        immediately right about the consequence: "speed bahut bahut hi slow
-        aaya". Both of those are correct, because seconds of audio was the wrong
-        thing to measure. What the pass buys is punctuation and paragraphs, and
-        that depends on how much TEXT there is, not how long he took to say it.
+        The slowness he actually hit was a 38 s dictation, where 6.8 s of decode
+        on four threads is the floor and the cleanup rides on top of it. Gating
+        the cleanup was treating the symptom at the wrong end.
 
-        So: characters. Short replies go out at once, anything with real
-        structure in it gets cleaned up. `polish_min_chars` is the one number.
+        So the knob stays, defaulted off. Nothing here decides for him.
         """
         return self.enabled and len(text.strip()) >= self.min_chars
 

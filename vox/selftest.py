@@ -394,23 +394,43 @@ def set_clipboard(text: str) -> None:
                    stderr=subprocess.DEVNULL, timeout=10)
 
 
-def journal_since(stamp: str) -> str:
-    """Log text for this session only.
+def journal_mark() -> str:
+    """A cursor pointing at the newest line in the daemon log, right now.
 
-    `--since` has one-second granularity, so a test that starts in the same
-    second the previous one finished sees the previous result too. Everything
-    before the last `recording started` is therefore discarded."""
-    out = subprocess.run(["journalctl", "--user", "-u", "vox", "--since", stamp,
-                          "--no-pager", "-o", "cat"], capture_output=True, text=True,
-                         timeout=30).stdout
+    `--since` takes a timestamp and resolves to ONE SECOND, and these scenarios
+    run about that far apart — measured 2026-08-13, scenario 1 logged
+    `transcribed` at 08:10:31 and scenario 2 opened its window at 08:10:32.
+    Whichever scenario happened to land on the wrong side of a second boundary
+    then failed, and a different one failed on each run. A cursor is exact, so
+    the whole class of that goes away.
+    """
+    out = subprocess.run(["journalctl", "--user", "-u", "vox", "-n", "0",
+                          "--show-cursor", "--no-pager"],
+                         capture_output=True, text=True, timeout=30).stdout
+    for line in out.splitlines():
+        if line.startswith("-- cursor:"):
+            return line.split("-- cursor:", 1)[1].strip()
+    return ""
+
+
+def journal_since(mark: str) -> str:
+    """Log text written since `mark`, for this scenario only.
+
+    Everything before the last `recording started` is discarded as well: a
+    scenario only ever cares about its own attempt, and a retry inside one would
+    otherwise leave the first attempt's result in the window.
+    """
+    cmd = ["journalctl", "--user", "-u", "vox", "--no-pager", "-o", "cat"]
+    cmd += ["--after-cursor", mark] if mark else ["-n", "200"]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout
     return out.rsplit("recording started", 1)[-1] if "recording started" in out else out
 
 
-def wait_for(stamp: str, needle: str, seconds: int = 40) -> str:
+def wait_for(mark: str, needle: str, seconds: int = 40) -> str:
     """Block until a line containing `needle` shows up in the daemon log."""
     for _ in range(seconds):
         time.sleep(1)
-        for line in journal_since(stamp).splitlines():
+        for line in journal_since(mark).splitlines():
             if needle in line:
                 return line
     return ""
@@ -433,7 +453,7 @@ def test_end_to_end() -> None:
     # made an earlier version of this test fail on a reading nobody produced.
     with Loopback() as loop:
         # 1. a real utterance goes all the way through
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        stamp = journal_mark()
         set_clipboard("VOX-SELFTEST-SENTINEL")
         sock_cmd("start")
         time.sleep(0.8)
@@ -453,7 +473,7 @@ def test_end_to_end() -> None:
               "ready for the next sentence")
 
         # 2. silence must produce nothing at all
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        stamp = journal_mark()
         sock_cmd("start")
         time.sleep(12)
         sock_cmd("stop")
@@ -465,7 +485,7 @@ def test_end_to_end() -> None:
 
         # 3. the live caption streams and grows
         import re
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        stamp = journal_mark()
         sock_cmd("start")
         time.sleep(0.8)
         loop.play(BENCH / "long43.wav")
@@ -493,24 +513,25 @@ def test_end_to_end() -> None:
               spoken_result(final[-1])[:56] if final else "no result")
 
         # 4. cancel throws the audio away
-        #
-        # `journalctl --since` resolves to ONE SECOND. wait_for above returns the
-        # instant scenario 3's `transcribed` is printed, and the three lines
-        # between there and here take microseconds — so this window opened in the
-        # same second as that line and contained it, and the check failed for a
-        # reason that has nothing to do with cancel. Raising scenario 3's timeout
-        # (2026-08-13) fixed a different instance of the same confusion and left
-        # this one. Wait out the second instead.
-        time.sleep(1.2)
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        stamp = journal_mark()
         sock_cmd("start")
         time.sleep(1)
         loop.play(BENCH / "hi/mix1_16k.wav")
         sock_cmd("cancel")
         time.sleep(4)
         logs = journal_since(stamp)
+        # Say WHICH half failed and show the window. This check went red on and
+        # off for an afternoon and "nothing delivered" told me nothing at all
+        # about why — a failure that cannot be read is a failure you debug by
+        # re-running, which is how a whole afternoon goes.
+        saw_cancel = "cancelled" in logs
+        saw_text = "transcribed" in logs
+        detail = "nothing delivered"
+        if not saw_cancel or saw_text:
+            tail = " | ".join(logs.strip().splitlines()[-4:])[:160]
+            detail = (f"cancelled={saw_cancel} transcribed={saw_text} :: {tail}")
         check("end-to-end", "cancel discards the recording",
-              "cancelled" in logs and "transcribed" not in logs, "nothing delivered")
+              saw_cancel and not saw_text, detail)
 
 
 # ── system ────────────────────────────────────────────────────────────────────

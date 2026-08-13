@@ -98,28 +98,37 @@ parakeet_dir  = "~/.config/orca/speech-models/parakeet-tdt-0.6b-v3-int8"
 # `agy` CLI instead costs 14-16 s of startup alone (measured), which would have
 # doubled the wait for nothing.
 #
-# Gated on how much TEXT came back, not on how long the audio was. The round
-# trip is FLAT at ~6-8 s whatever it is given (measured: 350 chars 6.0 s, 1050
-# chars 7.8 s), so on a short reply it is pure wait for a result that is
-# measurably the same text back — his own dictations, 2026-08-13:
+# It runs on EVERYTHING. There is no length gate, and the two attempts to put
+# one there are worth recording because both were mine and both were wrong.
 #
-#     290 chars ->  294  in 4.6 s     nothing changed
-#     361 chars ->  379  in 7.1 s     added the markdown emphasis
-#     830 chars ->  805  in 9.8 s     restructured into paragraphs
+# First a 25 s audio gate, reasoned from usage stats. Yash overruled it — he
+# wanted every line cleaned up. Then, when he said "speed bahut bahut hi slow
+# aaya", I moved the gate onto transcript length at 220 characters, on the
+# belief that the pass cost 6-8 s and did nothing to short text. Timed against
+# his own lines, 2026-08-13, both halves of that were false:
 #
-# This was polish_min_sec = 25, which Yash overruled to 1.5 — polish everything
-# — and he was then immediately right about what that cost: "speed bahut bahut
-# hi slow aaya". Both calls were right; seconds of audio was simply the wrong
-# thing to measure. What the pass buys is punctuation and paragraphs, and that
-# depends on the amount of text, not on how long he took to say it.
+#      33 chars ->  34  in 4.3 s   "porti" -> "Poori", capital, full stop
+#      74 chars ->  91  in 3.3 s   spelling, punctuation, the bold emphasis
+#     277 chars -> 288  in 3.7 s   punctuation and capitals
+#
+# 3-4 s, flat, and the SHORT lines are where it shows most — a one-line reply
+# is exactly where a missing capital and a mangled word are obvious. He caught
+# it within minutes of the gate landing: "choti line sahi se nhi ari h".
+#
+# The slowness he reported was never this. It was a 38 s dictation: 6.8 s of
+# decode on four threads plus the polish on top. Decode is the floor there, not
+# the cleanup.
 #
 # Fails open: any error, timeout, or a reply shorter than half the input (which
 # would be a summary, not a cleanup) and the raw transcript is delivered
 # unchanged. Set polish = false to turn the whole thing off.
 polish             = true
-# Raise it if short dictations still feel slow; lower it toward 0 to go back to
-# polishing everything.
-polish_min_chars   = 220
+# 0 = everything. Only raise this if you would rather have the seconds than the
+# punctuation on short lines.
+polish_min_chars   = 0
 polish_model       = "gemini-3-flash"
 polish_url         = "http://127.0.0.1:51200/v1/chat/completions"
-polish_timeout_sec = 25.0
+# 25 -> 12. Measured median is 3-4 s, so twelve is already four times the
+# normal cost; past that the rotator is having a bad day and the raw transcript
+# is a better answer than a longer wait.
+polish_timeout_sec = 12.0
