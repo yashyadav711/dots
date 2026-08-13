@@ -1190,7 +1190,12 @@ main() {
   for s in "${STAGES[@]}"; do done_stage "$s" && ok "$s" || say "  ${C_D}·  $s pending${C_0}"; done
   say ""
   say "next:  nhq-newbox verify      # smoke-test every layer"
+  # `(( DRY )) && warn …` as the last statement made main() — and so the whole
+  # script — exit 1 on every successful non-dry run, because (( 0 )) is false.
+  # That made a real failure indistinguishable from success to any caller, which
+  # is exactly how rig's sabotaged first sweep looked "fine". Be explicit.
   (( DRY )) && warn "this was a dry run — nothing changed"
+  return 0
 }
 
 main "$@"
