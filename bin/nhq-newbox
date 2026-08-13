@@ -992,6 +992,32 @@ EOF
   svc "syncthing@$USER.service"
   say "  ${C_D}web UI (it only listens on localhost):  ssh -L 8384:localhost:8384 $USER@$(hostname)  → http://localhost:8384${C_0}"
 
+  # Hand DNS to systemd-resolved BEFORE tailscale needs it. Left alone,
+  # NetworkManager manages /etc/resolv.conf itself; that happens to point at
+  # resolved's stub and MagicDNS appears to work, but nothing guarantees NM keeps
+  # that nameserver — it rewrites the file on every reconnect, which on this box
+  # means after every power cut. Tailscale flags exactly this ("systemd-resolved
+  # and NetworkManager are wired together incorrectly").
+  if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    svc systemd-resolved
+    wr /etc/NetworkManager/conf.d/10-dns-resolved.conf <<'EOF'
+# nhq-newbox — hand DNS to systemd-resolved so Tailscale's MagicDNS survives a
+# NetworkManager restart. Without this NM owns /etc/resolv.conf and clobbers the
+# tailnet search domain on reconnect.
+[main]
+dns=systemd-resolved
+EOF
+    # A symlink NM will not overwrite, unlike the regular file it writes itself.
+    [[ -L /etc/resolv.conf ]] || run sudo ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+    run sudo systemctl restart NetworkManager
+    sleep 3
+    if getent hosts archlinux.org >/dev/null 2>&1; then
+      ok "DNS via systemd-resolved (MagicDNS-safe across NM restarts)"
+    else
+      bad "public DNS broke after the resolved handover — check /etc/resolv.conf"
+    fi
+  fi
+
   svc tailscaled
   say "  ${C_D}then, once: sudo tailscale up --ssh --accept-routes${C_0}"
 
@@ -1017,7 +1043,23 @@ verify_share() {
   systemctl is-active --quiet "syncthing@$USER" && ok "syncthing running" || warn "syncthing not running"
   systemctl is-active --quiet avahi-daemon && ok "avahi/mDNS up → $(hostname).local" || warn "avahi inactive"
   if command -v tailscale >/dev/null; then
-    tailscale status &>/dev/null && ok "tailscale up: $(tailscale ip -4 2>/dev/null | head -1)" || warn "tailscale installed but not logged in (sudo tailscale up --ssh)"
+    if tailscale status &>/dev/null; then
+      ok "tailscale up: $(tailscale ip -4 2>/dev/null | head -1)  $(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // ""' 2>/dev/null | sed 's/\.$//')"
+      # tailscale diagnoses itself; surface that instead of assuming "connected"
+      # means "working". This is how the resolved/NetworkManager DNS breakage was
+      # found — the tunnel was up and MagicDNS was one NM restart from dying.
+      local health; health=$(tailscale status 2>&1 | sed -n '/Health check/,$p' | grep -E '^#?\s+-' | sed 's/^#*[[:space:]]*-[[:space:]]*//')
+      if [[ -n $health ]]; then
+        while IFS= read -r h; do [[ -n $h ]] && warn "tailscale health: $h"; done <<<"$health"
+      else
+        ok "tailscale reports no health issues"
+      fi
+      [[ $(tailscale debug prefs 2>/dev/null | grep -c '"RunSSH": true') -gt 0 ]] \
+        && ok "tailscale ssh enabled (key-free access from any tailnet device)" \
+        || warn "tailscale ssh off — enable with: sudo tailscale up --ssh"
+    else
+      warn "tailscale installed but not logged in (sudo tailscale up --ssh)"
+    fi
   fi
   # Print the RESOLVED path — a copy-pasteable fstab line cannot contain $HOME,
   # since it is the remote server's home, not the client's.
