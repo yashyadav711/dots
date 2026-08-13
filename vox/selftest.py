@@ -613,6 +613,25 @@ def test_polish() -> None:
 
 def main() -> int:
     print(f"\033[1mvox selftest\033[0m — {time.strftime('%Y-%m-%d %H:%M')}")
+
+    # THIS SUITE TAKES OVER THE LIVE DAEMON. It rewrites his config, restarts
+    # vox, and runs real start/stop cycles — which open the microphone, put the
+    # overlay on screen, and land text on his clipboard. It is a two and a half
+    # minute hijack of the thing he dictates with.
+    #
+    # On 2026-08-13 I ran it about a dozen times while he was working and he
+    # eventually asked why voice typing kept starting on its own: "m to alt alt
+    # bhi nhi dba rha". Fifty-six recordings that day, nearly all mine. Nothing
+    # in the suite said it would do that, so nothing stopped me.
+    #
+    # It now refuses unless someone says so out loud. An agent has to mean it.
+    if not ("--yes" in sys.argv or os.environ.get("VOX_SELFTEST") == "1"):
+        print("\nThis drives the LIVE daemon: it opens the mic, shows the overlay,\n"
+              "restarts vox and writes to the clipboard, for about 2.5 minutes.\n"
+              "Do not run it while someone is using the machine.\n\n"
+              "  vox-selftest --yes        (or VOX_SELFTEST=1)\n", file=sys.stderr)
+        return 2
+
     if not (BENCH / "hi/mix1_16k.wav").exists():
         print(f"missing test audio under {BENCH}", file=sys.stderr)
         return 2

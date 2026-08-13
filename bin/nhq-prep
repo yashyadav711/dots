@@ -19,7 +19,7 @@ TARGETS = {
     "envy": Path.home() / "Github/nHQ/envy",
     "heydaddy": Path.home() / "Github/Work/heydaddy",
     "mirror": Path.home() / "Github/Work/mirror",
-    "builder": Path.home() / "Github/Work/builder",
+    "builder": Path.home() / "Github/nHQ/nhq-builder",
     "nhq-service": Path.home() / "Github/nHQ/nhq-app-stack/nhq-service",
     "nhq-app": Path.home() / "Github/nHQ/nhq-app-stack/nhq-app",
     "vault": Path(os.environ.get("NHQ_VAULT", "/home/yash/Obsidian/nHQ"))

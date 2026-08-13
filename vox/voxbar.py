@@ -349,42 +349,48 @@ class WaveStrip(Gtk.ApplicationWindow):
         cr.rectangle(0, base - 1.6, w, 1.6)
         cr.fill()
 
-        # Fixed scale — the ruler. Short, dim, and it does not answer to the
-        # microphone; it is the thing being measured against.
-        main = 40
-        sp = jaw_max / main
-        for i in range(main + 1):
-            d = jaw_max - i * sp
+        # ONE comb, not two. The upper-half port put the fixed scale and the
+        # vernier comb on the same side of the datum and tried to tell them
+        # apart by weight. Rendered, they simply collided — Yash: "dono line
+        # takra rahi h" — and it was worse than that: the vernier rides OUTWARD
+        # on the jaw, so the louder he spoke the further off-screen it went, and
+        # quiet, mid and loud came out looking identical.
+        #
+        # So the ruler is the only comb, and the measurement is which part of it
+        # is LIT. Light spreads out from the centre as he gets louder — a
+        # reading you take in at a glance, with nothing to overlap.
+        n = 44
+        sp = jaw_max / n
+        for i in range(n + 1):
+            d = i * sp
             u = d / cx
             major = i % 5 == 0
-            status((0.20 + 0.26 * (1 - u)) * (1.0 - 0.5 * u * u) + 0.05)
+            # `open_` is the reach of the measurement; ticks inside it are lit.
+            # The half-tick of softness at the boundary stops the front edge
+            # strobing as the level jitters across a tick.
+            lit = max(0.0, min(1.0, (open_ - d) / max(sp, 1.0) + 1.0))
+            if lit > 0.02:
+                measure(lv, (0.55 + 0.42 * lv) * lit * (0.35 + 0.65 * (1 - u * u)))
+                up = (22 if major else 12) * (0.55 + 0.45 * lit)
+                lw = 2.6 if major else 1.7
+            else:
+                status(0.16 * (1 - 0.5 * u) + 0.04)     # the unlit ruler behind
+                up = 11 if major else 6
+                lw = 2.0 if major else 1.3
             for x in (cx + d, cx - d):
-                tick(x, 13 if major else 7, 2.2 if major else 1.4)
+                if 2 < x < w - 2:
+                    tick(x, up, lw)
 
-        # Vernier comb — 39 teeth against the fixed 40, which is the vernier
-        # principle itself: the two combs beat against each other and where they
-        # line up is the reading. Tall and bright so it reads over the ruler.
-        vn = 39
-        vsp = (sp * main) / vn
-        for i in range(vn + 1):
-            lo = i * vsp
-            major = i % 5 == 0
-            for sgn in (1, -1):
-                x = cx + sgn * (open_ + lo)
-                if x < 2 or x > w - 2:
-                    continue
-                u = abs(x - cx) / cx
-                measure(lv, (0.95 if major else 0.58) * lv * (1.0 - 0.55 * u * u))
-                tick(x, 26 if major else 15, 2.6 if major else 1.6)
-
-        # The jaw faces: where the measurement is actually taken. Full height,
-        # so the two of them frame the reading.
+        # The jaw faces, at the edge of the lit span. Full height, so the two of
+        # them frame the reading rather than joining the comb.
         for sgn in (1, -1):
-            measure(lv, 0.62 + 0.36 * lv)
-            tick(cx + sgn * open_, h - 2, 3.0)
+            x = cx + sgn * open_
+            if 2 < x < w - 2:
+                measure(lv, 0.66 + 0.32 * lv)
+                tick(x, h - 2, 3.0)
 
         # Origin mark, so the eye knows what this is measured from.
-        status(0.30 + 0.5 * lv)
+        status(0.34 + 0.5 * lv)
         tick(cx, h - 4, 1.8)
 
         # Scanlines, centred with the rest and kept light — full strength across

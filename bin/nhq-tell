@@ -61,6 +61,19 @@ resolve_session() {
   hit="$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
          | grep -m1 -E "^fleet-${key}(-|$)" || true)"
   [[ -n "$hit" ]] && { printf '%s' "$hit"; return 0; }
+
+  # Last resort: ask the sessions where they actually ARE. The slug is derived
+  # from the registry's repo path, so the moment those disagree the agent reads
+  # as offline while sitting right there — which is exactly what happened on
+  # 2026-08-13: the registry said Github/Work/builder, he works in
+  # Github/nHQ/nhq-builder, and `omp-nhq-builder` was live and unreachable.
+  # A pane's own cwd cannot drift from where the agent is, so it is the more
+  # reliable question; the slug stays first because it is exact and free.
+  if [[ -n "$repo" ]]; then
+    while read -r s p; do
+      [[ "$p" == "$repo" || "$p" == "$repo"/* ]] && { printf '%s' "$s"; return 0; }
+    done < <(tmux list-sessions -F '#{session_name} #{pane_current_path}' 2>/dev/null)
+  fi
   return 1
 }
 

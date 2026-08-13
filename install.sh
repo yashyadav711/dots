@@ -74,6 +74,10 @@ mkdir -p "$HOME/.local/share/vox" "$HOME/.config/vox"
 link vox/voxd.py                        "$HOME/.local/share/vox/voxd.py"
 link vox/voxbar.py                      "$HOME/.local/share/vox/voxbar.py"
 link vox/selftest.py                    "$HOME/.local/share/vox/selftest.py"
+# The `vox` command itself. It lived only in ~/.local/bin until 2026-08-13,
+# which is the same story as voxd.py: the thing you actually type existed on
+# one laptop and no rebuild would have brought it back.
+link vox/vox                            "$HOME/.local/bin/vox"
 link vox/config.toml                    "$HOME/.config/vox/config.toml"
 link vox/vocabulary.toml                "$HOME/.config/vox/vocabulary.toml"
 

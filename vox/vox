@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""vox — CLI for the system-wide dictation daemon."""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+# `vox status | head -3` must not end in a traceback.
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+SOCK = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "vox/vox.sock"
+SHARE = Path.home() / ".local/share/vox"
+CONFIG = Path.home() / ".config/vox/config.toml"
+VOCAB = Path.home() / ".config/vox/vocabulary.toml"
+
+USAGE = """vox — system-wide voice typing
+
+  vox                 toggle recording (same as double-tap Alt)
+  vox start|stop      start / stop explicitly
+  vox start english   one-off in the other model
+  vox cancel          throw away the current recording
+  vox status          what the daemon is doing right now
+  vox unload          drop the model from RAM immediately
+
+  vox model           which model is active (Alt = default, Ctrl = the other)
+  vox model hinglish  Hindi + English, romanised  (default)
+  vox model english   Parakeet — best English, no Hindi
+
+  vox on|off          enable / disable the service at login
+  vox restart         restart the daemon (after editing config)
+  vox logs [-f]       daemon logs
+  vox config          open the config file in $EDITOR
+  vox vocab           open the vocabulary (names + word fixes)
+  vox bench <file>    time the active engine on a wav file
+  vox doctor          check every dependency and permission
+  vox test            run the full selftest (unit -> end-to-end)
+"""
+
+
+def send(cmd: str) -> dict:
+    if not SOCK.exists():
+        return {"ok": False, "error": "daemon not running — try: vox restart"}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(10)
+            s.connect(str(SOCK))
+            s.sendall(cmd.encode())
+            return json.loads(s.recv(65536).decode() or "{}")
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def systemctl(*args: str) -> int:
+    return subprocess.run(["systemctl", "--user", *args]).returncode
+
+
+def doctor() -> int:
+    import shutil
+    rows, bad = [], 0
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        nonlocal bad
+        rows.append(("  OK  " if ok else " FAIL ", label, detail))
+        if not ok:
+            bad += 1
+
+    for tool, why in [("parecord", "recording"), ("wtype", "typing"),
+                      ("wl-copy", "clipboard fallback"), ("notify-send", "notifications")]:
+        check(f"{tool} ({why})", shutil.which(tool) is not None, shutil.which(tool) or "not installed")
+
+    groups = subprocess.run(["id", "-nG"], capture_output=True, text=True).stdout.split()
+    check("user in 'input' group", "input" in groups, " ".join(groups))
+
+    kbds = [p for p in Path("/dev/input").glob("event*") if os.access(p, os.R_OK)]
+    check("readable keyboard devices", bool(kbds), f"{len(kbds)} readable event devices")
+
+    py = SHARE / "venv/bin/python"
+    check("venv python", py.exists(), str(py))
+    if py.exists():
+        r = subprocess.run([str(py), "-c", "import sherpa_onnx,numpy;print(sherpa_onnx.__version__)"],
+                           capture_output=True, text=True)
+        check("sherpa-onnx + numpy", r.returncode == 0, (r.stdout or r.stderr).strip()[:80])
+
+    model = Path.home() / ".config/orca/speech-models/parakeet-tdt-0.6b-v3-int8"
+    files = ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"]
+    missing = [f for f in files if not (model / f).exists()]
+    check("parakeet model", not missing, str(model) if not missing else f"missing {missing}")
+
+    hinglish = SHARE / "models/ggml-hinglish-q5_0.bin"
+    check("hinglish model", hinglish.exists(),
+          f"{hinglish} ({hinglish.stat().st_size / 1e6:.0f} MB)" if hinglish.exists() else "not downloaded")
+    check("whisper-server", shutil.which("whisper-server") is not None,
+          shutil.which("whisper-server") or "install whisper-cpp")
+
+    active = subprocess.run(["systemctl", "--user", "is-active", "vox"],
+                            capture_output=True, text=True).stdout.strip()
+    check("vox.service active", active == "active", active)
+    check("control socket", SOCK.exists(), str(SOCK))
+
+    width = max(len(r[1]) for r in rows)
+    for mark, label, detail in rows:
+        print(f"[{mark}] {label:<{width}}  {detail}")
+    print("\nall good" if not bad else f"\n{bad} problem(s) above")
+    return 1 if bad else 0
+
+
+def bench(path: str) -> int:
+    py = SHARE / "venv/bin/python"
+    code = f'''
+import time, wave, numpy as np, sherpa_onnx, os, resource
+M = os.path.expanduser("~/.config/orca/speech-models/parakeet-tdt-0.6b-v3-int8")
+t0=time.time()
+rec = sherpa_onnx.OfflineRecognizer.from_transducer(
+    encoder=f"{{M}}/encoder.int8.onnx", decoder=f"{{M}}/decoder.int8.onnx",
+    joiner=f"{{M}}/joiner.int8.onnx", tokens=f"{{M}}/tokens.txt",
+    num_threads=4, sample_rate=16000, feature_dim=80,
+    decoding_method="greedy_search", provider="cpu",
+    model_type="nemo_transducer", debug=False)
+load=time.time()-t0
+w=wave.open({path!r}); n=w.getnframes(); sr=w.getframerate()
+pcm=np.frombuffer(w.readframes(n),dtype="<i2").astype(np.float32)/32768.0
+dur=n/sr
+t0=time.time(); s=rec.create_stream(); s.accept_waveform(sr,pcm); rec.decode_stream(s)
+el=time.time()-t0
+print(f"audio   {{dur:.1f}}s")
+print(f"load    {{load:.2f}}s")
+print(f"decode  {{el:.2f}}s   (RTF {{el/dur:.3f}})")
+print(f"peakRSS {{resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024:.0f}}MB")
+print(f"text    {{s.result.text!r}}")
+'''
+    return subprocess.run([str(py), "-c", code]).returncode
+
+
+ENGINE_ALIASES = {
+    "hinglish": ("whisper", "Hindi + English, romanised (Whisper-Hindi2Hinglish-Swift)"),
+    "whisper": ("whisper", "Hindi + English, romanised (Whisper-Hindi2Hinglish-Swift)"),
+    "english": ("parakeet", "English only, best punctuation (Parakeet TDT v3)"),
+    "parakeet": ("parakeet", "English only, best punctuation (Parakeet TDT v3)"),
+}
+
+
+def model(which: str | None) -> int:
+    """Show or switch the active engine by rewriting one line of the config."""
+    import re
+    text = CONFIG.read_text()
+    current = re.search(r'^engine\s*=\s*"([^"]+)"', text, re.M)
+    current = current.group(1) if current else "?"
+
+    if which is None:
+        for alias, (engine, desc) in ENGINE_ALIASES.items():
+            if alias in ("whisper", "parakeet"):
+                continue
+            mark = "*" if engine == current else " "
+            print(f" {mark} {alias:<10} {desc}")
+        return 0
+
+    if which not in ENGINE_ALIASES:
+        print(f"unknown model {which!r} — try: hinglish | english", file=sys.stderr)
+        return 2
+    engine, desc = ENGINE_ALIASES[which]
+    if engine == current:
+        print(f"already on {which} — {desc}")
+        return 0
+    CONFIG.write_text(re.sub(r'^engine\s*=\s*"[^"]+"', f'engine = "{engine}"', text, count=1, flags=re.M))
+    rc = systemctl("restart", "vox")
+    print(f"switched to {which} — {desc}" if rc == 0 else "config updated but restart failed")
+    return rc
+
+
+def main(argv: list[str]) -> int:
+    cmd = argv[0] if argv else "toggle"
+
+    if cmd in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    if cmd in ("toggle", "start", "stop", "cancel", "unload"):
+        # `vox start english` / `vox toggle hinglish` pick the engine for one go
+        pick = ENGINE_ALIASES.get(argv[1])[0] if len(argv) > 1 and argv[1] in ENGINE_ALIASES else ""
+        r = send(f"{cmd}:{pick}" if pick else cmd)
+        if not r.get("ok", True):
+            print(r.get("error"), file=sys.stderr)
+            return 1
+        return 0
+    if cmd == "status":
+        r = send("status")
+        if "error" in r:
+            print(r["error"], file=sys.stderr)
+            return 1
+        for k, v in r.items():
+            print(f"{k:<16} {v}")
+        return 0
+    if cmd == "model":
+        return model(argv[1] if len(argv) > 1 else None)
+    if cmd == "on":
+        return systemctl("enable", "--now", "vox")
+    if cmd == "off":
+        return systemctl("disable", "--now", "vox")
+    if cmd == "restart":
+        return systemctl("restart", "vox")
+    if cmd == "logs":
+        return subprocess.run(["journalctl", "--user", "-u", "vox",
+                               *(["-f"] if "-f" in argv else ["-n", "60", "--no-pager"])]).returncode
+    if cmd == "config":
+        return subprocess.run([os.environ.get("EDITOR", "nano"), str(CONFIG)]).returncode
+    if cmd == "vocab":
+        rc = subprocess.run([os.environ.get("EDITOR", "nano"), str(VOCAB)]).returncode
+        return systemctl("restart", "vox") if rc == 0 else rc
+    if cmd == "doctor":
+        return doctor()
+    if cmd == "test":
+        # --yes on his behalf. The suite refuses without it because it takes
+        # over the live daemon — mic, overlay, clipboard, for 2.5 minutes — and
+        # an agent running it while he works is exactly what happened on
+        # 2026-08-13. Typing `vox test` IS the consent; the guard is there to
+        # stop the runs nobody asked for.
+        return subprocess.run([str(SHARE / "venv/bin/python"),
+                               str(SHARE / "selftest.py"), "--yes"]).returncode
+    if cmd == "bench":
+        if len(argv) < 2:
+            print("usage: vox bench <file.wav>", file=sys.stderr)
+            return 2
+        return bench(os.path.abspath(argv[1]))
+
+    print(USAGE, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
