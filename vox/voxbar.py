@@ -44,7 +44,6 @@ from __future__ import annotations
 import json
 import math
 import sys
-from collections import deque
 
 import gi
 
@@ -64,13 +63,11 @@ import cairo  # noqa: E402
 WAVE_H = 56
 FPS = 60
 
-# The instrument lives in the right-hand end and the rest of the strip is left
-# empty on purpose. Yash picked this out of three right-aligned readings of the
-# design: "01" — the corner-gauge one. SPAN is how far the scale reaches back
-# from the origin; it never spans the monitor, because the emptiness is the
-# point.
+# The origin is pinned to the right edge and the scale runs the whole width from
+# it. This was briefly the corner version, with the instrument packed into the
+# right-hand end and the rest of the strip empty; Yash rejected that and asked
+# for the full sweep — "hard right full sweep vaala sahi hai".
 ORIGIN_INSET = 18.0
-SPAN_MAX = 430.0
 
 # Four states, four colours. With no caption these are the entire status
 # display, so they are picked to be unmistakable at the edge of vision rather
@@ -131,14 +128,12 @@ class State:
     """Everything the strip draws from, ticked once per frame."""
 
     def __init__(self) -> None:
-        self.levels: deque[float] = deque([0.0], maxlen=256)
         self.smooth = 0.0
         self.phase = "warming"
         self.alpha = 0.0
         self.target_alpha = 1.0
         self.spin = 0.0
         self.busy = False
-        self.shimmer = 0.0
         self.breathe = 0.0        # slow pulse while warming, so amber is not frozen
         self.flash = 0.0          # 1 -> 0 burst on `done`
         # OKLab state colour, eased rather than switched. `lab_now` is what gets
@@ -152,10 +147,9 @@ class State:
     def push_level(self, level: float) -> None:
         level = max(0.0, min(1.0, level))
         # Fast attack, slow release: a consonant should spike immediately, but
-        # the bars must not collapse to nothing between syllables or the strip
-        # reads as "it stopped hearing me" during ordinary speech.
+        # the jaw must not slam shut between syllables or the strip reads as "it
+        # stopped hearing me" during ordinary speech.
         self.smooth = max(level, self.smooth * 0.82)
-        self.levels.appendleft(self.smooth)
 
     def set_phase(self, phase: str) -> None:
         if phase == "done" and self.phase != "done":
@@ -179,21 +173,27 @@ class State:
         self.flash *= 0.88
         self.breathe = (self.breathe + 0.045) % (2 * math.pi)
 
-        # A light travels along the bars whenever the model is mid-decode, so a
-        # slow window looks like work happening rather than a frozen strip.
-        self.shimmer = (self.shimmer + 0.035) % 1.0 if self.busy else 0.0
-
+        # `smooth` IS the drawing now — the caliper reads it directly, where the
+        # old bars read a history deque. So every phase has to drive it, and a
+        # phase that drives nothing leaves the jaw frozen wherever the last
+        # syllable left it. That is exactly what happened on the first run: the
+        # red transcribing state held whatever width the last word had.
         if self.phase == "warming":
-            # Breathing, not silent. Amber with flat bars is indistinguishable
+            # Breathing, not still. Amber at a fixed width is indistinguishable
             # from a hung overlay, and the model can take a second to load.
-            self.levels.appendleft(0.10 + 0.06 * (1 + math.sin(self.breathe)) / 2)
+            self.smooth += (0.10 + 0.05 * (1 + math.sin(self.breathe)) / 2 - self.smooth) * 0.18
         elif self.phase == "transcribing":
-            self.spin += 0.09
-            self.levels.appendleft(0.16 + 0.11 * math.sin(self.spin))
+            # A slow sweep, so a long decode looks like work rather than a hang.
+            self.spin += 0.075
+            self.smooth += (0.30 + 0.22 * math.sin(self.spin) - self.smooth) * 0.20
         elif self.phase == "done":
-            # Settle flat: the job is finished, and a wave still moving would
-            # suggest it is not.
-            self.levels.appendleft(max(0.0, (self.levels[0] if self.levels else 0.0) * 0.82))
+            # Settle flat: the job is finished, and a jaw still moving would say
+            # otherwise.
+            self.smooth *= 0.86
+        else:
+            # Recording. push_level does the work, but decay here too so a
+            # stalled mic stream closes the jaw instead of freezing it open.
+            self.smooth *= 0.97
 
         return not (self.target_alpha == 0.0 and self.alpha < 0.02)
 
@@ -206,22 +206,41 @@ class State:
         self.lab_now = tuple(a + (b - a) * e for a, b in zip(self.lab_from, self.lab_to))
 
     def shade(self, v: float, alpha: float) -> tuple[float, float, float, float]:
-        """The state colour at loudness `v`.
+        """The state colour, dimmed by loudness `v`. For the parts that MEASURE.
 
-        Loudness moves lightness and chroma, NEVER hue. A green that slid toward
-        yellow as you spoke up would look cheap and would also fight the state
-        colours, which are the only status display this thing has. Quiet is a
-        dim, desaturated version of the same colour; loud is the colour at full
-        strength. Exponents 1.5 and 1.2 are the perceptual mapping — linear
-        looks flat at the bottom of the range.
+        Loudness moves lightness and chroma, NEVER hue. A green sliding toward
+        yellow as you speak up looks cheap and fights the state colours.
+
+        The floors matter more than the curve. They started at 0.22 chroma and
+        Yash immediately caught what that costs: "jab wo chaaloo hota hai aur
+        uske baad phir jab process hota hai, to uska color change hona chaahie
+        na yaar. Wo color change nahi ho raha." He was right and the cause was
+        mine — warming and transcribing both sit near silence, so at 22% chroma
+        amber, green and red all arrived as the same washed grey. The state was
+        being drowned by the level. Floors are 0.55 now, and the structural
+        parts do not use this function at all; see `chrome`.
         """
         L, A, B = self.lab_now
         c = math.hypot(A, B)
-        h = math.atan2(B, A)
+        hue = math.atan2(B, A)
         v = max(0.0, min(1.0, v))
-        lv = 0.42 + (L - 0.42) * (v ** 1.5)
-        cv = c * (0.22 + 0.78 * (v ** 1.2))
-        r, g, b = oklab_to_rgb((lv, cv * math.cos(h), cv * math.sin(h)))
+        lv = 0.52 + (L - 0.52) * (0.45 + 0.55 * v ** 1.5)
+        cv = c * (0.55 + 0.45 * (v ** 1.2))
+        return self._rgba(lv, cv, hue, alpha)
+
+    def chrome(self, alpha: float) -> tuple[float, float, float, float]:
+        """The state colour at full strength, whatever the microphone is doing.
+
+        The bracket, the rail and the jaw are the STATUS display: amber means
+        wait, green means speak, red means it is working them out. That has to be
+        readable in silence — which is precisely when warming and transcribing
+        happen — so it is deliberately not attenuated by level.
+        """
+        L, A, B = self.lab_now
+        return self._rgba(L, math.hypot(A, B), math.atan2(B, A), alpha)
+
+    def _rgba(self, L: float, c: float, hue: float, alpha: float):
+        r, g, b = oklab_to_rgb((L, c * math.cos(hue), c * math.sin(hue)))
         if self.flash > 0.01:                        # capture beat, toward white
             f = self.flash
             r, g, b = (x + (1.0 - x) * f for x in (r, g, b))
@@ -229,7 +248,7 @@ class State:
 
 
 class WaveStrip(Gtk.ApplicationWindow):
-    """Bottom-right corner — a caliper reading the microphone."""
+    """Bottom edge — a caliper anchored right, measuring the full width leftward."""
 
     def __init__(self, app: Gtk.Application, state: State):
         super().__init__(application=app)
@@ -275,133 +294,119 @@ class WaveStrip(Gtk.ApplicationWindow):
         if s.alpha < 0.01:
             return
 
-        # A vernier caliper, anchored in the right-hand corner and measuring
-        # back to the left. Chosen by Yash out of thirty-four candidates and
-        # three right-aligned readings of this one, on 2026-08-13.
+        # A vernier caliper anchored at the RIGHT EDGE, measuring the full width
+        # of the monitor leftward. Chosen by Yash on 2026-08-13: "hard right full
+        # sweep vaala sahi hai" — after the corner version, which packed the same
+        # instrument into the right-hand end, looked wrong to him: "ye jo pichhe
+        # vaali line hai na, ye actually tumko poore length par daalni padegi".
         #
-        # The strip used to be bars, edge to edge. Two things were wrong with
-        # that and this fixes both: it scrolled sideways like a chart recorder
-        # ("sab right se left ke taraf hi ho ja rahi hai"), and it filled the
-        # whole width whether or not it had anything to say. An instrument
-        # sitting in one corner with the rest of the screen left alone is a
-        # quieter thing to have on all day.
+        # So: the scale is the full width and never moves. The origin is pinned
+        # at the right. The only thing that travels is the jaw, and it travels
+        # leftward out of the origin as you get louder.
         #
-        # Everything below is a fraction of h, so the design survives a change
-        # of WAVE_H without being re-tuned.
+        # Every dimension is a fraction of h, so WAVE_H can change without any
+        # of this needing re-tuning.
         ox = w - ORIGIN_INSET
         cy = h * 0.54
         lv = 0.05 + s.smooth * 0.95              # never fully dead
-        span = min(w - 40.0, SPAN_MAX)
+        span = ox - 14.0
 
-        def rgba(v: float, a: float) -> None:
+        def measure(v: float, a: float) -> None:
             cr.set_source_rgba(*s.shade(v, a))
 
-        def stroke(x0, y0, x1, y1, lw, v, a):
+        def status(a: float) -> None:
+            cr.set_source_rgba(*s.chrome(a))
+
+        def line(x0, y0, x1, y1, lw):
             cr.set_line_width(lw)
-            rgba(v, a)
             cr.move_to(x0, y0)
             cr.line_to(x1, y1)
             cr.stroke()
 
-        # A backing wash under the instrument, fading out to the left.
-        #
-        # Not decoration. This surface floats over whatever happens to be at the
-        # bottom of the screen, and the first screenshot on 2026-08-13 landed it
-        # on a terminal status line — hairline ticks over grey text, unreadable.
-        # The overlay cannot know what is underneath, so it brings its own floor.
-        # It stops well short of a bar: transparent on the left, and never more
-        # than a third opaque even under the readout.
-        pad = cairo.LinearGradient(ox - span - 40, 0, ox, 0)
+        # The overlay brings its own floor. It floats over whatever is at the
+        # bottom of the screen — on 2026-08-13 that was a terminal status line,
+        # and hairlines over grey text are unreadable. Weighted to the right,
+        # where the instrument is densest, and gone by the left edge.
+        pad = cairo.LinearGradient(0, 0, ox, 0)
         pad.add_color_stop_rgba(0.00, 0, 0, 0, 0.0)
-        pad.add_color_stop_rgba(0.55, 0, 0, 0, 0.14 * s.alpha)
-        pad.add_color_stop_rgba(1.00, 0, 0, 0, 0.34 * s.alpha)
+        pad.add_color_stop_rgba(0.55, 0, 0, 0, 0.13 * s.alpha)
+        pad.add_color_stop_rgba(1.00, 0, 0, 0, 0.32 * s.alpha)
         cr.set_source(pad)
         cr.rectangle(0, 0, w, h)
         cr.fill()
 
-        # The bracket. Two corners and air — never a closed box, which is the
-        # difference between a HUD and a dialog.
+        # Brackets at both ends. The right one is heavy — that is the anchor,
+        # and it is the piece that carries the state colour at full strength.
+        status(0.62 + 0.30 * lv)
         cr.set_line_width(2.6)
-        rgba(0.6, 0.5 + 0.3 * lv)
-        cr.move_to(ox - 18, 7)
-        cr.line_to(ox, 7)
-        cr.line_to(ox, h - 7)
-        cr.line_to(ox - 18, h - 7)
+        cr.move_to(ox - 18, 6); cr.line_to(ox, 6)
+        cr.line_to(ox, h - 6); cr.line_to(ox - 18, h - 6)
+        cr.stroke()
+        status(0.24)
+        cr.set_line_width(1.6)
+        cr.move_to(24, 6); cr.line_to(10, 6)
+        cr.line_to(10, h - 6); cr.line_to(24, h - 6)
         cr.stroke()
 
-        # Fixed scale, marching left out of the origin, dying out well before
-        # the left edge so the emptiness reads as intended rather than as a
-        # surface that failed to paint.
-        n = 30
+        # The fixed scale: the full-length back line he asked for. It does not
+        # move and it does not respond to the microphone; it is the ruler.
+        n = 56
         sp = span / n
         for i in range(1, n + 1):
-            x = ox - 10 - i * sp
-            if x < 6:
+            x = ox - i * sp
+            if x < 8:
                 break
             major = i % 5 == 0
             u = i / n
-            stroke(x, cy - (15 if major else 8), x, cy,
-                   2.2 if major else 1.4, 0.45,
-                   (0.30 + 0.22 * (1 - u)) * (1 - u * 0.85) + 0.04)
+            status((0.30 + 0.26 * (1 - u)) * (1.0 - 0.55 * u * u) + 0.05)
+            line(x, cy - (15 if major else 8), x, cy, 2.2 if major else 1.4)
 
-        # The vernier comb rides outward on the jaw. 29 teeth against the fixed
-        # 30 is the vernier principle itself: the two combs beat against each
-        # other, and where they line up is the reading.
-        vn = 29
+        # The vernier comb rides on the jaw. 55 teeth against the fixed 56 is the
+        # vernier principle itself — the combs beat against each other, and where
+        # they align is the reading.
+        vn = 55
         vsp = (sp * n) / vn
-        reach = lv * span * 0.9
+        reach = lv * span * 0.92
+        jx = ox - reach
         for i in range(vn + 1):
-            x = ox - 10 - reach + i * vsp
-            if x > ox - 10 or x < 6:
+            x = jx + i * vsp
+            if x > ox or x < 8:
                 continue
             major = i % 5 == 0
             u = i / vn
-            stroke(x, cy, x, cy + (14 if major else 7),
-                   2.4 if major else 1.5, lv,
-                   (0.9 if major else 0.5) * lv * (1 - u * 0.6))
+            measure(lv, (0.9 if major else 0.5) * lv * (1.0 - 0.55 * u * u))
+            line(x, cy, x, cy + (14 if major else 7), 2.4 if major else 1.5)
 
-        # The readout: a bracketed field of cells that fills as you get louder.
-        # This is the part you can read from across the desk without looking at
-        # it properly.
-        bw = 34 + lv * 120
-        bx = ox - 10 - bw
-        cr.set_line_width(2.2)
-        rgba(lv, 0.72 + 0.24 * lv)
-        cr.move_to(bx + 9, cy - 15)
-        cr.line_to(bx, cy - 15)
-        cr.line_to(bx, cy + 15)
-        cr.line_to(bx + 9, cy + 15)
+        # The measurement itself: a bracket at the travelling jaw and a run of
+        # cells filling back to the origin. This is the part that sweeps out from
+        # the right as you speak, and it is what makes the strip a meter rather
+        # than a pattern.
+        cr.set_line_width(2.4)
+        measure(lv, 0.78 + 0.20 * lv)
+        cr.move_to(jx + 10, cy - 16); cr.line_to(jx, cy - 16)
+        cr.line_to(jx, cy + 16); cr.line_to(jx + 10, cy + 16)
         cr.stroke()
 
-        # Lit against unlit has to be a big gap, not a shade. In the first
-        # screenshot the quiet strip and the loud strip looked much the same,
-        # because 0.09 against 0.35 is a difference you have to look for. An
-        # unlit cell is now barely a ghost and a lit one is solid — the meter
-        # should be readable from the corner of your eye, at speed.
-        cells = 14
-        cw = (bw - 12) / cells
-        on = round(lv * cells)
+        cells = 26
+        cw = reach / cells
         for i in range(cells):
-            rgba(lv, 0.55 + 0.42 * lv if i < on else 0.055)
-            cr.rectangle(bx + 7 + i * cw, cy - 4.5, max(1.6, cw - 2.4), 9)
+            measure(lv, 0.18 + 0.58 * lv * (1 - i / cells * 0.7))
+            cr.rectangle(jx + 4 + i * cw, cy - 4, max(1.4, cw - 2.6), 8)
             cr.fill()
 
-        # The jaw face at the origin.
-        stroke(ox - 10, cy - 22, ox - 10, cy + 21, 3.0, lv, 0.6 + 0.35 * lv)
+        # The jaw face at the origin — the fixed end of the caliper.
+        status(0.70 + 0.28 * lv)
+        line(ox, cy - 24, ox, cy + 23, 3.0)
 
-        # Scanlines, but ONLY over the instrument and fading out to the left.
-        # In the prototype they ran the full width, which is fine on a page with
-        # a background; on a transparent overlay that is a permanent dark band
-        # across the bottom of the monitor. Here they darken the corner the
-        # instrument occupies and nothing else.
-        left = max(0.0, bx - 60)
-        scan = cairo.LinearGradient(left, 0, ox, 0)
+        # Scanlines, weighted right like the wash. Full-width at full strength
+        # would be a permanent dark band across the bottom of the monitor.
+        scan = cairo.LinearGradient(0, 0, ox, 0)
         scan.add_color_stop_rgba(0.0, 0, 0, 0, 0.0)
-        scan.add_color_stop_rgba(1.0, 0, 0, 0, 0.20 * s.alpha)
+        scan.add_color_stop_rgba(1.0, 0, 0, 0, 0.18 * s.alpha)
         y = (s.breathe * 3.5) % 3.0
         cr.set_source(scan)
         while y < h:
-            cr.rectangle(left, y, ox - left, 1.0)
+            cr.rectangle(0, y, ox, 1.0)
             y += 3.0
         cr.fill()
 
