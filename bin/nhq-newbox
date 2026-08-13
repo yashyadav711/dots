@@ -538,15 +538,24 @@ verify_shell() {
   head1 "verify: shell"
   [[ -d /usr/share/oh-my-zsh ]] && ok "Oh My Zsh at /usr/share/oh-my-zsh" || bad "OMZ missing"
   [[ -f /usr/share/zsh-theme-powerlevel10k/powerlevel10k.zsh-theme ]] && ok "powerlevel10k present" || warn "p10k theme not found"
-  # MUST run under a pty. Without one, zsh emits "can't change option: zle"
-  # (fzf/p10k keybindings need ZLE, which only exists on a terminal) and this
-  # check reported a broken shell on a box whose interactive zsh is perfectly
-  # clean. `script` gives it the terminal it needs.
+  # Startup cleanliness is about what zsh PRINTS, not what it returns.
+  # Two traps here, both hit on rig:
+  #   1. No pty -> fzf/p10k keybindings need ZLE and zsh prints
+  #      "can't change option: zle", so a clean shell looks broken. Hence script(1).
+  #   2. script(1) READS STDIN, so without </dev/null it swallows whatever is
+  #      feeding the script (it ate a heredoc during debugging), and `zsh -ic`
+  #      given /dev/null hits EOF and exits 1 even when nothing is wrong.
+  # So: run it under a pty, with stdin closed, and judge the OUTPUT.
   if command -v script >/dev/null; then
-    script -qec 'zsh -ic exit' /dev/null &>/dev/null && ok "zsh starts clean under a pty" \
-      || bad "zsh startup errors — reproduce with: script -qec 'zsh -ic exit' /dev/null"
+    local zout
+    zout=$(script -qec 'zsh -ic exit' /dev/null </dev/null 2>&1 | tr -d '\r' | grep -vE '^[[:space:]]*$' || true)
+    if [[ -z $zout ]]; then
+      ok "zsh starts clean (no output under a pty)"
+    else
+      bad "zsh prints on startup: $(head -c 200 <<<"$zout")"
+    fi
   else
-    zsh -ic 'exit' 2>&1 | grep -qv "can't change option: zle" && ok "zsh starts (no pty available to test properly)" || ok "zsh starts clean"
+    warn "script(1) unavailable — cannot test zsh startup properly"
   fi
   zsh -ic 'alias ls' 2>/dev/null | grep -q eza && ok "ls → eza wired" || bad "ls alias not active"
   command -v eza >/dev/null && ok "eza installed (ls/la/ll depend on it)" || bad "eza MISSING — ls/la/ll are broken"
@@ -617,8 +626,17 @@ verify_gpu() {
   else
     bad "nvidia-smi cannot talk to the GPU — module not loaded. Check: dmesg | grep -i nvidia"; return 1
   fi
+  # modeset only matters for a graphical session. On a headless box nvidia_drm
+  # is often not loaded at all, so an empty read is normal — not a problem to
+  # warn about. Compute (CUDA/ollama/containers) does not need KMS.
   local ms; ms=$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null)
-  [[ $ms == Y ]] && ok "nvidia_drm.modeset=Y" || warn "modeset=$ms — add nvidia_drm.modeset=1 to the kernel cmdline if you want a Wayland session"
+  if [[ $ms == Y ]]; then
+    ok "nvidia_drm.modeset=Y (KMS on — Wayland-capable)"
+  elif [[ -z $ms ]]; then
+    ok "nvidia_drm not loaded — expected on a headless box; compute is unaffected"
+  else
+    warn "nvidia_drm.modeset=$ms — add nvidia_drm.modeset=1 to the kernel cmdline before using a Wayland session"
+  fi
   # a module for EVERY installed kernel, or the fallback boots blind
   local k m=0
   for k in $(ls /usr/lib/modules/); do
