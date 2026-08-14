@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# rig-off — shut the GPU box down cleanly from the laptop.
+#
+# Not just `ssh rig poweroff`. The order matters on a box that already loses power
+# several times a day: stop the writers FIRST, flush, then halt. Every unclean
+# stop is a btrfs generation that has to be recovered on the next boot, and a
+# container killed mid-write is the one that comes back corrupt.
+#
+#   rig-off          stop services, sync, power off
+#   rig-off --reboot reboot instead of powering off
+#   rig-off --status just report what is running, change nothing
+#
+# Companion to `rig`, which attaches to its omp session.
+set -uo pipefail
+
+HOST=rig
+MODE="${1:-off}"
+
+c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_d=$'\e[2m'; c_0=$'\e[0m'
+ok()   { printf '  %s✓%s %s\n' "$c_g" "$c_0" "$*"; }
+warn() { printf '  %s!%s %s\n' "$c_y" "$c_0" "$*"; }
+die()  { printf '%srig-off: %s%s\n' "$c_r" "$*" "$c_0" >&2; exit 1; }
+
+reachable() { ssh -o BatchMode=yes -o ConnectTimeout=6 "$HOST" true 2>/dev/null; }
+
+if ! reachable; then
+  case "$MODE" in
+    --status) echo "rig: already off / unreachable"; exit 0 ;;
+    *) echo "rig: already off / unreachable — nothing to do"; exit 0 ;;
+  esac
+fi
+
+if [[ $MODE == --status ]]; then
+  ssh -o BatchMode=yes "$HOST" "bash -lc '
+    echo \"uptime:   \$(uptime -p)\"
+    echo \"omp:      \$(systemctl --user is-active omp-rig.service 2>/dev/null)\"
+    echo \"ollama:   \$(systemctl is-active ollama 2>/dev/null)\"
+    echo \"webui:    \$(sudo -n docker inspect -f {{.State.Status}} open-webui 2>/dev/null || echo absent)\"
+    echo \"loaded:   \$(ollama ps 2>/dev/null | tail -n +2 | awk \"{print \\\$1}\" | paste -sd, - || true)\"
+  '"
+  exit 0
+fi
+
+printf '%s→ %s: stopping writers before halt%s\n' "$c_d" "$HOST" "$c_0"
+
+# Stop in dependency order: the UI that talks to ollama, then ollama itself (it
+# holds multi-GB model files open), then the agent session. Each is best-effort —
+# a missing unit must not block the shutdown.
+ssh -o BatchMode=yes "$HOST" "bash -lc '
+  sudo -n docker stop -t 15 open-webui >/dev/null 2>&1 && echo \"STOPPED webui\"
+  sudo -n systemctl stop ollama >/dev/null 2>&1 && echo \"STOPPED ollama\"
+  systemctl --user stop omp-rig.service >/dev/null 2>&1 && echo \"STOPPED omp\"
+  sync
+  sudo -n btrfs filesystem sync / 2>/dev/null && echo \"SYNCED btrfs\"
+'" 2>/dev/null | while read -r line; do
+  case "$line" in
+    STOPPED*) ok "stopped ${line#STOPPED }" ;;
+    SYNCED*)  ok "flushed ${line#SYNCED }" ;;
+  esac
+done
+
+if [[ $MODE == --reboot ]]; then
+  ok "rebooting"
+  ssh -o BatchMode=yes "$HOST" "bash -lc 'sudo -n systemctl reboot'" 2>/dev/null || true
+  printf '%s  waiting for it to come back…%s\n' "$c_d" "$c_0"
+  sleep 40
+  for i in $(seq 1 14); do
+    reachable && { ok "back up after ~$((40 + (i-1)*10))s"; exit 0; }
+    sleep 10
+  done
+  warn "not back yet — check the BIOS 'Restore on AC Power Loss' setting, or: rig-off --status"
+  exit 1
+fi
+
+ssh -o BatchMode=yes "$HOST" "bash -lc 'sudo -n systemctl poweroff'" 2>/dev/null || true
+
+# Confirm. "I sent the command" is not "it is off".
+for i in $(seq 1 12); do
+  sleep 5
+  reachable || { ok "rig is OFF (clean, after ~$((i*5))s)"; exit 0; }
+done
+warn "still responding after 60s — it may be stuck; check the monitor"
+exit 1

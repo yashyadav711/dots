@@ -1236,16 +1236,21 @@ stage_fleet() {
     (( DRY )) || ln -sfn "$dots/bin/$t" "$HOME/.local/bin/$t"
   done
 
-  # Per-agent shorthands: typing `rig` opens that agent's live session. Only the
-  # ones that actually have a wrapper in dots/bin get linked, so this does not
-  # invent commands for agents that have none.
+  # Per-agent shorthands: `rig` opens that agent's live session, `rig-off` halts
+  # its box. Only names that actually have a wrapper in dots/bin get linked, so
+  # this never invents a command for an agent that has none — and a new verb
+  # (rig-something) is picked up by existing, not by editing this list.
   local sc=0
   while read -r ag; do
-    [[ -n $ag && -x $dots/bin/$ag ]] || continue
-    (( DRY )) || ln -sfn "$dots/bin/$ag" "$HOME/.local/bin/$ag"
-    ((sc++))
+    [[ -n $ag ]] || continue
+    for w in "$ag" "$dots"/bin/"$ag"-*; do
+      w=$(basename "$w")
+      [[ -x $dots/bin/$w ]] || continue
+      (( DRY )) || ln -sfn "$dots/bin/$w" "$HOME/.local/bin/$w"
+      ((sc++))
+    done
   done < <(jq -r '.agents | keys[]' "$dots/bin/fleet-registry.json" 2>/dev/null)
-  (( sc )) && ok "linked $sc agent shorthand(s) (e.g. \`rig\` → nhq-attach rig)"
+  (( sc )) && ok "linked $sc agent shorthand(s) (e.g. \`rig\` attach, \`rig-off\` halt)"
   (( DRY )) || ok "linked the agy/omp helper commands"
 
   # omp agent config — commands, hooks, rules, themes. dots carries these and
