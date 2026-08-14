@@ -91,7 +91,12 @@ case "$cmd" in
       _meta_set_field "$file" "$1" "$2"
       shift 2
     done
-    [[ $# -ne 0 ]] && die "init: dangling field '$1' with no value"
+    # `[[ cond ]] && die` as a branch's LAST statement returns 1 whenever cond is
+    # false — which is the success path. `init` therefore exited 1 on every
+    # successful write, and nhq-spawn's `|| echo "could not write .meta"` fired on
+    # every single spawn while the record was sitting there, correct. An `if` with
+    # no else returns 0.
+    if [[ $# -ne 0 ]]; then die "init: dangling field '$1' with no value"; fi
     ;;
 
   get)
@@ -130,3 +135,8 @@ case "$cmd" in
     die "unknown command '$cmd' (want: init|get|set|all)"
     ;;
 esac
+
+# Reaching here means the command did its work; `die` is the only failure path.
+# Explicit, so no branch's trailing conditional can ever leak a false failure to
+# callers again.
+exit 0
