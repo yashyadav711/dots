@@ -1142,13 +1142,28 @@ stage_fleet() {
   fi
 
   # ── the big binaries ────────────────────────────────────────────────────────
+  # Detect by PATH-INDEPENDENT file test. `command -v` reported both missing on
+  # rig while omp was sitting in ~/.local/bin working fine: a non-interactive ssh
+  # shell gets PATH=/usr/local/sbin:/usr/local/bin:/usr/bin and nothing else.
   local src=${NHQ_FLEET_SRC:-}
   local need=()
-  command -v omp    >/dev/null || need+=(omp)
-  command -v claude >/dev/null || need+=(claude)
+  [[ -x $HOME/.local/bin/omp ]] || need+=(omp)
+
+  # claude ships as versioned trees plus a launcher symlink. The tree can be
+  # present while the launcher is absent (e.g. the tree was copied by hand), so
+  # heal that here instead of calling it missing and re-downloading 235 MB.
+  if [[ ! -x $HOME/.local/bin/claude ]]; then
+    local cv; cv=$(ls -1 "$HOME/.local/share/claude/versions" 2>/dev/null | sort -V | tail -1)
+    if [[ -n ${cv:-} ]]; then
+      run ln -sfn "$HOME/.local/share/claude/versions/$cv" "$HOME/.local/bin/claude"
+      ok "claude launcher relinked → $cv"
+    else
+      need+=(claude)
+    fi
+  fi
 
   if ((${#need[@]} == 0)); then
-    ok "omp $(omp --version 2>/dev/null) and claude already present"
+    ok "omp $("$HOME/.local/bin/omp" --version 2>/dev/null) and claude present"
   elif [[ -z $src ]]; then
     warn "missing: ${need[*]} — these are large binaries and are not in the repo."
     say  "  ${C_D}copy them from another fleet machine:  NHQ_FLEET_SRC=yash@envy nhq-newbox fleet${C_0}"
@@ -1179,8 +1194,13 @@ verify_fleet() {
     command -v "$c" >/dev/null && ok "$c" || warn "$c missing"
   done
   [[ -L $HOME/.omp/agent/commands ]] && ok "omp agent config linked from dots" || warn "omp agent config not linked"
-  if command -v omp >/dev/null; then ok "omp $(omp --version 2>/dev/null)"; else warn "omp not installed (NHQ_FLEET_SRC=... nhq-newbox fleet)"; fi
-  if command -v claude >/dev/null; then ok "claude present"; else warn "claude not installed"; fi
+  # Path-independent: a non-interactive ssh shell has no ~/.local/bin on PATH.
+  if [[ -x $HOME/.local/bin/omp ]]; then ok "omp $("$HOME/.local/bin/omp" --version 2>/dev/null)"; else warn "omp not installed (NHQ_FLEET_SRC=... nhq-newbox fleet)"; fi
+  if [[ -x $HOME/.local/bin/claude ]]; then ok "claude $(basename "$(readlink -f "$HOME/.local/bin/claude")")"; else warn "claude not installed"; fi
+  # ~/.local/bin must be on PATH for an interactive login, or none of the above
+  # is reachable by typing its name.
+  grep -qs 'local/bin' "$HOME/.config/zsh/nhq.zsh" && ok "~/.local/bin exported on PATH for interactive zsh" \
+    || warn "~/.local/bin may not be on PATH — check ~/.config/zsh/nhq.zsh"
   # A linked command whose target vanished is worse than a missing one: it fails
   # at the worst moment instead of being obviously absent.
   local broken; broken=$(find "$HOME/.local/bin" -maxdepth 1 -xtype l 2>/dev/null | wc -l)
