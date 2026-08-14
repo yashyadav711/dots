@@ -21,16 +21,38 @@ set -uo pipefail
 HOST=rig
 REPO='$HOME/Github/rig'          # expanded on the REMOTE side, not here
 
+SESSION=omp-rig
+c_d=$'\e[2m'; c_r=$'\e[31m'; c_0=$'\e[0m'
+die() { printf '%srig: %s%s\n' "$c_r" "$*" "$c_0" >&2; exit 1; }
+
+# ── already ON rig? then everything is local ─────────────────────────────────
+# `rig` is installed on rig too (the fleet stage links every agent shorthand on
+# whichever box it runs). Without this it tried to ssh to itself, and rig has no
+# key to itself, so it died with "cannot reach rig with keys" while sitting on the
+# very machine it was looking for. Same trap nhq_remote_dispatch guards against.
+if [[ "$(hostname -s 2>/dev/null)" == rig ]]; then
+  target="$HOME/Github/rig"
+  case "${1:-}" in
+    --status)  exec "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/nhq-attach" rig --status ;;
+    --attach)  exec tmux new-session -A -s "$SESSION" -c "$target" ;;
+    ''|ssh|sh|shell)
+      # A child process cannot cd the parent shell, so hand over a login shell
+      # already sitting in the repo.
+      cd "$target" 2>/dev/null || cd "$HOME"
+      printf '%salready on rig — %s%s\n' "$c_d" "$PWD" "$c_0"
+      exec "${SHELL:-/bin/bash}" -l ;;
+    *)
+      cd "$target" 2>/dev/null || cd "$HOME"
+      exec omp "$@" ;;
+  esac
+fi
+
 # Re-pin the host before connecting. `rig.local` resolves only when this laptop's
 # systemd-resolved feels like answering mDNS (nsswitch has no mdns entry), which is
 # how `ssh rig` intermittently died with "Temporary failure in name resolution".
 # nhq-resolve asks avahi directly and rewrites the ssh include, so a changed DHCP
 # lease after a power cut also fixes itself here.
 "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/nhq-resolve" rig --quiet >/dev/null 2>&1 || true
-SESSION=omp-rig
-
-c_d=$'\e[2m'; c_r=$'\e[31m'; c_0=$'\e[0m'
-die() { printf '%srig: %s%s\n' "$c_r" "$*" "$c_0" >&2; exit 1; }
 
 ssh -o BatchMode=yes -o ConnectTimeout=6 "$HOST" true 2>/dev/null \
   || die "cannot reach $HOST with keys (is it on? try: rig-off --status)"

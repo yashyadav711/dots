@@ -21,12 +21,36 @@ MODE="${1:-off}"
 # how `ssh rig` intermittently died with "Temporary failure in name resolution".
 # nhq-resolve asks avahi directly and rewrites the ssh include, so a changed DHCP
 # lease after a power cut also fixes itself here.
-"$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/nhq-resolve" rig --quiet >/dev/null 2>&1 || true
 
 c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_d=$'\e[2m'; c_0=$'\e[0m'
 ok()   { printf '  %s✓%s %s\n' "$c_g" "$c_0" "$*"; }
 warn() { printf '  %s!%s %s\n' "$c_y" "$c_0" "$*"; }
 die()  { printf '%srig-off: %s%s\n' "$c_r" "$*" "$c_0" >&2; exit 1; }
+
+# ── already ON rig? shut THIS box down, do not ssh to ourselves ──────────────
+# rig-off is linked on rig too. Without this it tried to ssh to itself, found no
+# key, and reported the box unreachable while running on it.
+if [[ "$(hostname -s 2>/dev/null)" == rig ]]; then
+  if [[ $MODE == --status ]]; then
+    echo "uptime:   $(uptime -p)"
+    echo "omp:      $(systemctl --user is-active omp-rig.service 2>/dev/null)"
+    echo "ollama:   $(systemctl is-active ollama 2>/dev/null)"
+    echo "webui:    $(sudo -n docker inspect -f '{{.State.Status}}' open-webui 2>/dev/null || echo absent)"
+    exit 0
+  fi
+  printf '%s→ shutting down this box (rig) — stopping writers first%s\n' "$c_d" "$c_0"
+  sudo -n docker stop -t 15 open-webui >/dev/null 2>&1 && ok "stopped webui"
+  sudo -n systemctl stop ollama       >/dev/null 2>&1 && ok "stopped ollama"
+  systemctl --user stop omp-rig.service >/dev/null 2>&1 && ok "stopped omp"
+  sync; sudo -n btrfs filesystem sync / 2>/dev/null && ok "flushed btrfs"
+  if [[ $MODE == --reboot ]]; then ok "rebooting"; exec sudo -n systemctl reboot; fi
+  ok "powering off"
+  exec sudo -n systemctl poweroff
+fi
+
+# Re-pin only when we are the REMOTE caller — on rig itself there is nothing to
+# resolve, and the guard above already returned.
+"$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/nhq-resolve" rig --quiet >/dev/null 2>&1 || true
 
 reachable() { ssh -o BatchMode=yes -o ConnectTimeout=6 "$HOST" true 2>/dev/null; }
 
