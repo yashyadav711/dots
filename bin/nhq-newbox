@@ -1231,7 +1231,7 @@ stage_fleet() {
   (( DRY )) && printf '  %s[dry] would link %d nhq-* commands into ~/.local/bin%s\n' "$C_D" "$n" "$C_0" \
             || ok "linked $n nhq-* commands"
 
-  for t in ompt agyq agy-snapshot agy-usage agy-claude agy-reauth mcp-write-guard claude-oom-guard nhq-attach nhq-omp-session; do
+  for t in ompt agyq agy-snapshot agy-usage agy-claude agy-reauth mcp-write-guard claude-oom-guard nhq-attach nhq-omp-session nhq-omp-pane nhq-resolve; do
     [[ -x $dots/bin/$t ]] || continue
     (( DRY )) || ln -sfn "$dots/bin/$t" "$HOME/.local/bin/$t"
   done

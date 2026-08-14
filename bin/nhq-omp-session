@@ -33,22 +33,25 @@ command -v tmux >/dev/null || { echo "nhq-omp-session: tmux not found" >&2; exit
 [[ -x $OMP ]] || { echo "nhq-omp-session: omp not found at $OMP" >&2; exit 1; }
 [[ -d $WORKDIR ]] || { echo "nhq-omp-session: no such dir: $WORKDIR" >&2; exit 1; }
 
-# The pane command. omp exits when a turn ends, so without this loop the pane
-# would drop to a shell and `rig` would attach to a dead prompt. The sleep keeps a
-# crash-looping omp from spinning a core.
-# MUST be wrapped in an explicit shell. tmux execs the pane command directly, so a
-# bare `while true; do …; done` is looked up as a BINARY, fails instantly, and the
-# pane — and with it the whole session — dies the moment it is created. Verified on
-# rig: `tmux new-session -d "sleep 300"` survives, the same with a bare while loop
-# does not, and `bash -c "<loop>"` does.
-PANE_LOOP="while true; do '$OMP'; printf '\n[omp exited — restarting in 2s]\n'; sleep 2; done"
+# The pane command lives in its own script (nhq-omp-pane) because the logic grew
+# past what belongs in a quoted one-liner: it has to tell a DELIBERATE exit from an
+# unattended crash. The first version was a bare `while true; do omp; sleep 2; done`
+# and it relaunched omp the instant Yash typed /exit — he could not leave his own
+# session.
+#
+# Still invoked through an explicit `bash`: tmux execs the pane command directly,
+# so anything that is not a binary dies instantly and takes the session with it.
+# Verified on rig — `tmux new-session -d "sleep 300"` survives, a bare while loop
+# does not.
+PANE="$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/nhq-omp-pane"
+[[ -x $PANE ]] || { echo "nhq-omp-session: missing $PANE" >&2; exit 1; }
 
 # -A is attach-or-create: safe to run repeatedly, never makes a second session.
 tmux new-session -A -d -s "$SESSION" -c "$WORKDIR" \
   -e "VISUAL=${NHQ_OMP_EDITOR:-nhq-editor}" \
   -e "EDITOR=${NHQ_OMP_EDITOR:-nhq-editor}" \
   ${AGENT_NAME:+-e "NHQ_AGENT=$AGENT_NAME"} \
-  bash -c "$PANE_LOOP" || { echo "nhq-omp-session: could not create $SESSION" >&2; exit 1; }
+  bash "$PANE" "$SESSION" || { echo "nhq-omp-session: could not create $SESSION" >&2; exit 1; }
 
 # Confirm it actually survived creation. tmux returns 0 for a session whose pane
 # died immediately, so "created" is not the same as "running".

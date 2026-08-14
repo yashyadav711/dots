@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# nhq-omp-pane <session-name> — the command that runs INSIDE the persistent tmux
+# pane. Keeps omp present without fighting the person using it.
+#
+# The distinction that matters, and the bug it fixes:
+#
+#   The first version was `while true; do omp; sleep 2; done`. The point was that
+#   omp exits when a turn ends, so a bare pane would fall to a dead shell and `rig`
+#   would attach to nothing. But it also meant typing `/exit` inside omp relaunched
+#   it instantly — Yash could not leave.
+#
+#   So: WHY omp exited is what decides.
+#     - a client is ATTACHED  -> a human chose to leave. Respect it, drop to a
+#       shell, leave the session alive so `rig` still has something to attach to.
+#     - NOBODY attached       -> omp fell over unattended. Restart it, so the
+#       session is ready the next time he arrives. That was always the real intent.
+#
+# Restart uses backoff so a genuinely broken omp cannot spin a core.
+set -uo pipefail
+
+SESSION="${1:?usage: nhq-omp-pane <session-name>}"
+OMP="$HOME/.local/bin/omp"
+delay=2
+
+attached() { [[ -n "$(tmux list-clients -t "$SESSION" 2>/dev/null)" ]]; }
+
+while true; do
+  "$OMP"
+  rc=$?
+
+  if attached; then
+    printf '\n\e[2m── omp exited (code %s) and you are attached, so it will not restart.\n' "$rc"
+    printf '   run `omp` to start it again, or detach with the tmux prefix + d.\n'
+    printf '   the session stays alive either way, so `rig` still lands here.\e[0m\n\n'
+    exec "${SHELL:-/bin/bash}" -l
+  fi
+
+  # Unattended exit: bring it back for next time, backing off if it keeps dying.
+  printf '\n\e[2m[omp exited (code %s) with nobody attached — restarting in %ss]\e[0m\n' "$rc" "$delay"
+  sleep "$delay"
+  (( delay < 60 )) && delay=$(( delay * 2 ))
+done
