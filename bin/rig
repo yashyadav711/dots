@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # rig — get onto the GPU box.
 #
-#   rig                    a shell on rig, in ~/Github/rig on its main branch.
-#   rig ssh | sh | shell   the same thing, said explicitly
+#   rig                    FROM THE LAPTOP: a shell on rig, in ~/Github/rig.
+#                          ON RIG ITSELF:   attaches the omp-rig session.
+#   rig ssh | sh | shell   a plain shell, no omp, on either machine
 #   rig --resume [SESSION] resume a previous omp conversation on rig
 #   rig --continue [NAME]  continue the last omp conversation on rig
 #   rig --attach           attach the always-running omp session (omp-rig)
@@ -34,13 +35,26 @@ if [[ "$(hostname -s 2>/dev/null)" == rig ]]; then
   target="$HOME/Github/rig"
   case "${1:-}" in
     --status)  exec "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/nhq-attach" rig --status ;;
-    --attach)  exec tmux new-session -A -s "$SESSION" -c "$target" ;;
-    ''|ssh|sh|shell)
-      # A child process cannot cd the parent shell, so hand over a login shell
-      # already sitting in the repo.
+
+    ''|--attach)
+      # ON rig, bare `rig` means "get me into my session here" — that is what he
+      # asked for, and it is the opposite of what it means from the laptop (where
+      # attaching would nest a second tmux inside the laptop's own).
+      #
+      # -A attaches the always-running omp-rig session if it exists and creates it
+      # otherwise, so this works whether or not the keepalive service is up.
+      if [[ -n ${TMUX:-} ]]; then
+        # Already inside tmux on rig: switch instead of nesting.
+        exec tmux switch-client -t "$SESSION" 2>/dev/null || exec tmux new-session -A -s "$SESSION" -c "$target"
+      fi
+      exec tmux new-session -A -s "$SESSION" -c "$target" ;;
+
+    ssh|sh|shell)
+      # The explicit escape hatch: a plain shell, no omp.
       cd "$target" 2>/dev/null || cd "$HOME"
-      printf '%salready on rig — %s%s\n' "$c_d" "$PWD" "$c_0"
+      printf '%son rig — %s%s\n' "$c_d" "$PWD" "$c_0"
       exec "${SHELL:-/bin/bash}" -l ;;
+
     *)
       cd "$target" 2>/dev/null || cd "$HOME"
       exec omp "$@" ;;

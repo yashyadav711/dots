@@ -33,6 +33,14 @@ hosts="$(jq -r '.agents | to_entries[] | select(.value.host != null) | .value.ho
 [[ -z ${hosts:-} ]] && exit 0
 
 for h in $hosts; do
+  # Skip ourselves. The registry travels with the repo, so on rig the rig agent
+  # also reads host=rig — without this the dashboard sshes to the box it is
+  # already running on, fails for want of a key to itself, and reports the
+  # machine you are sitting on as "unreachable".
+  if nhq_is_self_host "$h"; then
+    printf '\n\e[1m🛰  THIS BOX — %s\e[0m\n   (its sessions are in the local list above)\n' "$h"
+    continue
+  fi
   printf '\n\e[1m🛰  REMOTE — %s\e[0m\n' "$h"
   if ! nhq_remote_check "$h"; then
     printf '   \e[31munreachable\e[0m (key-based ssh failed — ssh-copy-id %s)\n' "$h"
