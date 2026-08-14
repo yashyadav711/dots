@@ -2,16 +2,20 @@
 # rig — get onto the GPU box.
 #
 #   rig                    a shell on rig, in ~/Github/rig on its main branch.
-#                          NO omp. This is the "just put me there" command.
+#   rig ssh | sh | shell   the same thing, said explicitly
 #   rig --resume [SESSION] resume a previous omp conversation on rig
 #   rig --continue [NAME]  continue the last omp conversation on rig
 #   rig --attach           attach the always-running omp session (omp-rig)
 #   rig --status           what is alive over there; changes nothing
-#   rig <anything else>    passed straight through to omp on rig
+#   rig -<flag> …          any other flag is passed through to omp on rig
 #
 # Bare `rig` deliberately does NOT open omp and does NOT attach the persistent
-# session: attaching from inside the laptop's tmux nests two multiplexers, and
-# more importantly he asked for a plain landing spot. omp is opt-in via the flags.
+# session: attaching from inside the laptop's tmux nests two multiplexers, and he
+# asked for a plain landing spot. omp is opt-in via the flags.
+#
+# A bare WORD is not forwarded to omp. It used to be, and `rig ssh` therefore ran
+# omp's own `ssh` subcommand and answered "No SSH hosts configured" — which reads
+# like rig is broken when nothing is wrong. Unknown words now print usage.
 set -uo pipefail
 
 HOST=rig
@@ -41,7 +45,7 @@ case "${1:-}" in
     exec "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/nhq-attach" rig
     ;;
 
-  '')
+  ''|ssh|sh|shell)
     # Plain shell, in the repo, on its main branch. -t for a real pty so the
     # remote login shell (fish) behaves normally.
     #
@@ -78,9 +82,12 @@ case "${1:-}" in
     ;;
 
   *)
-    q=""
-    for a in "$@"; do q+=" $(printf '%q' "$a")"; done
-    # shellcheck disable=SC2029
-    exec ssh -t "$HOST" "bash -lc 'export PATH=\$HOME/.local/bin:\$PATH; cd $REPO 2>/dev/null || cd \$HOME; exec omp$q'"
+    # A bare word used to be forwarded to omp, so `rig ssh` ran omp's OWN ssh
+    # subcommand and printed "No SSH hosts configured" — which reads like rig is
+    # broken when nothing is. Say what the options are instead of guessing.
+    printf '%srig: don'\''t know "%s"%s\n\n' "$c_r" "$1" "$c_0" >&2
+    sed -n '4,10p' "$(readlink -f "${BASH_SOURCE[0]:-$0}")" | sed 's/^# \?/  /' >&2
+    printf '\n  %sinside omp you can also reach it directly: ssh://rig/home/bom/…%s\n' "$c_d" "$c_0" >&2
+    exit 2
     ;;
 esac
