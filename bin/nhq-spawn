@@ -156,8 +156,13 @@ write_spawn_meta "$SESSION"
 # approvals (the fleet equivalent of the old --dangerously-skip-permissions).
 # tmux -e exports NHQ_AGENT into the session env (tmux ≥3.2) so the agent — and any
 # nhq-* callback it runs — knows its own canonical name without re-deriving it.
+# The trailing shell keeps the tmux session (and omp's scrollback) alive after omp
+# exits. It was hardcoded to `fish`, which is only right on the laptop — rig runs
+# zsh, so the pane fell back to whatever tmux's default was. $SHELL follows the
+# machine, with fish as the fallback for the historical behaviour.
+FALLBACK_SHELL="${SHELL:-/usr/bin/fish}"
 tmux new-session -d -s "$SESSION" -e "NHQ_AGENT=$NAME" -c "$REPO" \
-  "$OMP_BIN --config '$SEAT_OVERLAY' --approval-mode yolo; exec fish"
+  "$OMP_BIN --config '$SEAT_OVERLAY' --approval-mode yolo; exec '$FALLBACK_SHELL'"
 
 # Wait for omp (node/bun) to boot before sending the task. Poll the pane's
 # current command until it's no longer a bare shell, capped at ~30s.
