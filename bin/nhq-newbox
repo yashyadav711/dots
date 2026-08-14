@@ -541,12 +541,75 @@ source-file ~/.tmux/.tmux.conf
 if-shell '[ -f ~/.tmux.conf.remote ]' 'source-file ~/.tmux.conf.remote'
 EOF
 
-  # login shell
-  if [[ $SHELL != */zsh ]]; then
-    run sudo chsh -s /usr/bin/zsh "$USER"
-    ok "login shell → zsh (takes effect next login)"
+  # ── fish: the PRIMARY shell ──────────────────────────────────────────────────
+  # Yash's shell is fish, on every box. zsh + Oh My Zsh stay installed and fully
+  # configured above (he asked for OMZ), but fish is what he logs into, so muscle
+  # memory and the dots aliases behave identically to the laptop.
+  pkg fish cachyos-fish-config
+
+  local dotsf=$HOME/Github/dots/fish
+  if [[ -d $dotsf ]]; then
+    run mkdir -p "$HOME/.config/fish/conf.d" "$HOME/.config/fish/functions"
+    run ln -sfn "$dotsf/config.fish" "$HOME/.config/fish/config.fish"
+    run ln -sfn "$dotsf/alias.fish"  "$HOME/.config/fish/conf.d/alias.fish"
+    local fn=0
+    for f in "$dotsf"/functions/*.fish; do
+      [[ -e $f ]] || continue
+      (( DRY )) || ln -sfn "$f" "$HOME/.config/fish/functions/$(basename "$f")"
+      ((fn++))
+    done
+    ok "linked fish config + alias.fish + $fn functions from dots"
   else
-    ok "login shell already zsh"
+    warn "dots/fish not present — run the 'dirs' stage first, then re-run 'shell'"
+  fi
+
+  # The same env the zsh side gets, in fish syntax. conf.d is auto-sourced, so
+  # this needs no edit to his config.fish (which is a symlink into the repo and
+  # shared with the laptop — machine-specific values must never go in there).
+  wr "$HOME/.config/fish/conf.d/nhq-env.fish" <<'EOF'
+# nhq-newbox — machine env for fish. Mirrors ~/.config/zsh/nhq.zsh so both shells
+# behave the same. Kept in conf.d, NOT in config.fish: that file is a symlink into
+# the dots repo shared with every other box.
+fish_add_path -g $HOME/.local/bin
+
+set -gx EDITOR nvim
+set -gx VISUAL nvim
+
+# AI weights/caches on the OS SSD — this box has no bulk-storage disk.
+set -gx OLLAMA_MODELS $HOME/ai/ollama
+set -gx HF_HOME $HOME/ai/huggingface
+set -gx TORCH_HOME $HOME/ai/torch
+set -gx UV_CACHE_DIR $HOME/ai/uv-cache
+
+# GPU shortcuts, matching the zsh aliases.
+alias gpu 'nvidia-smi'
+alias gputop 'nvtop'
+alias gputemp 'nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw --format=csv'
+alias health 'nhq-newbox verify'
+EOF
+
+  # Oh My Fish — the laptop's prompt comes from its budspencer theme. Installed
+  # via its own installer because it is not packaged; skipped if already present
+  # so re-running the stage is free.
+  if [[ ! -f $HOME/.local/share/omf/init.fish ]]; then
+    if (( DRY )); then
+      printf '  %s[dry] install Oh My Fish + budspencer theme%s\n' "$C_D" "$C_0"
+    else
+      run bash -c 'curl -fsSL https://raw.githubusercontent.com/oh-my-fish/oh-my-fish/master/bin/install | fish --no-config' \
+        && ok "Oh My Fish installed"
+      fish -c 'omf install budspencer' >/dev/null 2>&1 && ok "omf theme budspencer" \
+        || warn "could not install the budspencer theme — run: omf install budspencer"
+    fi
+  else
+    ok "Oh My Fish already present"
+  fi
+
+  # login shell → fish
+  if [[ $SHELL != */fish ]]; then
+    run sudo chsh -s /usr/bin/fish "$USER"
+    ok "login shell → fish (takes effect next login; zsh+OMZ remain available as 'zsh')"
+  else
+    ok "login shell already fish"
   fi
   mark_stage shell
 }
@@ -573,6 +636,26 @@ verify_shell() {
     fi
   else
     warn "script(1) unavailable — cannot test zsh startup properly"
+  fi
+
+  # fish is the shell he actually logs into, so it gets the same scrutiny as zsh:
+  # does it start clean, is it the login shell, and did the dots config land.
+  if command -v fish >/dev/null; then
+    local fout
+    fout=$(script -qec 'fish -i -c exit' /dev/null </dev/null 2>&1 | tr -d '\r' \
+           | grep -vE '^[[:space:]]*$|Welcome to fish' || true)
+    [[ -z $fout ]] && ok "fish starts clean" || bad "fish prints on startup: $(head -c 200 <<<"$fout")"
+    [[ -L $HOME/.config/fish/config.fish ]] && ok "fish config.fish linked from dots" \
+      || warn "fish config.fish is not a symlink into dots"
+    fish -c 'alias' 2>/dev/null | grep -q eza && ok "fish: ls → eza wired" \
+      || warn "fish aliases not active (conf.d/alias.fish linked?)"
+    fish -c 'echo $OLLAMA_MODELS' 2>/dev/null | grep -q ai/ollama && ok "fish: AI env exported" \
+      || warn "fish: OLLAMA_MODELS not set (conf.d/nhq-env.fish?)"
+    [[ -f $HOME/.local/share/omf/init.fish ]] && ok "Oh My Fish present" || warn "Oh My Fish missing (prompt theme)"
+    [[ $(getent passwd "$USER" | cut -d: -f7) == */fish ]] && ok "login shell is fish" \
+      || warn "login shell is $(getent passwd "$USER" | cut -d: -f7), not fish"
+  else
+    bad "fish not installed — it is the primary shell"
   fi
   zsh -ic 'alias ls' 2>/dev/null | grep -q eza && ok "ls → eza wired" || bad "ls alias not active"
   command -v eza >/dev/null && ok "eza installed (ls/la/ll depend on it)" || bad "eza MISSING — ls/la/ll are broken"
