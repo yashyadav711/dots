@@ -595,10 +595,18 @@ EOF
     if (( DRY )); then
       printf '  %s[dry] install Oh My Fish + budspencer theme%s\n' "$C_D" "$C_0"
     else
-      run bash -c 'curl -fsSL https://raw.githubusercontent.com/oh-my-fish/oh-my-fish/master/bin/install | fish --no-config' \
-        && ok "Oh My Fish installed"
-      fish -c 'omf install budspencer' >/dev/null 2>&1 && ok "omf theme budspencer" \
-        || warn "could not install the budspencer theme — run: omf install budspencer"
+      # Download then run, NOT `curl | fish`: piped into fish the installer
+      # fails, and it needs --noninteractive or it waits for a keypress that
+      # never comes in an automated run.
+      if run bash -c 'curl -fsSL https://raw.githubusercontent.com/oh-my-fish/oh-my-fish/master/bin/install -o /tmp/omf-install' \
+         && run fish /tmp/omf-install --noninteractive; then
+        ok "Oh My Fish installed"
+        run rm -f /tmp/omf-install
+        fish -c 'omf install budspencer' >/dev/null 2>&1 && ok "omf theme budspencer" \
+          || warn "could not install the budspencer theme — run: omf install budspencer"
+      else
+        warn "Oh My Fish install failed — fish still works, just without the omf prompt theme"
+      fi
     fi
   else
     ok "Oh My Fish already present"
