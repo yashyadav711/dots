@@ -22,6 +22,7 @@
 #   docker   docker + daemon.json (log caps, live-restore) + GPU via CDI
 #   storage  OPTIONAL: a real second disk, only if one is ever added + approved
 #   dirs     ~/Github + ~/ai layout; model caches on the SSD (no bulk disk here)
+#   fleet    nhq-* commands, omp agent config, omp/claude binaries
 #   share    NFS export, Syncthing, Tailscale, mDNS
 #   power    journald caps, snapper retention, grub-btrfs, WoL, hibernate wiring
 #
@@ -47,7 +48,7 @@ LOG=/var/log/nhq-newbox.log
 
 C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[1m'; C_D=$'\e[2m'; C_0=$'\e[0m'
 
-STAGES=(base ssh shell gpu docker storage dirs share power)
+STAGES=(base ssh shell gpu docker storage dirs fleet share power)
 
 say()  { printf '%s\n' "$*"; }
 head1() { printf '\n%s══ %s %s\n' "$C_B" "$*" "$C_0"; }
@@ -1070,6 +1071,122 @@ verify_share() {
 
 # ─────────────────────────────────────────────────────────── power
 
+# ─────────────────────────────────────────────────────────── fleet
+
+# The NHQ tooling layer: the nhq-* commands, ompt, the omp agent config, and the
+# two big self-updating binaries (omp, claude).
+#
+# Split deliberately: everything that lives in the dots repo is linked here and
+# is fully reproducible from git. omp and claude are ~180 MB and ~235 MB binaries
+# that are NOT in the repo, so they are copied from another fleet machine named
+# by NHQ_FLEET_SRC. Both self-update afterwards, so this only has to happen once.
+stage_fleet() {
+  head1 "fleet — nhq-* commands, omp agent config, omp/claude binaries"
+  local dots=$HOME/Github/dots
+  [[ -d $dots/bin ]] || { warn "dots not cloned — run the 'dirs' stage first"; return 0; }
+  run mkdir -p "$HOME/.local/bin"
+
+  # nhq-* by GLOB, not a hand-kept list: the same reasoning as dots/install.sh —
+  # a new tool should be installed by existing, not by someone remembering to add
+  # it here. Libraries and data files are resolved as siblings inside dots/bin via
+  # readlink -f, so they must stay there and must NOT be linked.
+  # NOTE: these loops mutate directly rather than via run(), so each one is
+  # explicitly DRY-guarded. 122 symlinks through run() would bury the output;
+  # a dry run that silently created them would be worse.
+  local n=0 cmd
+  for path in "$dots"/bin/nhq-*; do
+    [[ -e $path ]] || continue
+    cmd=$(basename "$path")
+    case "$cmd" in
+      *.sh|*.yml|*.json|*.jsonl|*.md) continue ;;
+      nhq-heydaddy-deploy|nhq-heydaddy-probe) continue ;;   # argv[0] dispatchers
+    esac
+    [[ -x $path ]] || continue
+    (( DRY )) || ln -sfn "$path" "$HOME/.local/bin/$cmd"
+    ((n++))
+  done
+  (( DRY )) && printf '  %s[dry] would link %d nhq-* commands into ~/.local/bin%s\n' "$C_D" "$n" "$C_0" \
+            || ok "linked $n nhq-* commands"
+
+  for t in ompt agyq agy-snapshot agy-usage agy-claude agy-reauth mcp-write-guard claude-oom-guard; do
+    [[ -x $dots/bin/$t ]] || continue
+    (( DRY )) || ln -sfn "$dots/bin/$t" "$HOME/.local/bin/$t"
+  done
+  (( DRY )) || ok "linked the agy/omp helper commands"
+
+  # omp agent config — commands, hooks, rules, themes. dots carries these and
+  # install.sh never linked them, so they existed in git and on exactly one
+  # machine. Per-subdir symlinks so omp's own generated state in ~/.omp/agent
+  # (sessions, caches) is untouched.
+  if [[ -d $dots/omp/agent ]]; then
+    run mkdir -p "$HOME/.omp/agent"
+    for d in "$dots"/omp/agent/*/; do
+      [[ -d $d ]] || continue
+      (( DRY )) || ln -sfn "${d%/}" "$HOME/.omp/agent/$(basename "$d")"
+    done
+    (( DRY )) && printf '  %s[dry] would link omp agent config: %s%s\n' "$C_D" "$(ls -1 "$dots"/omp/agent | tr '\n' ' ')" "$C_0" \
+              || ok "linked omp agent config: $(ls -1 "$dots"/omp/agent | tr '\n' ' ')"
+  fi
+
+  # The nhq command grid is generated from a manifest, then linted. Both run here
+  # for the same reason install.sh runs them: the rule was never the problem,
+  # nothing checking it was. nhq-lint only reports, but it still must not run
+  # during a dry run — "changes nothing" has to include "prints nothing extra".
+  [[ -x $dots/bin/nhq-gen ]] && run "$dots/bin/nhq-gen" --apply
+  if [[ -x $dots/bin/nhq-lint ]]; then
+    if (( DRY )); then
+      printf '  %s[dry] would run nhq-lint%s\n' "$C_D" "$C_0"
+    else
+      "$dots/bin/nhq-lint" --quiet || warn "nhq-lint reported naming errors (not fatal)"
+    fi
+  fi
+
+  # ── the big binaries ────────────────────────────────────────────────────────
+  local src=${NHQ_FLEET_SRC:-}
+  local need=()
+  command -v omp    >/dev/null || need+=(omp)
+  command -v claude >/dev/null || need+=(claude)
+
+  if ((${#need[@]} == 0)); then
+    ok "omp $(omp --version 2>/dev/null) and claude already present"
+  elif [[ -z $src ]]; then
+    warn "missing: ${need[*]} — these are large binaries and are not in the repo."
+    say  "  ${C_D}copy them from another fleet machine:  NHQ_FLEET_SRC=yash@envy nhq-newbox fleet${C_0}"
+  else
+    say "  fetching ${need[*]} from $src"
+    for b in "${need[@]}"; do
+      case $b in
+        omp)
+          run rsync -a --info=progress2 "$src:.local/bin/omp" "$HOME/.local/bin/omp" \
+            && run chmod +x "$HOME/.local/bin/omp" ;;
+        claude)
+          # claude lives under a versioned dir with a launcher symlink; take the
+          # whole tree so the version layout stays intact.
+          run rsync -a "$src:.local/share/claude/" "$HOME/.local/share/claude/"
+          local v; v=$(ls -1 "$HOME/.local/share/claude/versions" 2>/dev/null | sort -V | tail -1)
+          [[ -n ${v:-} ]] && run ln -sfn "$HOME/.local/share/claude/versions/$v" "$HOME/.local/bin/claude" ;;
+      esac
+    done
+  fi
+  mark_stage fleet
+}
+
+verify_fleet() {
+  head1 "verify: fleet"
+  local n; n=$(find "$HOME/.local/bin" -maxdepth 1 -name 'nhq-*' 2>/dev/null | wc -l)
+  (( n > 50 )) && ok "$n nhq-* commands on PATH" || warn "only $n nhq-* commands linked"
+  for c in nhq nhq-bot nhq-status ompt; do
+    command -v "$c" >/dev/null && ok "$c" || warn "$c missing"
+  done
+  [[ -L $HOME/.omp/agent/commands ]] && ok "omp agent config linked from dots" || warn "omp agent config not linked"
+  if command -v omp >/dev/null; then ok "omp $(omp --version 2>/dev/null)"; else warn "omp not installed (NHQ_FLEET_SRC=... nhq-newbox fleet)"; fi
+  if command -v claude >/dev/null; then ok "claude present"; else warn "claude not installed"; fi
+  # A linked command whose target vanished is worse than a missing one: it fails
+  # at the worst moment instead of being obviously absent.
+  local broken; broken=$(find "$HOME/.local/bin" -maxdepth 1 -xtype l 2>/dev/null | wc -l)
+  (( broken == 0 )) && ok "no broken symlinks in ~/.local/bin" || bad "$broken broken symlink(s) in ~/.local/bin"
+}
+
 stage_power() {
   head1 "power — surviving 3–4 cuts a day"
   # cachyos-snapper-support is the CachyOS name; plain 'snapper-support' does not
@@ -1320,7 +1437,7 @@ main() {
     verify)
       RO=1
       preflight
-      for s in base ssh shell gpu docker storage dirs share power; do
+      for s in base ssh shell gpu docker storage dirs fleet share power; do
         declare -F "verify_$s" >/dev/null && "verify_$s" || true
       done
       head1 "done"; exit 0 ;;
