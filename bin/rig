@@ -16,6 +16,13 @@ set -uo pipefail
 
 HOST=rig
 REPO='$HOME/Github/rig'          # expanded on the REMOTE side, not here
+
+# Re-pin the host before connecting. `rig.local` resolves only when this laptop's
+# systemd-resolved feels like answering mDNS (nsswitch has no mdns entry), which is
+# how `ssh rig` intermittently died with "Temporary failure in name resolution".
+# nhq-resolve asks avahi directly and rewrites the ssh include, so a changed DHCP
+# lease after a power cut also fixes itself here.
+"$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/nhq-resolve" rig --quiet >/dev/null 2>&1 || true
 SESSION=omp-rig
 
 c_d=$'\e[2m'; c_r=$'\e[31m'; c_0=$'\e[0m'
