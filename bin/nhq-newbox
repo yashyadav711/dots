@@ -48,7 +48,9 @@ LOG=/var/log/nhq-newbox.log
 
 C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[1m'; C_D=$'\e[2m'; C_0=$'\e[0m'
 
-STAGES=(base ssh shell gpu docker storage dirs fleet share power)
+# agy sits before fleet: the fleet stage starts this box's omp session, and that
+# session needs a working model lane the moment it comes up.
+STAGES=(base ssh shell gpu docker storage dirs agy fleet share power)
 
 say()  { printf '%s\n' "$*"; }
 head1() { printf '\n%s══ %s %s\n' "$C_B" "$*" "$C_0"; }
@@ -1067,6 +1069,141 @@ verify_dirs() {
     [[ -d $HOME/ai/ollama ]] && ok "AI dirs on SSD under ~/ai (no bulk disk — expected on this box)" \
       || bad "~/ai/ollama missing — dirs stage did not complete"
   fi
+}
+
+# ─────────────────────────────────────────────────────────── agy (model proxy)
+
+# The rotator is what gives a GPU box working frontier models without an API
+# key: an OpenAI-compatible proxy over a pool of Google accounts, serving
+# Gemini + Claude at zero Anthropic quota. omp's `agy/*` lanes point straight at
+# it, and Open WebUI lists the same models, so one service covers agent work and
+# the chat UI both.
+#
+# It runs LOCALLY on every box that needs it rather than everyone borrowing the
+# laptop's copy — a headless box must keep working when the laptop is asleep.
+stage_agy() {
+  head1 "agy — local model proxy (Gemini/Claude, keyless) for omp + Open WebUI"
+
+  # The distro npm, deliberately. `npm` is NOT installed with nodejs on Arch, and
+  # on a box with Hermes the npm found on PATH belongs to Hermes' own bundled
+  # node under ~/.hermes/node. A system service must never depend on another
+  # app's private runtime — when Hermes updates, the service would die with it.
+  pkg npm nodejs git
+
+  local app="$HOME/Github/nHQ/pi-antigravity-rotator"
+  local repo=https://github.com/yashyadav711/pi-antigravity-rotator.git
+
+  # Fetch by URL, never by remote NAME. "origin" means different things on
+  # different boxes — on the laptop it is the upstream project and this repo's
+  # own fixes live only on the fork, so `reset --hard origin/main` there would
+  # quietly roll the tree back onto upstream and drop them.
+  if [[ -d $app/.git ]]; then
+    if [[ -n $(git -C "$app" status --porcelain 2>/dev/null) ]]; then
+      warn "$app has uncommitted changes — leaving the tree alone (commit or stash, then re-run)"
+    else
+      run git -C "$app" fetch -q "$repo" main && run git -C "$app" reset --hard -q FETCH_HEAD
+    fi
+  else
+    run mkdir -p "$(dirname "$app")"
+    run git clone -q "$repo" "$app"
+  fi
+  [[ -d $app/src/compat ]] && ok "compat layer present ($(git -C "$app" rev-parse --short HEAD 2>/dev/null))" \
+    || bad "no src/compat/ — this checkout predates tool-schema sanitising and WILL 400 on omp's tool calls"
+
+  # Never --omit=dev here: `npm start` runs `tsx src/cli.ts`, and tsx is a dev
+  # dependency, so a production-only install guarantees the unit cannot boot.
+  say "  installing deps with the distro node ($(/usr/bin/node --version 2>/dev/null))"
+  ( cd "$app" && run env PATH=/usr/bin:/usr/local/bin /usr/bin/npm install --no-audit --no-fund )
+  [[ -x $app/node_modules/.bin/tsx ]] && ok "tsx present" || bad "tsx missing — 'npm start' cannot run"
+
+  # Credentials are the one thing this script will not invent. They are Google
+  # refresh tokens; they get copied from a box that already has them.
+  local acct="$HOME/.pi-antigravity-rotator/accounts.json"
+  if [[ -s $acct ]]; then
+    ok "accounts.json present ($(python3 -c "import json;print(len(json.load(open('$acct'))['accounts']))" 2>/dev/null || echo '?') account(s))"
+  else
+    warn "no $acct — copy it from a box that has it, then re-run this stage:"
+    say  "      scp ~/.pi-antigravity-rotator/accounts.json ~/.config/agy/creds.env <thisbox>:"
+  fi
+
+  WR_MODE=600 wr "$HOME/.config/systemd/user/pi-antigravity-rotator.service" <<EOF
+[Unit]
+Description=pi-antigravity-rotator proxy server (agy lanes for omp + Open WebUI)
+Documentation=https://github.com/tuxevil/pi-antigravity-rotator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$app
+# Explicit PATH: ~/.local/bin can shadow the distro node with an app-bundled one,
+# and this service must use the node its deps were built against.
+Environment=PATH=/usr/bin:/usr/local/bin
+ExecStart=/usr/bin/npm start
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pi-antigravity-rotator
+
+[Install]
+WantedBy=default.target
+EOF
+
+  run systemctl --user daemon-reload
+  run systemctl --user enable --now pi-antigravity-rotator.service
+
+  # Teach omp the provider. Keyless and self-discovering, so the model list never
+  # goes stale as the upstream pool changes.
+  wr "$HOME/.omp/agent/models.yml" <<'EOF'
+# omp custom providers
+#
+# agy = pi-antigravity-rotator, running as a systemd user service ON THIS BOX
+#   (localhost:51200). Keyless OpenAI-compatible proxy over a pool of Google
+#   accounts -> Gemini + Claude at zero Anthropic quota. Models are discovered
+#   from GET /v1/models, so this file never has to list them.
+providers:
+  agy:
+    baseUrl: http://localhost:51200/v1
+    auth: none
+    api: openai-completions
+    discovery:
+      type: openai-models-list
+EOF
+
+  mark_stage agy
+}
+
+verify_agy() {
+  head1 "verify: agy"
+  local app="$HOME/Github/nHQ/pi-antigravity-rotator"
+  [[ -d $app/src/compat ]] && ok "compat layer present" \
+    || bad "no src/compat/ — omp tool calls will 400 (Google rejects unsanitised schemas)"
+  [[ -x $app/node_modules/.bin/tsx ]] && ok "tsx installed" || bad "tsx missing — the unit cannot start"
+  grep -q 'PATH=/usr/bin' "$HOME/.config/systemd/user/pi-antigravity-rotator.service" 2>/dev/null \
+    && ok "unit pinned to the distro node" \
+    || warn "unit not PATH-pinned — it may pick up an app-bundled node that its deps were not built against"
+  systemctl --user is-enabled --quiet pi-antigravity-rotator 2>/dev/null && ok "enabled at login" \
+    || bad "NOT enabled — the proxy will not return after a reboot"
+  systemctl --user is-active --quiet pi-antigravity-rotator 2>/dev/null && ok "active" || { bad "not running"; return 1; }
+
+  local n
+  n=$(curl -s -m 12 http://127.0.0.1:51200/v1/models 2>/dev/null \
+      | python3 -c 'import json,sys;print(len(json.load(sys.stdin).get("data",[])))' 2>/dev/null)
+  [[ ${n:-0} -gt 0 ]] && ok "serving $n model(s) on :51200" || bad "/v1/models returned nothing — check accounts.json"
+
+  # A model list proves the service is up; only a completion proves the accounts
+  # actually authenticate from THIS box.
+  local reply
+  reply=$(curl -s -m 60 http://127.0.0.1:51200/v1/chat/completions \
+            -H 'Content-Type: application/json' -H 'Authorization: Bearer local' \
+            -d '{"model":"gemini-3-flash","messages":[{"role":"user","content":"Reply with exactly: OK"}],"max_tokens":8}' 2>/dev/null \
+          | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["choices"][0]["message"]["content"].strip() if "choices" in d else "ERR "+json.dumps(d)[:120])' 2>/dev/null)
+  [[ $reply == *OK* ]] && ok "real completion works — the accounts authenticate here" \
+    || bad "completion failed: ${reply:-no response}"
+
+  grep -q 'agy:' "$HOME/.omp/agent/models.yml" 2>/dev/null && ok "omp knows the agy provider" \
+    || bad "no agy provider in ~/.omp/agent/models.yml — omp will ask for an API key"
 }
 
 # ─────────────────────────────────────────────────────────── share
