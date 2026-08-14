@@ -66,8 +66,14 @@ fi
 if [[ "$MODE" == --status ]]; then
   ssh -o BatchMode=yes "$HOST" "bash -lc '
     if tmux has-session -t $SESSION 2>/dev/null; then
-      panecmd=\$(tmux list-panes -t $SESSION -F \"#{pane_current_command}\" 2>/dev/null | head -1)
-      echo \"live — pane running: \$panecmd\"
+      # pane_current_command is the keepalive LOOP SHELL; omp is its child. Report
+      # what is actually running or this says "zsh" for a perfectly live agent.
+      ppid=\$(tmux list-panes -t $SESSION -F \"#{pane_pid}\" 2>/dev/null | head -1)
+      if pgrep -P \"\$ppid\" -x omp >/dev/null 2>&1; then
+        echo \"live — omp running (pid \$(pgrep -P \"\$ppid\" -x omp | head -1))\"
+      else
+        echo \"live — omp restarting (keepalive brings it back within ~2s)\"
+      fi
       systemctl --user is-active omp-$KEY.service 2>/dev/null | sed \"s/^/keepalive: /\"
     else
       echo \"no session\"
