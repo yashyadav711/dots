@@ -670,24 +670,33 @@ verify_shell() {
   command -v bat >/dev/null && ok "bat installed (cat depends on it)" || bad "bat MISSING — cat is broken"
   [[ -f $HOME/.tmux.conf ]] && ok "tmux.conf present" || bad "tmux.conf missing"
 
-  # Check the RESOLVED BINDING, not that a file exists. The override file was
+  # Check the RESOLVED BINDING, not that a file exists — the override file was
   # written correctly on rig and never sourced, so "file present" passed while
-  # copy was still piping to wl-copy and silently failing over SSH.
-  if tmux -f "$HOME/.tmux.conf" new-session -d -s _nhqcheck 2>/dev/null; then
-    ok "tmux starts with the real config"
-    local binding; binding=$(tmux list-keys -T copy-mode-vi 2>/dev/null | grep MouseDragEnd1Pane || true)
-    if [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]]; then
-      ok "graphical session — wl-copy/xclip bindings are correct here"
-    elif grep -qE 'wl-copy|xclip|pbcopy' <<<"$binding"; then
-      bad "copy still pipes to wl-copy/xclip with no display — copies will NOT reach your laptop. Is ~/.tmux.conf.remote sourced?"
+  # copy still piped to wl-copy and failed silently over SSH.
+  #
+  # MUST use a private socket (-L). `tmux -f <conf>` only applies when the SERVER
+  # starts; against an already-running server the flag is ignored and you read
+  # that server's stale bindings. A leftover server from before the config was
+  # rewritten made this check report a broken clipboard while the config was fine.
+  local S=(tmux -L nhqcheck -f "$HOME/.tmux.conf")
+  "${S[@]}" kill-server 2>/dev/null
+  if "${S[@]}" new-session -d -s probe 2>/dev/null; then
+    ok "tmux starts with the real config (isolated server)"
+    local binding; binding=$("${S[@]}" list-keys -T copy-mode-vi 2>/dev/null | grep MouseDragEnd1Pane || true)
+    if grep -qE 'wl-copy|xclip|pbcopy' <<<"$binding"; then
+      if [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]]; then
+        ok "graphical session — wl-copy/xclip bindings are correct here"
+      else
+        bad "copy pipes to wl-copy/xclip with no display — copies will NOT reach your laptop. Is ~/.tmux.conf.remote sourced?"
+      fi
     elif grep -q 'copy-selection' <<<"$binding"; then
       ok "copy uses OSC52 (reaches the laptop clipboard over SSH)"
     else
       warn "could not determine the copy binding: ${binding:-<none>}"
     fi
-    [[ $(tmux show -gv set-clipboard 2>/dev/null) == on ]] && ok "set-clipboard on (OSC52 enabled)" \
-      || warn "set-clipboard is $(tmux show -gv set-clipboard 2>/dev/null) — OSC52 will not forward"
-    tmux kill-session -t _nhqcheck 2>/dev/null
+    [[ $("${S[@]}" show -gv set-clipboard 2>/dev/null) == on ]] && ok "set-clipboard on (OSC52 enabled)" \
+      || warn "set-clipboard is $("${S[@]}" show -gv set-clipboard 2>/dev/null) — OSC52 will not forward"
+    "${S[@]}" kill-server 2>/dev/null
   else
     bad "tmux failed to start with ~/.tmux.conf — config error"
   fi
