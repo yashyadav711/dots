@@ -560,6 +560,55 @@ bind v copy-mode \; send-keys -X begin-selection \; send-keys -X cursor-right
 run-shell -b "sleep 3 && bash $HOME/Github/dots/tmux/copy-mode-type-exit.sh"
 # ------------------------------------------------------------------------------
 
+# -- headless / SSH clipboard fallback -----------------------------------------
+# The wl-copy bindings above are right on this laptop and USELESS anywhere without
+# a Wayland display — over SSH into rig they fail silently and every copy dies in
+# tmux's internal buffer: you select text and nothing reaches the clipboard.
+#
+# OSC 52 is the fix: tmux hands the selection to the CLIENT terminal (kitty here),
+# which puts it in the local clipboard. `set-clipboard on` above already enables
+# that transport; these bindings just stop piping to a program that is not there.
+#
+# GUARDED so this one shared file stays correct on every machine: it only rebinds
+# when there is no Wayland AND no X display, i.e. exactly when wl-copy/xclip
+# cannot work. On the laptop it is a no-op.
+#
+# It lives HERE rather than in a machine-local file because both alternatives
+# broke on rig: wrapping ~/.tmux.conf stopped the gpakosz base resolving its own
+# path (its _apply_configuration pipeline exited 127 and the theme silently never
+# applied), and chaining a second ~/.tmux.conf.local recursed with
+# "too many nested files".
+if-shell '[ -z "$WAYLAND_DISPLAY" ] && [ -z "$DISPLAY" ]' {
+  unbind -T copy-mode    MouseDragEnd1Pane
+  unbind -T copy-mode-vi MouseDragEnd1Pane
+  bind -T copy-mode    MouseDragEnd1Pane send -X copy-selection-and-cancel
+  bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-selection-and-cancel
+  bind -T copy-mode    y send -X copy-selection-and-cancel
+  bind -T copy-mode-vi y send -X copy-selection-and-cancel
+}
+# ------------------------------------------------------------------------------
+
+# -- per-machine status colours -------------------------------------------------
+# Yash works on rig mostly over `ssh rig` / `rig` from this laptop, and the two
+# look identical once you are in a terminal. One wrong `rm` because you thought
+# you were somewhere else is enough. So the box announces itself: the laptop keeps
+# its ember/crimson bar, rig gets teal — matching its omp theme (nhq-rig), so both
+# surfaces agree at a glance.
+#
+# Runtime `set -g`, not tmux_conf_theme_* variables: those are consumed by the
+# base's shell pass at load time and cannot be made conditional. These options are
+# applied after the theme is built, so they win.
+if-shell '[ "$(hostname -s)" = rig ]' {
+  set -g status-style                       'fg=#d4d8e4,bg=#0b1f1d,none'
+  set -g status-left  '#[fg=#0b1f1d,bg=#2dd4bf,bold] ⛁ RIG #[fg=#2dd4bf,bg=#0b1f1d,nobold]#[fg=#7fffd4,bg=#0b1f1d] #S '
+  set -g status-right '#[fg=#14b8a6,bg=#0b1f1d] %H:%M #[fg=#0b1f1d,bg=#2dd4bf,bold] GPU '
+  set -g pane-active-border-style           'fg=#2dd4bf'
+  set -g pane-border-style                  'fg=#14384a'
+  set -g message-style                      'fg=#0b1f1d,bg=#2dd4bf,bold'
+  setw -g window-status-current-style       'fg=#0b1f1d,bg=#7fffd4,bold'
+}
+# ------------------------------------------------------------------------------
+
 # # /!\ do not remove the following line
 # EOF
 #

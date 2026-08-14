@@ -1,13 +1,79 @@
 #!/usr/bin/env bash
-# rig — open the Rig agent's live omp session on the GPU box.
+# rig — get onto the GPU box.
 #
-# Typing `rig` from a plain terminal ssh's to rig and lands in the same tmux
-# session every time, with omp already running. Detach with the tmux prefix + d;
-# the conversation stays alive on the box, so the next `rig` continues it.
+#   rig                    a shell on rig, in ~/Github/rig on its main branch.
+#                          NO omp. This is the "just put me there" command.
+#   rig --resume [SESSION] resume a previous omp conversation on rig
+#   rig --continue [NAME]  continue the last omp conversation on rig
+#   rig --attach           attach the always-running omp session (omp-rig)
+#   rig --status           what is alive over there; changes nothing
+#   rig <anything else>    passed straight through to omp on rig
 #
-#   rig            attach
-#   rig --status   is it alive, without attaching
-#
-# Everything real lives in nhq-attach, which does this for any agent in the
-# registry — local or remote. This is just the name Yash wanted to type.
-exec "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/nhq-attach" rig "$@"
+# Bare `rig` deliberately does NOT open omp and does NOT attach the persistent
+# session: attaching from inside the laptop's tmux nests two multiplexers, and
+# more importantly he asked for a plain landing spot. omp is opt-in via the flags.
+set -uo pipefail
+
+HOST=rig
+REPO='$HOME/Github/rig'          # expanded on the REMOTE side, not here
+SESSION=omp-rig
+
+c_d=$'\e[2m'; c_r=$'\e[31m'; c_0=$'\e[0m'
+die() { printf '%srig: %s%s\n' "$c_r" "$*" "$c_0" >&2; exit 1; }
+
+ssh -o BatchMode=yes -o ConnectTimeout=6 "$HOST" true 2>/dev/null \
+  || die "cannot reach $HOST with keys (is it on? try: rig-off --status)"
+
+case "${1:-}" in
+  --status)
+    exec "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/nhq-attach" rig --status
+    ;;
+
+  --attach)
+    # The persistent session, for picking up the long-running conversation.
+    exec "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/nhq-attach" rig
+    ;;
+
+  '')
+    # Plain shell, in the repo, on its main branch. -t for a real pty so the
+    # remote login shell (fish) behaves normally.
+    #
+    # The branch is only switched when the tree is CLEAN: silently moving off a
+    # branch with uncommitted work would be a good way to lose it.
+    exec ssh -t "$HOST" "cd $REPO 2>/dev/null || cd \$HOME; \
+      if git rev-parse --git-dir >/dev/null 2>&1; then \
+        main=\$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||'); \
+        [ -n \"\$main\" ] || main=\$(git branch --list main master | head -1 | tr -d ' *'); \
+        cur=\$(git rev-parse --abbrev-ref HEAD); \
+        if [ -n \"\$main\" ] && [ \"\$cur\" != \"\$main\" ]; then \
+          if [ -z \"\$(git status --porcelain)\" ]; then \
+            git checkout -q \"\$main\" && echo \"switched to \$main\"; \
+          else \
+            echo \"staying on \$cur — uncommitted changes, not switching to \$main\"; \
+          fi; \
+        fi; \
+      fi; \
+      exec \$SHELL -l"
+    ;;
+
+  --resume|--continue|-*)
+    # omp flags — hand the whole argument list to omp on rig.
+    #
+    # Run omp DIRECTLY, not inside a remote tmux: this is usually invoked from the
+    # laptop's own tmux, and nesting would leave the prefix key fighting itself.
+    # For scrollback-in-tmux use `rig --attach`, which is what the persistent
+    # session is for.
+    q=""
+    for a in "$@"; do q+=" $(printf '%q' "$a")"; done
+    printf '%s→ omp on %s%s\n' "$c_d" "$HOST" "$c_0"
+    # shellcheck disable=SC2029
+    exec ssh -t "$HOST" "bash -lc 'export PATH=\$HOME/.local/bin:\$PATH; cd $REPO 2>/dev/null || cd \$HOME; exec omp$q'"
+    ;;
+
+  *)
+    q=""
+    for a in "$@"; do q+=" $(printf '%q' "$a")"; done
+    # shellcheck disable=SC2029
+    exec ssh -t "$HOST" "bash -lc 'export PATH=\$HOME/.local/bin:\$PATH; cd $REPO 2>/dev/null || cd \$HOME; exec omp$q'"
+    ;;
+esac
