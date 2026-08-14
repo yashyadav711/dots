@@ -50,7 +50,7 @@ C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[1m'; C_D=$'\e[2m'; C_0=$'\
 
 # agy sits before fleet: the fleet stage starts this box's omp session, and that
 # session needs a working model lane the moment it comes up.
-STAGES=(base ssh shell gpu docker storage dirs agy fleet share power)
+STAGES=(base ssh shell gpu docker storage dirs agy ai fleet share power)
 
 say()  { printf '%s\n' "$*"; }
 head1() { printf '\n%s══ %s %s\n' "$C_B" "$*" "$C_0"; }
@@ -1069,6 +1069,159 @@ verify_dirs() {
     [[ -d $HOME/ai/ollama ]] && ok "AI dirs on SSD under ~/ai (no bulk disk — expected on this box)" \
       || bad "~/ai/ollama missing — dirs stage did not complete"
   fi
+}
+
+# ─────────────────────────────────────────────────────────── ai (local models)
+
+# Local inference + the chat UI that fronts it. Pairs with the agy stage: Open
+# WebUI ends up listing the local GPU models AND the rotator's hosted ones in one
+# dropdown, so a phone or tablet on the LAN is a full client with nothing installed.
+stage_ai() {
+  head1 "ai — ollama on the GPU + Open WebUI for the LAN"
+
+  # PACKAGED ollama, never the curl installer. The installer drops its own tree in
+  # /usr/share/ollama and a binary in /usr/local/bin that SHADOWS the packaged one,
+  # and pacman then refuses to install over it ("exists in filesystem"). Untangling
+  # that on rig cost a working ollama for half an hour. ollama-cuda pulls the CUDA
+  # runners; the daemon runs as its own 'ollama' system user.
+  pkg ollama-cuda
+
+  # Flash attention + a quantised KV cache is the difference between an 8B model
+  # fitting this class of card with room for context, and spilling to the CPU.
+  # q4_0 measured fine at the default context on Turing (RTX 2070); it is only
+  # very large contexts that do not fit, and that is a VRAM limit, not a bug.
+  wr /etc/systemd/system/ollama.service.d/10-kv-cache.conf <<'EOF'
+[Service]
+Environment=OLLAMA_FLASH_ATTENTION=1
+Environment=OLLAMA_KV_CACHE_TYPE=q4_0
+EOF
+  run sudo systemctl daemon-reload
+  svc ollama.service
+
+  # Models stay in the daemon's own /var/lib/ollama. The dirs stage exports
+  # OLLAMA_MODELS=~/ai/ollama for interactive use, but that has NO effect on a
+  # system daemon running as the 'ollama' user - it cannot traverse a 700 home
+  # dir, and loosening that to relocate weights would be a bad trade. Said plainly
+  # here so nobody hunts for models under ~/ai and concludes something is broken.
+  ok "models live in /var/lib/ollama (daemon-owned; ~/ai/ollama is for interactive use)"
+
+  command -v docker >/dev/null || { warn "docker missing — run the docker stage first, then re-run 'ai'"; return 1; }
+
+  # --network=host + PORT=80 so the LAN reaches it as a bare http://<box>/ with no
+  # port to remember, and so the container can talk to ollama and the rotator on
+  # loopback. Loopback is deliberate: OLLAMA_HOST stays on 127.0.0.1 rather than
+  # exposing an unauthenticated model API to the whole network.
+  if sudo docker inspect open-webui >/dev/null 2>&1; then
+    ok "open-webui container already exists (leaving it; config is reconciled below)"
+  else
+    run sudo docker run -d --name open-webui --network=host \
+      -e PORT=80 \
+      -e OLLAMA_BASE_URL=http://127.0.0.1:11434 \
+      -e OPENAI_API_BASE_URL=http://127.0.0.1:51200/v1 \
+      -e OPENAI_API_KEY=local \
+      -e WEBUI_AUTH=True \
+      -e ENABLE_WEB_SEARCH=True \
+      -e WEB_SEARCH_ENGINE=duckduckgo \
+      -e BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL=True \
+      -e RAG_EMBEDDING_ENGINE=ollama \
+      -v open-webui:/app/backend/data \
+      --restart unless-stopped ghcr.io/open-webui/open-webui:main
+  fi
+
+  # THE TRAP, and it cost a whole round of "nothing changed": those -e flags are
+  # FIRST-BOOT SEEDS ONLY. Open WebUI copies them into its own database once, and
+  # from then on the database wins - so re-running docker with new -e values
+  # changes nothing a user can see. Reconcile the database itself, which is also
+  # what keeps the Admin Settings UI authoritative and editable.
+  #
+  # `docker exec` needs -i or the heredoc never reaches python and this silently
+  # does nothing while reporting success.
+  if (( DRY )); then
+    say "  ${C_D}[dry] reconcile open-webui config rows in its database${C_0}"
+  else
+    sudo docker exec -i open-webui python3 - <<'PY' 2>/dev/null | sed 's/^/  /' || warn "could not reconcile the WebUI database (is the container up?)"
+import json, sqlite3
+c = sqlite3.connect("/app/backend/data/webui.db")
+want = {
+    "openai.enable": True,
+    "openai.api_base_urls": ["http://127.0.0.1:51200/v1"],
+    "openai.api_keys": ["local"],
+    "ollama.enable": True,
+    "ollama.base_urls": ["http://127.0.0.1:11434"],
+    "web.search.enable": True,
+    "web.search.engine": "duckduckgo",
+    "web.search.result_count": 4,
+    # Feed results straight to the model instead of through a vector store, so web
+    # search needs no embedding model to exist.
+    "web.search.bypass_embedding_and_retrieval": True,
+}
+changed = []
+for k, v in want.items():
+    row = c.execute("select value from config where key=?", (k,)).fetchone()
+    new = json.dumps(v)
+    if row is None:
+        c.execute("insert into config (key,value,updated_at) values (?,?,datetime('now'))", (k, new))
+        changed.append(f"set {k}")
+    elif row[0] != new:
+        c.execute("update config set value=?, updated_at=datetime('now') where key=?", (new, k))
+        changed.append(f"fixed {k}")
+c.commit()
+print("webui config: " + (", ".join(changed) if changed else "already correct"))
+PY
+    (( DRY )) || run sudo docker restart open-webui
+  fi
+
+  mark_stage ai
+}
+
+verify_ai() {
+  head1 "verify: ai"
+  command -v ollama >/dev/null || { bad "ollama missing"; return 1; }
+  pacman -Qo /usr/bin/ollama &>/dev/null && ok "ollama is package-managed ($(pacman -Q ollama 2>/dev/null))" \
+    || bad "/usr/bin/ollama is NOT owned by a package — a curl install will shadow and break pacman upgrades"
+  [[ -e /usr/local/bin/ollama ]] && bad "/usr/local/bin/ollama exists — it shadows the packaged binary; remove it" \
+    || ok "no curl-installed binary shadowing it"
+  systemctl is-enabled --quiet ollama && ok "ollama enabled at boot" || bad "ollama NOT enabled — no models after a power cut"
+  systemctl is-active  --quiet ollama && ok "ollama active" || { bad "ollama not running"; return 1; }
+  systemctl show ollama -p Environment --value 2>/dev/null | grep -q OLLAMA_FLASH_ATTENTION \
+    && ok "flash attention + quantised KV cache on" || warn "no KV-cache drop-in — models will use more VRAM than needed"
+
+  # A GPU box that quietly fell back to CPU still answers, just uselessly slowly,
+  # so check placement rather than only that a reply came back.
+  local ps; ps=$(timeout 40 ollama ps 2>/dev/null)
+  if grep -qi 'GPU' <<<"$ps"; then ok "a model is resident on the GPU"
+  else say "  ${C_D}(no model resident right now — 'ollama run <model>' then re-check 'ollama ps' for GPU placement)${C_0}"; fi
+
+  command -v docker >/dev/null || { warn "docker missing — skipping Open WebUI checks"; return 0; }
+  sudo docker inspect open-webui >/dev/null 2>&1 || { bad "no open-webui container"; return 1; }
+  [[ $(sudo docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' open-webui 2>/dev/null) == unless-stopped ]] \
+    && ok "container restarts after a reboot" || bad "container has no restart policy — it will stay down after a power cut"
+  local code; code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 http://127.0.0.1/ 2>/dev/null)
+  [[ $code == 200 ]] && ok "WebUI answering on port 80" || bad "WebUI HTTP $code"
+
+  # The decisive check: not that the endpoints are up, but that the WebUI's own
+  # model-fetching code returns both sources. Env vars can look perfect while the
+  # database still points somewhere else entirely.
+  sudo docker exec -i open-webui sh -c 'WEBUI_SECRET_KEY=$(cat /app/backend/data/.webui_secret_key 2>/dev/null || echo probe) exec python3 -' <<'PY' 2>/dev/null | grep -E '^(  |FAIL)' | sed 's/^/  /'
+import asyncio
+from open_webui.main import app
+from open_webui.routers.openai import get_all_models as oa
+from open_webui.routers.ollama import get_all_models as ol
+class R:
+    def __init__(s, a): s.app = a
+def ids(p):
+    d = (p.get("models") or p.get("data") or []) if isinstance(p, dict) else (p or [])
+    return [m.get("id") or m.get("model") or m.get("name") for m in d]
+async def main():
+    r = R(app)
+    for label, fn in (("hosted (agy rotator)", oa), ("local GPU (ollama)", ol)):
+        try:
+            n = len(ids(await fn(request=r, user=None)))
+            print(f"  {label}: {n} model(s)" if n else f"FAIL {label}: 0 models")
+        except Exception as e:
+            print(f"FAIL {label}: {type(e).__name__}")
+asyncio.run(main())
+PY
 }
 
 # ─────────────────────────────────────────────────────────── agy (model proxy)
