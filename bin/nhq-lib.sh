@@ -56,7 +56,7 @@ nhq_idle_seconds() {
   fi
 }
 
-# Does the pane_pid's descendant process tree contain a claude/node process?
+# Does the pane_pid's descendant process tree contain a live agent harness?
 # Dependency-free BFS over `ps --ppid` (no pstree needed).
 nhq_pane_has_claude() {
   local pid="${1:-}"; [[ -z "$pid" ]] && return 1
@@ -65,8 +65,14 @@ nhq_pane_has_claude() {
     next=""
     for cur in $queue; do
       comm=$(ps -o comm= -p "$cur" 2>/dev/null | tr -d ' ')
-      # claude/node = Claude Code / omp harness; jcode* = jcode harness (2026-07-19)
-      [[ "$comm" == "claude" || "$comm" == "node" || "$comm" == jcode* ]] && return 0
+      # claude/node = Claude Code; jcode* = jcode harness (2026-07-19);
+      # omp = the omp binary. omp was MISSING here, and omp is what every fleet
+      # agent actually runs: a compiled binary whose comm is plain "omp", not
+      # "node". So every omp session reported "⚫ DEAD (no claude / at fish)" in
+      # nhq-fleet/nhq-status while sitting there perfectly alive — and the reaper
+      # takes DEAD as permission to clean up. Found on rig's persistent session
+      # (2026-08-14), but it was never rig-specific.
+      [[ "$comm" == "claude" || "$comm" == "node" || "$comm" == "omp" || "$comm" == jcode* ]] && return 0
       kids=$(ps -o pid= --ppid "$cur" 2>/dev/null)
       for k in $kids; do next="$next $k"; done
     done

@@ -1384,7 +1384,16 @@ verify_fleet() {
       bad "omp-$ag.service NOT enabled — nothing will be running to attach to after a reboot"
     fi
     if tmux has-session -t "omp-$ag" 2>/dev/null; then
-      ok "tmux session omp-$ag live, pane running: $(tmux list-panes -t "omp-$ag" -F '#{pane_current_command}' 2>/dev/null | head -1)"
+      # pane_current_command reports the LOOP SHELL, not omp — omp is its child.
+      # Walk the tree instead, or a perfectly live agent reads as a bare shell.
+      local ppid; ppid=$(tmux list-panes -t "omp-$ag" -F '#{pane_pid}' 2>/dev/null | head -1)
+      if [[ -n ${ppid:-} ]] && pgrep -P "$ppid" -x omp >/dev/null 2>&1; then
+        ok "omp-$ag live with omp running (pid $(pgrep -P "$ppid" -x omp | head -1))"
+      elif [[ -n ${ppid:-} ]]; then
+        warn "omp-$ag live but omp is not running right now — the keepalive loop restarts it within ~2s"
+      else
+        bad "omp-$ag has no pane"
+      fi
     else
       bad "tmux session omp-$ag missing"
     fi
