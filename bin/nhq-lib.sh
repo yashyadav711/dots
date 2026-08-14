@@ -172,6 +172,19 @@ nhq_remote_check() {
       "$host" true 2>/dev/null
 }
 
+# 0 if <host> names THIS machine. Without this, an agent whose host is its own
+# box dispatches to itself forever: the registry travels with the repo, so on rig
+# the "rig" agent also reads host=rig, and the remote nhq-spawn tried to ssh onward
+# to "rig" again. The visible symptom was a bogus "key-based ssh failed" coming
+# from the FAR side, which reads exactly like a missing key.
+nhq_is_self_host() {
+  local host="${1:-}"; [[ -z "$host" ]] && return 1
+  local short; short="$(hostname -s 2>/dev/null || hostname 2>/dev/null)"
+  [[ "$host" == "$short" || "$host" == "$short".* ]] && return 0
+  [[ "$host" == "$(hostname -f 2>/dev/null)" ]] && return 0
+  return 1
+}
+
 # nhq_remote_dispatch <agent-token> <tool-name> "$@"
 # Re-runs <tool-name> with the original arguments on the agent's host, then exits
 # with the remote status. Returns 1 (caller continues) when the agent is local.
@@ -179,6 +192,19 @@ nhq_remote_dispatch() {
   local token="${1:-}" tool="${2:-}"; shift 2 || true
   local host; host="$(nhq_agent_host "$token")"
   [[ -z "$host" ]] && return 1          # local agent — caller continues normally
+
+  # Already on the agent's own machine: this IS the local case.
+  nhq_is_self_host "$host" && return 1
+
+  # Belt and braces: even if a hostname is renamed or an ssh alias disagrees with
+  # `hostname -s`, one hop is all that can ever happen.
+  if [[ -n "${NHQ_REMOTE_HOP:-}" ]]; then
+    printf '%s: refusing a second remote hop (already dispatched from %s).\n' \
+      "$tool" "$NHQ_REMOTE_HOP" >&2
+    printf '  the registry host for "%s" (%s) does not match this box (%s).\n' \
+      "$token" "$host" "$(hostname -s 2>/dev/null)" >&2
+    exit 5
+  fi
 
   if ! nhq_remote_check "$host"; then
     printf '%s: agent "%s" lives on host "%s" but key-based ssh to it failed.\n' \
@@ -192,9 +218,12 @@ nhq_remote_dispatch() {
   # a non-interactive ssh command sources no rc files, hence no ~/.local/bin.
   local q="" a
   for a in "$@"; do q+=" $(printf '%q' "$a")"; done
+  # -tt: force a pty even when our own stdin is not a terminal. nhq-spawn drives
+  # tmux on the far side and needs one; without it ssh warns and the remote tool
+  # runs without a controlling terminal.
   # shellcheck disable=SC2029
-  ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -t "$host" \
-    "bash -lc 'export PATH=\$HOME/.local/bin:\$PATH; exec $tool$q'"
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -tt "$host" \
+    "bash -lc 'export NHQ_REMOTE_HOP=$(hostname -s 2>/dev/null); export PATH=\$HOME/.local/bin:\$PATH; exec $tool$q'"
   exit $?
 }
 
