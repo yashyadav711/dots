@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# nhq-omp-session <session-name> <working-dir> [display-name]
+#
+# Keeps a tmux session alive with omp running inside it, as a systemd USER
+# service. This is what makes `rig` always have something to attach to.
+#
+# Why a supervisor script instead of putting tmux straight in ExecStart —
+# both obvious ways fail, and both fail QUIETLY:
+#
+#   Type=oneshot  `tmux new-session -d` returns immediately, systemd calls the
+#                 job done and reaps the cgroup, killing the tmux server it just
+#                 started. The unit sits there reporting
+#                 "active (exited), status=0/SUCCESS" with no session.
+#   Type=forking  systemd waits for a main PID it can never identify (tmux has
+#                 no PIDFile and the client exits at once), so the unit hangs in
+#                 "activating" forever.
+#
+# Both were observed on rig; the only way to catch either was to reboot and look,
+# because the unit's own status claimed success.
+#
+# So: Type=simple, and this script stays in the foreground for as long as the
+# session exists. systemd keeps the unit active, the cgroup keeps the tmux server,
+# and if the session ever disappears this exits so Restart=always rebuilds it.
+set -uo pipefail
+
+SESSION="${1:?usage: nhq-omp-session <session> <dir> [display-name]}"
+WORKDIR="${2:?usage: nhq-omp-session <session> <dir> [display-name]}"
+AGENT_NAME="${3:-}"
+OMP="$HOME/.local/bin/omp"
+POLL="${NHQ_OMP_POLL:-20}"
+
+command -v tmux >/dev/null || { echo "nhq-omp-session: tmux not found" >&2; exit 1; }
+[[ -x $OMP ]] || { echo "nhq-omp-session: omp not found at $OMP" >&2; exit 1; }
+[[ -d $WORKDIR ]] || { echo "nhq-omp-session: no such dir: $WORKDIR" >&2; exit 1; }
+
+# The pane command. omp exits when a turn ends, so without this loop the pane
+# would drop to a shell and `rig` would attach to a dead prompt. The sleep keeps a
+# crash-looping omp from spinning a core.
+PANE_CMD="while true; do '$OMP'; printf '\n[omp exited — restarting in 2s]\n'; sleep 2; done"
+
+# -A is attach-or-create: safe to run repeatedly, never makes a second session.
+tmux new-session -A -d -s "$SESSION" -c "$WORKDIR" \
+  -e "VISUAL=${NHQ_OMP_EDITOR:-nhq-editor}" \
+  -e "EDITOR=${NHQ_OMP_EDITOR:-nhq-editor}" \
+  ${AGENT_NAME:+-e "NHQ_AGENT=$AGENT_NAME"} \
+  "$PANE_CMD" || { echo "nhq-omp-session: could not create $SESSION" >&2; exit 1; }
+
+echo "nhq-omp-session: $SESSION live in $WORKDIR (omp supervised)"
+
+# Hold the unit open. Exiting when the session is gone is deliberate: it lets
+# systemd's Restart=always put it back rather than leaving a dead unit "active".
+while tmux has-session -t "$SESSION" 2>/dev/null; do
+  sleep "$POLL"
+done
+
+echo "nhq-omp-session: $SESSION disappeared — exiting so systemd restarts it" >&2
+exit 1
