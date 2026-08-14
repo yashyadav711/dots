@@ -77,6 +77,11 @@ resolve_session() {
   return 1
 }
 
+# Remote agents live on another machine's tmux server, so resolve_session here
+# could never find them. Dispatch the same command over ssh first. Placed before
+# resolution so we never print a misleading "nothing live for: rig".
+nhq_remote_dispatch "$TARGET" nhq-tell "$@" || true
+
 SESSION="$(resolve_session "$TARGET" || true)"
 
 if [[ -z "$SESSION" ]]; then

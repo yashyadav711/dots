@@ -35,6 +35,12 @@ if [[ -z "$KEY" ]]; then
   echo "nhq-spawn: unknown agent '$AGENT' (want heydaddy|mirror|envy|director, or an alias)" >&2
   exit 1
 fi
+
+# Remote agents (registry "host") run on another machine's tmux server. Dispatch
+# the identical command over ssh and exit; local agents fall through untouched.
+# Done AFTER the agent is known to be valid, so an unknown token still errors
+# here rather than on the far side.
+nhq_remote_dispatch "$KEY" nhq-spawn "$@" || true
 REPO="$(nhq_agent_repo "$KEY")"
 NAME="$(nhq_agent_name "$KEY")"
 MODEL="$(nhq_agent_model "$KEY")"

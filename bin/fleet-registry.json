@@ -8,6 +8,7 @@
     "builder":  { "name": "Builder",  "repo": "Github/nHQ/nhq-builder",     "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": ["build", "nhq-builder"] },
     "heydaddy-design": { "name": "HeyDaddy Design", "repo": "Github/Work/heydaddy-design", "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": ["hd-design"] },
     "mirror-design":   { "name": "Mirror Design",   "repo": "Github/Work/mirror-design",   "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": ["md-design"] },
-    "nhq-features":    { "name": "NHQ Features",    "repo": "Github/nHQ/nhq-features",    "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": ["features"] }
+    "nhq-features":    { "name": "NHQ Features",    "repo": "Github/nHQ/nhq-features",    "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": ["features"] },
+    "rig":      { "name": "Rig",      "repo": "Github/rig",                 "model": "Claude Sonnet 4.6 (Thinking)", "stall_min": 15, "aliases": ["gpu", "box"], "host": "rig" }
   }
 }

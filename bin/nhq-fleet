@@ -8,7 +8,37 @@
 # nhq-status defaults to --human, so a bare `nhq-fleet` renders the dashboard; an
 # explicit mode flag (e.g. --json) overrides it. All state/repo/usage resolution
 # now lives in nhq-status + nhq-lib (registry + .meta), not here.
-set -euo pipefail
+#
+# Remote agents: an agent with a "host" in the registry (rig, the GPU box) runs on
+# a different machine's tmux server, which nhq-status cannot see. This wrapper
+# therefore renders the local dashboard, then appends one block per remote host by
+# running nhq-status THERE over ssh. Done here rather than inside nhq-status so the
+# single local state surface stays untouched and a dead host can never break the
+# local dashboard.
+set -uo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
-exec "$(dirname "$SELF")/nhq-status" "$@"
+DIR="$(dirname "$SELF")"
+# shellcheck source=/dev/null
+source "$DIR/nhq-lib.sh"
+
+# --json must stay machine-readable: emit only the local object, unchanged.
+for a in "$@"; do [[ $a == --json ]] && exec "$DIR/nhq-status" "$@"; done
+
+"$DIR/nhq-status" "$@" || true
+
+# One block per DISTINCT remote host.
+hosts="$(jq -r '.agents | to_entries[] | select(.value.host != null) | .value.host' \
+          "$(nhq_registry)" 2>/dev/null | sort -u)"
+[[ -z ${hosts:-} ]] && exit 0
+
+for h in $hosts; do
+  printf '\n\e[1m🛰  REMOTE — %s\e[0m\n' "$h"
+  if ! nhq_remote_check "$h"; then
+    printf '   \e[31munreachable\e[0m (key-based ssh failed — ssh-copy-id %s)\n' "$h"
+    continue
+  fi
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$h" \
+    "bash -lc 'export PATH=\$HOME/.local/bin:\$PATH; nhq-status --human --no-reap 2>/dev/null'" \
+    | sed 's/^/   /' || printf '   (no response)\n'
+done

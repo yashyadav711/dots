@@ -144,6 +144,60 @@ nhq_agent_repo() {
   printf '%s/%s' "$HOME" "$rel"
 }
 
+# ── remote agents ─────────────────────────────────────────────────────────────
+# An agent whose registry entry has a "host" lives on ANOTHER machine (rig is the
+# GPU box). Everything in the fleet — nhq-spawn, nhq-tell, nhq-fleet — drives
+# tmux, which is inherently local, so the only sane way to reach a remote agent
+# is to run the SAME command over ssh on the machine that owns its tmux server.
+#
+# Design: no logic is duplicated per tool. A tool calls nhq_remote_dispatch as
+# its first act; if the target agent is remote the call is re-executed there and
+# the tool exits with the remote status. Local agents fall straight through and
+# nothing changes.
+#
+# Requires key-based ssh to the host — a password prompt would break every
+# non-interactive path, so nhq_remote_check says so plainly instead of hanging.
+
+# Host for a token; "" when the agent is local.
+nhq_agent_host() {
+  local k; k="$(nhq_agent_canon "${1:-}")"
+  [[ -z "$k" ]] && { printf ''; return 0; }
+  nhq_agent_field "$k" host
+}
+
+# 0 if <host> is reachable with keys, non-interactively.
+nhq_remote_check() {
+  local host="${1:?}"
+  ssh -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new \
+      "$host" true 2>/dev/null
+}
+
+# nhq_remote_dispatch <agent-token> <tool-name> "$@"
+# Re-runs <tool-name> with the original arguments on the agent's host, then exits
+# with the remote status. Returns 1 (caller continues) when the agent is local.
+nhq_remote_dispatch() {
+  local token="${1:-}" tool="${2:-}"; shift 2 || true
+  local host; host="$(nhq_agent_host "$token")"
+  [[ -z "$host" ]] && return 1          # local agent — caller continues normally
+
+  if ! nhq_remote_check "$host"; then
+    printf '%s: agent "%s" lives on host "%s" but key-based ssh to it failed.\n' \
+      "$tool" "$token" "$host" >&2
+    printf '  fix: ssh-copy-id %s    (a password prompt cannot work here)\n' "$host" >&2
+    exit 4
+  fi
+
+  # Quote every argument so the remote shell sees exactly what we passed. The
+  # remote login shell may be fish, so invoke bash explicitly, and set PATH:
+  # a non-interactive ssh command sources no rc files, hence no ~/.local/bin.
+  local q="" a
+  for a in "$@"; do q+=" $(printf '%q' "$a")"; done
+  # shellcheck disable=SC2029
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -t "$host" \
+    "bash -lc 'export PATH=\$HOME/.local/bin:\$PATH; exec $tool$q'"
+  exit $?
+}
+
 # Canonical display name / default model / stall threshold for a token. "" if unknown.
 nhq_agent_name()      { local k; k="$(nhq_agent_canon "${1:-}")"; [[ -z "$k" ]] && { printf ''; return 0; }; nhq_agent_field "$k" name; }
 nhq_agent_model()     { local k; k="$(nhq_agent_canon "${1:-}")"; [[ -z "$k" ]] && { printf ''; return 0; }; nhq_agent_field "$k" model; }
