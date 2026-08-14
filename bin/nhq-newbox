@@ -1826,8 +1826,15 @@ main() {
     verify)
       RO=1
       preflight
-      for s in base ssh shell gpu docker storage dirs fleet share power; do
-        declare -F "verify_$s" >/dev/null && "verify_$s" || true
+      # Drive this off STAGES, never a second hand-written list. The duplicate
+      # here is exactly why a newly added stage could be fully installed and
+      # still never verified — the list had silently drifted.
+      # `verify <stage>…` narrows to specific layers; bare `verify` does all.
+      local -a vs=("${args[@]:1}")
+      ((${#vs[@]})) || vs=("${STAGES[@]}")
+      for s in "${vs[@]}"; do
+        declare -F "verify_$s" >/dev/null && "verify_$s" \
+          || warn "no verify for '$s' (have: ${STAGES[*]})"
       done
       head1 "done"; exit 0 ;;
     ups) preflight; stage_ups; exit 0 ;;
