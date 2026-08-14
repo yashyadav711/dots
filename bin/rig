@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# rig — open the Rig agent's live omp session on the GPU box.
+#
+# Typing `rig` from a plain terminal ssh's to rig and lands in the same tmux
+# session every time, with omp already running. Detach with the tmux prefix + d;
+# the conversation stays alive on the box, so the next `rig` continues it.
+#
+#   rig            attach
+#   rig --status   is it alive, without attaching
+#
+# Everything real lives in nhq-attach, which does this for any agent in the
+# registry — local or remote. This is just the name Yash wanted to type.
+exec "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/nhq-attach" rig "$@"

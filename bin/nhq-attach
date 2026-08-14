@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# nhq-attach <agent> — open an agent's LIVE omp session, wherever it lives.
+#
+# Local agent  → attaches to its tmux session on this machine.
+# Remote agent → ssh to the agent's host and attach to the session there.
+#
+# The session is PERSISTENT: on the agent's host a systemd user service keeps a
+# tmux session with omp running in a restart loop, so there is always something
+# to attach to and the conversation survives detaching, disconnecting, and the
+# box losing power. `nhq-newbox fleet` installs that service on any machine that
+# hosts a registry agent.
+#
+# Usage:
+#   nhq-attach rig            # open Rig's session (ssh + attach)
+#   nhq-attach rig --status   # is it alive? print, do not attach
+#   rig                       # shorthand wrapper for the above
+#
+# NESTING: attaching a remote tmux from inside a local tmux gives you two
+# multiplexers fighting over the same keys. This refuses to do that and tells you
+# how to proceed, rather than leaving you stuck in a session where the prefix
+# does the wrong thing.
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+# shellcheck source=/dev/null
+source "$(dirname "$SELF")/nhq-lib.sh"
+
+AGENT="${1:-}"
+MODE="${2:-attach}"
+
+if [[ -z "$AGENT" || "$AGENT" == -h || "$AGENT" == --help ]]; then
+  sed -n '2,24p' "$SELF" | sed 's/^# \?//'
+  exit "${AGENT:+0}" 2>/dev/null || exit 2
+fi
+
+KEY="$(nhq_agent_canon "$AGENT")"
+[[ -z "$KEY" ]] && {
+  echo "nhq-attach: unknown agent '$AGENT'" >&2
+  echo "  known: $(jq -r '.agents | keys | join(", ")' "$(nhq_registry)" 2>/dev/null)" >&2
+  exit 1
+}
+
+NAME="$(nhq_agent_name "$KEY")"
+HOST="$(nhq_agent_host "$KEY")"
+SESSION="omp-$KEY"
+REL_REPO="$(nhq_agent_field "$KEY" repo)"
+
+# ── local agent ───────────────────────────────────────────────────────────────
+if [[ -z "$HOST" ]] || nhq_is_self_host "$HOST"; then
+  if [[ "$MODE" == --status ]]; then
+    tmux has-session -t "$SESSION" 2>/dev/null \
+      && echo "$NAME: $SESSION live (local)" || echo "$NAME: no session (local)"
+    exit 0
+  fi
+  [[ -n "${TMUX:-}" ]] && exec tmux switch-client -t "$SESSION"
+  exec tmux new-session -A -s "$SESSION" -c "$HOME/$REL_REPO"
+fi
+
+# ── remote agent ──────────────────────────────────────────────────────────────
+if ! nhq_remote_check "$HOST"; then
+  echo "nhq-attach: cannot reach $HOST with keys." >&2
+  echo "  fix: ssh-copy-id $HOST" >&2
+  exit 4
+fi
+
+if [[ "$MODE" == --status ]]; then
+  ssh -o BatchMode=yes "$HOST" "bash -lc '
+    if tmux has-session -t $SESSION 2>/dev/null; then
+      panecmd=\$(tmux list-panes -t $SESSION -F \"#{pane_current_command}\" 2>/dev/null | head -1)
+      echo \"live — pane running: \$panecmd\"
+      systemctl --user is-active omp-$KEY.service 2>/dev/null | sed \"s/^/keepalive: /\"
+    else
+      echo \"no session\"
+    fi'" 2>/dev/null | sed "s/^/$NAME@$HOST: /"
+  exit 0
+fi
+
+# Two multiplexers on one terminal is exactly the thing to avoid. He runs this
+# from a bare kitty window on purpose; if that ever slips, say so instead of
+# creating the mess.
+if [[ -n "${TMUX:-}" ]]; then
+  cat >&2 <<EOF
+nhq-attach: you are already inside tmux ($(tmux display-message -p '#S' 2>/dev/null)).
+Attaching $NAME's remote tmux here would nest two multiplexers and the prefix key
+would fight itself.
+
+Open a plain terminal window and run:  $KEY
+Or, to do it anyway from a new local window:  tmux new-window "$KEY"
+EOF
+  exit 3
+fi
+
+echo "→ $NAME on $HOST  (tmux: $SESSION)"
+
+# Make sure something is there to attach to: start the keepalive service if it
+# exists, otherwise create the session directly. `new-session -A` attaches when it
+# already exists, so this is safe either way and never spawns a duplicate.
+exec ssh -t -o BatchMode=yes "$HOST" "bash -lc '
+  export PATH=\$HOME/.local/bin:\$PATH
+  systemctl --user start omp-$KEY.service 2>/dev/null || true
+  exec tmux new-session -A -s $SESSION -c \$HOME/$REL_REPO
+'"

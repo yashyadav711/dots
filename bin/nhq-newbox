@@ -1208,10 +1208,21 @@ stage_fleet() {
   (( DRY )) && printf '  %s[dry] would link %d nhq-* commands into ~/.local/bin%s\n' "$C_D" "$n" "$C_0" \
             || ok "linked $n nhq-* commands"
 
-  for t in ompt agyq agy-snapshot agy-usage agy-claude agy-reauth mcp-write-guard claude-oom-guard; do
+  for t in ompt agyq agy-snapshot agy-usage agy-claude agy-reauth mcp-write-guard claude-oom-guard nhq-attach; do
     [[ -x $dots/bin/$t ]] || continue
     (( DRY )) || ln -sfn "$dots/bin/$t" "$HOME/.local/bin/$t"
   done
+
+  # Per-agent shorthands: typing `rig` opens that agent's live session. Only the
+  # ones that actually have a wrapper in dots/bin get linked, so this does not
+  # invent commands for agents that have none.
+  local sc=0
+  while read -r ag; do
+    [[ -n $ag && -x $dots/bin/$ag ]] || continue
+    (( DRY )) || ln -sfn "$dots/bin/$ag" "$HOME/.local/bin/$ag"
+    ((sc++))
+  done < <(jq -r '.agents | keys[]' "$dots/bin/fleet-registry.json" 2>/dev/null)
+  (( sc )) && ok "linked $sc agent shorthand(s) (e.g. \`rig\` → nhq-attach rig)"
   (( DRY )) || ok "linked the agy/omp helper commands"
 
   # omp agent config — commands, hooks, rules, themes. dots carries these and
@@ -1283,6 +1294,61 @@ stage_fleet() {
       esac
     done
   fi
+
+  # ── persistent omp session for any agent THIS machine hosts ─────────────────
+  # So `rig` from the laptop always finds something to attach to, and the
+  # conversation survives detaching, disconnecting and losing power.
+  #
+  # Two things make it survive:
+  #   - a restart loop in the pane, because omp exits when a turn ends;
+  #   - a systemd USER service plus linger, so it comes back at boot with nobody
+  #     logged in. On a box that loses power 3-4x a day that is the whole point.
+  local me; me="$(hostname -s 2>/dev/null)"
+  local hosted; hosted="$(jq -r --arg h "$me" \
+    '.agents | to_entries[] | select(.value.host == $h) | .key' "$dots/bin/fleet-registry.json" 2>/dev/null)"
+
+  if [[ -z ${hosted:-} ]]; then
+    ok "no registry agent is hosted here — no persistent session needed"
+  else
+    # A user service only runs without an active login if lingering is enabled.
+    if loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
+      ok "lingering already enabled for $USER"
+    else
+      run sudo loginctl enable-linger "$USER"
+    fi
+
+    local ag
+    for ag in $hosted; do
+      local rel; rel="$(jq -r --arg k "$ag" '.agents[$k].repo' "$dots/bin/fleet-registry.json" 2>/dev/null)"
+      local disp; disp="$(jq -r --arg k "$ag" '.agents[$k].name' "$dots/bin/fleet-registry.json" 2>/dev/null)"
+      wr "$HOME/.config/systemd/user/omp-$ag.service" <<EOF
+[Unit]
+Description=Persistent omp session for the $disp agent (tmux: omp-$ag)
+Documentation=man:tmux(1)
+After=default.target
+
+[Service]
+# tmux -d daemonises, so the unit's job is done once the session exists.
+Type=oneshot
+RemainAfterExit=yes
+
+# -A: attach-or-create, so restarting the unit never makes a second session.
+# The while loop is what keeps omp *present*: omp exits when a turn ends, and an
+# empty pane would mean 'rig' attaches to a dead shell. The sleep stops a
+# crash-looping omp from spinning the CPU.
+ExecStart=/usr/bin/tmux new-session -A -d -s omp-$ag -c %h/$rel \\
+  -e VISUAL=nhq-editor -e EDITOR=nhq-editor -e NHQ_AGENT=$disp \\
+  "while true; do %h/.local/bin/omp; printf '\\\\n[omp exited — restarting in 2s, Ctrl-C to stop]\\\\n'; sleep 2; done"
+ExecStop=/usr/bin/tmux kill-session -t omp-$ag
+
+[Install]
+WantedBy=default.target
+EOF
+      run systemctl --user daemon-reload
+      run systemctl --user enable --now "omp-$ag.service"
+      ok "persistent session omp-$ag enabled (attach from anywhere with: $ag)"
+    done
+  fi
   mark_stage fleet
 }
 
@@ -1307,6 +1373,27 @@ verify_fleet() {
   # at the worst moment instead of being obviously absent.
   local broken; broken=$(find "$HOME/.local/bin" -maxdepth 1 -xtype l 2>/dev/null | wc -l)
   (( broken == 0 )) && ok "no broken symlinks in ~/.local/bin" || bad "$broken broken symlink(s) in ~/.local/bin"
+
+  # Persistent session for any agent hosted here — the thing `rig` attaches to.
+  local me; me="$(hostname -s 2>/dev/null)" ag
+  while read -r ag; do
+    [[ -n $ag ]] || continue
+    if systemctl --user is-enabled "omp-$ag.service" &>/dev/null; then
+      ok "omp-$ag.service enabled at boot"
+    else
+      bad "omp-$ag.service NOT enabled — nothing will be running to attach to after a reboot"
+    fi
+    if tmux has-session -t "omp-$ag" 2>/dev/null; then
+      ok "tmux session omp-$ag live, pane running: $(tmux list-panes -t "omp-$ag" -F '#{pane_current_command}' 2>/dev/null | head -1)"
+    else
+      bad "tmux session omp-$ag missing"
+    fi
+  done < <(jq -r --arg h "$me" '.agents | to_entries[] | select(.value.host == $h) | .key' \
+            "$HOME/Github/dots/bin/fleet-registry.json" 2>/dev/null)
+  loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes' \
+    && ok "lingering on (user services survive logout / start at boot)" \
+    || { [[ -n "$(jq -r --arg h "$me" '.agents|to_entries[]|select(.value.host==$h)|.key' "$HOME/Github/dots/bin/fleet-registry.json" 2>/dev/null)" ]] \
+         && bad "lingering OFF — the persistent session will not start until someone logs in"; }
 }
 
 stage_power() {
