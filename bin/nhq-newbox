@@ -1328,18 +1328,29 @@ Documentation=man:tmux(1)
 After=default.target
 
 [Service]
-# tmux -d daemonises, so the unit's job is done once the session exists.
-Type=oneshot
-RemainAfterExit=yes
+# Type=forking, NOT oneshot. \`tmux new-session -d\` starts a tmux SERVER and the
+# client exits immediately. With oneshot, systemd treats ExecStart returning as
+# "job done" and reaps everything left in the cgroup — so the session appeared to
+# start (unit "active (exited)", status 0/SUCCESS) and the tmux server was killed
+# a moment later. After a reboot there was nothing to attach to, while the unit
+# reported success. forking tells systemd to expect exactly that fork and adopt
+# the daemon instead of cleaning it up.
+Type=forking
 
 # -A: attach-or-create, so restarting the unit never makes a second session.
 # The while loop is what keeps omp *present*: omp exits when a turn ends, and an
-# empty pane would mean 'rig' attaches to a dead shell. The sleep stops a
+# empty pane would mean '$ag' attaches to a dead shell. The sleep stops a
 # crash-looping omp from spinning the CPU.
 ExecStart=/usr/bin/tmux new-session -A -d -s omp-$ag -c %h/$rel \\
   -e VISUAL=nhq-editor -e EDITOR=nhq-editor -e NHQ_AGENT=$disp \\
   "while true; do %h/.local/bin/omp; printf '\\\\n[omp exited — restarting in 2s, Ctrl-C to stop]\\\\n'; sleep 2; done"
 ExecStop=/usr/bin/tmux kill-session -t omp-$ag
+
+# The tmux server outlives the client that created it; do not let a stop or
+# restart of this unit take unrelated tmux sessions with it.
+KillMode=none
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=default.target
