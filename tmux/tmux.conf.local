@@ -589,24 +589,17 @@ if-shell '[ -z "$WAYLAND_DISPLAY" ] && [ -z "$DISPLAY" ]' {
 # ------------------------------------------------------------------------------
 
 # -- per-machine status colours -------------------------------------------------
-# Yash works on rig mostly over `ssh rig` / `rig` from this laptop, and the two
-# look identical once you are in a terminal. One wrong `rm` because you thought
-# you were somewhere else is enough. So the box announces itself: the laptop keeps
-# its ember/crimson bar, rig gets teal — matching its omp theme (nhq-rig), so both
-# surfaces agree at a glance.
+# Yash reaches rig almost entirely through `ssh rig` / `rig` from this laptop, and
+# once you are in a terminal the two boxes look identical. One wrong command
+# because you thought you were somewhere else is enough, so the bar says which
+# machine you are on — matching that box's omp theme.
 #
-# Runtime `set -g`, not tmux_conf_theme_* variables: those are consumed by the
-# base's shell pass at load time and cannot be made conditional. These options are
-# applied after the theme is built, so they win.
-if-shell '[ "$(hostname -s)" = rig ]' {
-  set -g status-style                       'fg=#d4d8e4,bg=#0b1f1d,none'
-  set -g status-left  '#[fg=#0b1f1d,bg=#2dd4bf,bold] ⛁ RIG #[fg=#2dd4bf,bg=#0b1f1d,nobold]#[fg=#7fffd4,bg=#0b1f1d] #S '
-  set -g status-right '#[fg=#14b8a6,bg=#0b1f1d] %H:%M #[fg=#0b1f1d,bg=#2dd4bf,bold] GPU '
-  set -g pane-active-border-style           'fg=#2dd4bf'
-  set -g pane-border-style                  'fg=#14384a'
-  set -g message-style                      'fg=#0b1f1d,bg=#2dd4bf,bold'
-  setw -g window-status-current-style       'fg=#0b1f1d,bg=#7fffd4,bold'
-}
+# DEFERRED, and that is the whole point: the base sources this file early to read
+# tmux_conf_theme_* vars, then builds and applies the theme at the END of its load.
+# Setting the options directly here got them applied and then clobbered back to the
+# laptop's colours a moment later. Same `run-shell -b "sleep …"` trick the
+# copy-mode helper above already relies on, for the same reason.
+run-shell -b "sleep 3 && bash $HOME/Github/dots/tmux/machine-theme.sh"
 # ------------------------------------------------------------------------------
 
 # # /!\ do not remove the following line
