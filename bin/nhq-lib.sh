@@ -191,6 +191,16 @@ nhq_is_self_host() {
 nhq_remote_dispatch() {
   local token="${1:-}" tool="${2:-}"; shift 2 || true
   local host; host="$(nhq_agent_host "$token")"
+
+  # A caller may pass a SESSION name (fleet-<agent>-<slug>) rather than an agent
+  # token — nhq-spawn prints exactly those in its "talk:" line. Map it back to its
+  # agent before giving up, or `nhq-tell fleet-rig-…` looks for a session on the
+  # wrong machine and reports "nothing live for".
+  if [[ -z "$host" && "$token" == fleet-* ]]; then
+    local sess_key; sess_key="$(nhq_session_agent "$token")"
+    [[ -n "$sess_key" ]] && host="$(nhq_agent_host "$sess_key")"
+  fi
+
   [[ -z "$host" ]] && return 1          # local agent — caller continues normally
 
   # Already on the agent's own machine: this IS the local case.
