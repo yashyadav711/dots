@@ -110,7 +110,11 @@ link bin/ompt           "$HOME/.local/bin/ompt"
 #     It is installed under its four face names (dev/prod × be/fe), which are
 #     symlinks to it inside dots/bin and are matched by the glob. Linking the
 #     dispatcher under its own name would give it no face to dispatch to.
-for path in "$DOTS"/bin/nhq-*; do
+# GLOB IS `nhq*`, NOT `nhq-*`: the bare `nhq` entrypoint has no hyphen, so the
+# hyphenated glob skipped it entirely. It survived on this laptop only because it
+# was hand-linked on 3 Jul, before this loop existed — a fresh rebuild from this
+# repo would have come up without the main command. Found provisioning rig.
+for path in "$DOTS"/bin/nhq*; do
   cmd=$(basename "$path")
   case "$cmd" in
     *.sh|*.yml|*.json|*.jsonl|*.md) continue ;;

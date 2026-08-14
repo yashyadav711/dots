@@ -1094,7 +1094,7 @@ stage_fleet() {
   # explicitly DRY-guarded. 122 symlinks through run() would bury the output;
   # a dry run that silently created them would be worse.
   local n=0 cmd
-  for path in "$dots"/bin/nhq-*; do
+  for path in "$dots"/bin/nhq*; do
     [[ -e $path ]] || continue
     cmd=$(basename "$path")
     case "$cmd" in
@@ -1190,8 +1190,10 @@ verify_fleet() {
   head1 "verify: fleet"
   local n; n=$(find "$HOME/.local/bin" -maxdepth 1 -name 'nhq-*' 2>/dev/null | wc -l)
   (( n > 50 )) && ok "$n nhq-* commands on PATH" || warn "only $n nhq-* commands linked"
+  # By path, not `command -v`: a non-interactive ssh shell has no ~/.local/bin
+  # on PATH, which made three present commands read as missing.
   for c in nhq nhq-bot nhq-status ompt; do
-    command -v "$c" >/dev/null && ok "$c" || warn "$c missing"
+    [[ -x $HOME/.local/bin/$c ]] && ok "$c" || bad "$c MISSING"
   done
   [[ -L $HOME/.omp/agent/commands ]] && ok "omp agent config linked from dots" || warn "omp agent config not linked"
   # Path-independent: a non-interactive ssh shell has no ~/.local/bin on PATH.
