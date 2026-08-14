@@ -545,7 +545,13 @@ EOF
   # Yash's shell is fish, on every box. zsh + Oh My Zsh stay installed and fully
   # configured above (he asked for OMZ), but fish is what he logs into, so muscle
   # memory and the dots aliases behave identically to the laptop.
-  pkg fish cachyos-fish-config
+  # subversion is not optional here despite nothing in the fleet using svn: the
+  # budspencer omf theme's fish_prompt calls `svn info` to detect a Subversion
+  # working copy, so without it EVERY prompt render prints
+  # "fish: Unknown command: svn" plus a stack trace. It is silent on the laptop
+  # only because subversion happens to be installed there (undeclared) — the same
+  # transitive-dependency trap as eza/bat.
+  pkg fish cachyos-fish-config subversion
 
   local dotsf=$HOME/Github/dots/fish
   if [[ -d $dotsf ]]; then
@@ -653,6 +659,23 @@ verify_shell() {
     fout=$(script -qec 'fish -i -c exit' /dev/null </dev/null 2>&1 | tr -d '\r' \
            | grep -vE '^[[:space:]]*$|Welcome to fish' || true)
     [[ -z $fout ]] && ok "fish starts clean" || bad "fish prints on startup: $(head -c 200 <<<"$fout")"
+
+    # RENDER THE PROMPT. `fish -i -c exit` never draws it, so a prompt that throws
+    # on every keystroke passed this check clean — which is exactly what happened
+    # with budspencer calling `svn` on a box without subversion. Startup and prompt
+    # are two different failures; test both.
+    local pout
+    pout=$(timeout 20 fish -c 'fish_prompt' 2>&1 | grep -E 'Unknown command|command not found|error' || true)
+    [[ -z $pout ]] && ok "fish prompt renders without errors" \
+      || bad "fish prompt errors on every render: $(head -c 160 <<<"$pout")"
+    if [[ -f $HOME/.config/omf/theme ]]; then
+      local th; th=$(cat "$HOME/.config/omf/theme")
+      [[ $th == budspencer ]] && command -v svn >/dev/null \
+        && ok "omf theme $th (svn present — budspencer's prompt needs it)"
+      [[ $th == budspencer ]] && ! command -v svn >/dev/null \
+        && bad "omf theme budspencer needs subversion — install it or the prompt errors constantly"
+      [[ $th != budspencer ]] && ok "omf theme $th"
+    fi
     [[ -L $HOME/.config/fish/config.fish ]] && ok "fish config.fish linked from dots" \
       || warn "fish config.fish is not a symlink into dots"
     fish -c 'alias' 2>/dev/null | grep -q eza && ok "fish: ls → eza wired" \

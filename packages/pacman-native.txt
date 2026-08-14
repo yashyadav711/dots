@@ -234,6 +234,7 @@ sof-firmware
 starship
 sublime-text-4
 sudo
+subversion
 syncthing
 sysfsutils
 texinfo
