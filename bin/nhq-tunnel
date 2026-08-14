@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# nhq-tunnel — reach a fleet box's private ports as if they were local.
+#
+# Usage:
+#   nhq-tunnel <agent> <service|ports>   open a tunnel (backgrounded)
+#   nhq-tunnel <agent> <service> --fg    hold it in the foreground instead
+#   nhq-tunnel --list                    what is live right now
+#   nhq-tunnel --stop <name|all>         close one or all
+#   nhq-tunnel <agent> <ports> --reverse serve one of MY ports on the box
+#
+# Ports are always written MINE:THEIRS — the first number is this machine's, the
+# second is the box's, in both directions. Only the direction of travel changes.
+#
+# Examples:
+#   nhq-tunnel rig webui              # rig's :80    -> http://localhost:8080
+#   nhq-tunnel rig ollama             # rig's :11434 as if ollama ran here
+#   nhq-tunnel rig 9000:3000          # my 9000      -> rig's 3000
+#   nhq-tunnel rig 51200:51999 -R     # my rotator on :51200 -> rig's :51999
+#                                     # (rig's own 51200 is taken, hence 51999)
+#
+# Why a tool instead of typing ssh -L:
+#
+#   * `ssh -L` without -o ExitOnForwardFailure=yes stays up when the forward
+#     FAILED, so you get a healthy-looking session that tunnels nothing. Every
+#     tunnel here sets it, and then proves the local port really answers.
+#   * A box's ip moves (DHCP, power cuts). Names are resolved through
+#     nhq-resolve first, the same way `rig` does, so a tunnel does not die of
+#     stale mDNS.
+#   * Ports get forgotten. Services are named, and `--list` shows what is live
+#     with the URL to open.
+set -uo pipefail
+
+LIB="$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/nhq-lib.sh"
+# shellcheck source=/dev/null
+[[ -r $LIB ]] && source "$LIB"
+
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/nhq-tunnels"
+mkdir -p "$RUN_DIR"
+
+c_g=$'\e[32m'; c_r=$'\e[31m'; c_y=$'\e[33m'; c_d=$'\e[2m'; c_b=$'\e[1m'; c_0=$'\e[0m'
+ok()   { printf '  %s✓%s %s\n' "$c_g" "$c_0" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$c_r" "$c_0" "$*" >&2; }
+warn() { printf '  %s!%s %s\n' "$c_y" "$c_0" "$*"; }
+die()  { bad "$*"; exit 1; }
+
+# Services worth a name. Local port defaults to the remote one, except where that
+# would need root (80) or collide with something usually running here (11434 is
+# free on the laptop, so it is kept — a tunnelled ollama then works with tools
+# that hardcode the default port).
+#   name        remote  local  scheme
+SERVICES="
+webui         80      8080   http
+rotator       51200   51200  http
+ollama        11434   11434  http
+oauth         54545   54545  http
+syncthing     8384    8384   http
+"
+
+service_row() { awk -v n="$1" '$1==n {print; exit}' <<<"$SERVICES"; }
+
+usage() { sed -n '2,30p' "$0" | sed 's/^# \?//'; exit "${1:-0}"; }
+
+port_open() { timeout 2 bash -c "echo >/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
+
+# What holds a local port — so "already in use" can name the culprit instead of
+# just refusing.
+port_owner() {
+  local p=$1 out
+  out=$(ss -tlnp 2>/dev/null | awk -v p=":$p\$" '$4 ~ p {print $NF; exit}')
+  [[ -n $out ]] && printf '%s' "$out" || printf 'unknown'
+}
+
+meta_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
+
+list_tunnels() {
+  local any=0 f
+  shopt -s nullglob
+  for f in "$RUN_DIR"/*.meta; do
+    any=1
+    local pid name agent host lp rp scheme mode
+    pid=$(meta_get "$f" pid); name=$(meta_get "$f" name); agent=$(meta_get "$f" agent)
+    host=$(meta_get "$f" host); lp=$(meta_get "$f" lport); rp=$(meta_get "$f" rport)
+    scheme=$(meta_get "$f" scheme); mode=$(meta_get "$f" mode)
+    if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
+      local arrow="localhost:$lp → $agent:$rp"
+      [[ $mode == reverse ]] && arrow="$agent:$rp → localhost:$lp"
+      if [[ $mode == reverse ]] || port_open "$lp"; then
+        ok "$(printf '%-12s %s' "$name" "$arrow")${scheme:+  ${c_d}${scheme}://localhost:$lp${c_0}}"
+      else
+        warn "$(printf '%-12s %s' "$name" "$arrow")  process alive but the port does not answer"
+      fi
+    else
+      rm -f "$f"   # stale: the ssh died, so the record is a lie
+    fi
+  done
+  (( any )) || printf '  %sno tunnels live%s\n' "$c_d" "$c_0"
+}
+
+stop_tunnel() {
+  local target=$1 f hit=0
+  shopt -s nullglob
+  for f in "$RUN_DIR"/*.meta; do
+    local name pid; name=$(meta_get "$f" name); pid=$(meta_get "$f" pid)
+    [[ $target == all || $target == "$name" ]] || continue
+    hit=1
+    if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      # ssh can take a moment to release the listener; wait rather than lie.
+      for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 0.3; done
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+      ok "stopped $name"
+    else
+      ok "$name was already gone"
+    fi
+    rm -f "$f"
+  done
+  (( hit )) || die "no tunnel named '$target' (see: nhq-tunnel --list)"
+}
+
+# ── args ────────────────────────────────────────────────────────────────────
+[[ $# -eq 0 ]] && usage 0
+case ${1:-} in
+  -h|--help)  usage 0 ;;
+  -l|--list)  list_tunnels; exit 0 ;;
+  --stop)     [[ -n ${2:-} ]] || die "--stop needs a name (or 'all')"; stop_tunnel "$2"; exit 0 ;;
+esac
+
+AGENT=$1; shift
+WHAT=${1:-}; shift || true
+[[ -n $WHAT ]] || die "what should I forward? a service ($(awk 'NF{printf "%s ", $1}' <<<"$SERVICES")) or PORTS like 9000:3000"
+
+FG=0 REVERSE=0
+for a in "$@"; do
+  case $a in
+    --fg|--foreground) FG=1 ;;
+    --reverse|-R)      REVERSE=1 ;;
+    *) die "unknown flag: $a" ;;
+  esac
+done
+
+# ── resolve the box ─────────────────────────────────────────────────────────
+# Prefer the fleet registry so aliases work (rig / gpu / box all mean one host),
+# and fall back to treating the argument as a literal ssh target.
+HOST=""
+if declare -F nhq_agent_host >/dev/null 2>&1; then
+  canon=$(nhq_agent_canon "$AGENT" 2>/dev/null)
+  [[ -n $canon ]] && { AGENT="$canon"; HOST=$(nhq_agent_host "$canon" 2>/dev/null); }
+fi
+HOST=${HOST:-$AGENT}
+
+# Re-pin the ip before connecting, for the same reason `rig` does: this laptop has
+# no mdns in nsswitch, so a .local name resolves only when systemd-resolved feels
+# like answering. Best-effort — a literal ip or a real ssh alias needs nothing.
+if command -v nhq-resolve >/dev/null 2>&1; then
+  nhq-resolve "$HOST" --quiet >/dev/null 2>&1 || true
+fi
+
+# ── work out the ports ──────────────────────────────────────────────────────
+row=$(service_row "$WHAT")
+if [[ -n $row ]]; then
+  read -r NAME RPORT LPORT SCHEME <<<"$row"
+elif [[ $WHAT =~ ^([0-9]+):([0-9]+)$ ]]; then
+  LPORT=${BASH_REMATCH[1]}; RPORT=${BASH_REMATCH[2]}; NAME="$RPORT"; SCHEME=""
+elif [[ $WHAT =~ ^[0-9]+$ ]]; then
+  LPORT=$WHAT; RPORT=$WHAT; NAME="$WHAT"; SCHEME=""
+else
+  die "'$WHAT' is not a known service or a port spec (LOCAL:REMOTE)"
+fi
+NAME="$AGENT-$NAME"
+
+if (( REVERSE )); then
+  # -R: the box listens and traffic comes back here. Here the "local" port is the
+  # one WE serve, and the remote port is what the box will dial.
+  SSH_FWD=(-R "${RPORT}:127.0.0.1:${LPORT}")
+  MODE=reverse
+  port_open "$LPORT" || warn "nothing is listening on localhost:$LPORT here — the box will connect to a closed port"
+else
+  SSH_FWD=(-L "${LPORT}:127.0.0.1:${RPORT}")
+  MODE=forward
+  # Refuse rather than let ssh fail cryptically, but do not refuse OUR OWN tunnel:
+  # re-running the same command should be a no-op, not an error.
+  if port_open "$LPORT"; then
+    if [[ -f $RUN_DIR/$NAME.meta ]] && kill -0 "$(meta_get "$RUN_DIR/$NAME.meta" pid)" 2>/dev/null; then
+      ok "$NAME already live — ${SCHEME:-tcp}://localhost:$LPORT"
+      exit 0
+    fi
+    die "localhost:$LPORT is already taken by $(port_owner "$LPORT") — pick another with LOCAL:REMOTE"
+  fi
+fi
+
+SSH_OPTS=(
+  -N
+  # Without this ssh happily stays connected when the forward could not be set
+  # up, which looks like success and tunnels nothing.
+  -o ExitOnForwardFailure=yes
+  -o ServerAliveInterval=20 -o ServerAliveCountMax=3
+  -o BatchMode=yes -o ConnectTimeout=8
+)
+
+if (( FG )); then
+  printf '  %s%s%s  %s\n' "$c_b" "$NAME" "$c_0" "$( ((REVERSE)) && echo "$HOST:$RPORT → localhost:$LPORT" || echo "localhost:$LPORT → $HOST:$RPORT" )"
+  [[ -n ${SCHEME:-} ]] && (( ! REVERSE )) && printf '  %sopen %s://localhost:%s%s\n' "$c_d" "$SCHEME" "$LPORT" "$c_0"
+  printf '  %sCtrl-C to close%s\n' "$c_d" "$c_0"
+  exec ssh "${SSH_OPTS[@]}" "${SSH_FWD[@]}" "$HOST"
+fi
+
+# Background: detach fully so closing this shell does not take the tunnel with it.
+setsid ssh "${SSH_OPTS[@]}" "${SSH_FWD[@]}" "$HOST" >"$RUN_DIR/$NAME.log" 2>&1 &
+PID=$!
+
+# Prove it. A pid alone means nothing — ssh may still be authenticating, or about
+# to exit because the forward was refused.
+live=0
+for _ in $(seq 1 20); do
+  kill -0 "$PID" 2>/dev/null || break
+  if (( REVERSE )); then live=1; break; fi   # nothing local to probe
+  port_open "$LPORT" && { live=1; break; }
+  sleep 0.4
+done
+
+if (( ! live )); then
+  kill "$PID" 2>/dev/null
+  bad "tunnel did not come up"
+  [[ -s $RUN_DIR/$NAME.log ]] && sed 's/^/    /' "$RUN_DIR/$NAME.log" | head -6
+  rm -f "$RUN_DIR/$NAME.log"
+  exit 1
+fi
+
+cat >"$RUN_DIR/$NAME.meta" <<EOF
+name=$NAME
+agent=$AGENT
+host=$HOST
+pid=$PID
+lport=$LPORT
+rport=$RPORT
+scheme=${SCHEME:-}
+mode=$MODE
+started=$(date -Is)
+EOF
+
+if (( REVERSE )); then
+  ok "$NAME live — $AGENT can now reach this box's :$LPORT as its own 127.0.0.1:$RPORT"
+else
+  ok "$NAME live — ${SCHEME:+$SCHEME://}localhost:$LPORT → $AGENT:$RPORT"
+  [[ -n ${SCHEME:-} ]] && printf '  %sopen %s://localhost:%s%s\n' "$c_d" "$SCHEME" "$LPORT" "$c_0"
+fi
+printf '  %sclose with: nhq-tunnel --stop %s%s\n' "$c_d" "$NAME" "$c_0"
