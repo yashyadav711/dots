@@ -34,6 +34,7 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -294,6 +295,144 @@ def cmd_whoami(a):
     print(resolve_identity(a.as_))
 
 
+# ── cross-machine delivery ──────────────────────────────────────────────────
+#
+# The bus is one SQLite file per BOX, so a message sent on rig lands in rig's
+# bus and Director never sees it. `nhq-msg send director …` on rig reported
+# success and delivered nothing.
+#
+# Delivery is a PULL, not a push, and that is deliberate. Director's box can
+# already ssh to every fleet box; the boxes cannot ssh back, and they should not
+# be given the means to. A GPU box that holds shared credentials and answers on
+# the LAN is the LAST thing that should hold a key into the laptop, so the trust
+# arrow stays one-way and Director does the collecting.
+#
+# Handoff is two-phase on purpose: fetch, insert locally, and only then ack. A
+# connection dying mid-transfer costs a duplicate at worst, never a lost message.
+
+
+def registry_agents() -> dict:
+    path = os.environ.get("NHQ_REGISTRY") or os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "fleet-registry.json"
+    )
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data.get("agents", {}) or {}
+    except Exception:
+        return {}
+
+
+def remote_hosts() -> list[str]:
+    """ssh targets of fleet boxes other than this one."""
+    here = {socket.gethostname(), socket.gethostname().split(".")[0]}
+    out = []
+    for spec in registry_agents().values():
+        host = (spec or {}).get("host")
+        if host and host not in here and host not in out:
+            out.append(host)
+    return out
+
+
+def ensure_forwarded_column(db) -> None:
+    cols = {r[1] for r in db.execute("PRAGMA table_info(messages)")}
+    if "forwarded_at" not in cols:
+        db.execute("ALTER TABLE messages ADD COLUMN forwarded_at TEXT")
+        db.commit()
+
+
+def cmd_handoff(a):
+    """Runs ON a fleet box. Emits messages addressed to someone elsewhere."""
+    db = connect()
+    ensure_forwarded_column(db)
+
+    if a.ack:
+        ids = [int(x) for x in a.ack.split(",") if x.strip()]
+        if ids:
+            qs = ",".join("?" * len(ids))
+            db.execute(
+                f"UPDATE messages SET forwarded_at=? WHERE id IN ({qs})", [now(), *ids]
+            )
+            db.commit()
+        print(json.dumps({"acked": ids}))
+        return
+
+    targets = [t.lower() for t in a.to]
+    qs = ",".join("?" * len(targets))
+    rows = db.execute(
+        "SELECT id,thread,from_id,to_id,kind,body,priority,created_at "
+        f"FROM messages WHERE lower(to_id) IN ({qs}) AND forwarded_at IS NULL "
+        "ORDER BY id LIMIT ?",
+        (*targets, a.limit),
+    ).fetchall()
+    keys = ["id", "thread", "from", "to", "kind", "body", "priority", "created_at"]
+    print(json.dumps([dict(zip(keys, r)) for r in rows]))
+
+
+def cmd_pull(a):
+    """Runs on Director's box. Collects messages the fleet could not deliver."""
+    me = resolve_identity(a.as_)
+    # Director answers to several names depending on which repo the session sits
+    # in, so collect for all of them rather than silently missing mail that was
+    # correctly addressed to "director".
+    targets = a.target or [me, "director", "nhq", "all"]
+    hosts = a.host or remote_hosts()
+    if not hosts:
+        print("nhq-msg: no remote fleet boxes in the registry")
+        return
+
+    db = connect()
+    ensure_forwarded_column(db)
+    total = 0
+
+    for host in hosts:
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+               "nhq-msg handoff " + " ".join(f"--to {t}" for t in targets)]
+        rc, out = _run(cmd, timeout=25.0)
+        if rc != 0:
+            print(f"nhq-msg: {host} unreachable ({out.splitlines()[0] if out else 'no output'})")
+            continue
+        try:
+            msgs = json.loads(out or "[]")
+        except json.JSONDecodeError:
+            print(f"nhq-msg: {host} returned unparseable output — is nhq-msg current there?")
+            continue
+        if not msgs:
+            print(f"nhq-msg: {host} has nothing waiting")
+            continue
+
+        if a.dry_run:
+            for m in msgs:
+                print(f"  [dry] {host}#{m['id']} {m['from']} → {m['to']} [{m['kind']}]  {m['body'][:80]}")
+            continue
+
+        taken = []
+        for m in msgs:
+            # The sender is tagged with its box so a reply is addressable and so
+            # two agents that share a name on different boxes stay distinct.
+            frm = m["from"] if "@" in m["from"] else f"{m['from']}@{host}"
+            db.execute(
+                """INSERT INTO messages(thread,from_id,to_id,kind,body,priority,created_at,forwarded_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (m["thread"], frm, m["to"], m["kind"], m["body"], m["priority"],
+                 m["created_at"], now()),
+            )
+            taken.append(str(m["id"]))
+        db.commit()
+
+        # Only now that they are durable here do we let the box forget them.
+        rc, _ = _run(["ssh", "-o", "BatchMode=yes", host,
+                      f"nhq-msg handoff --ack {','.join(taken)}"], timeout=20.0)
+        if rc != 0:
+            print(f"nhq-msg: {host} — collected {len(taken)} but ack failed; "
+                  "they may arrive twice (harmless, never lost)")
+        total += len(taken)
+        print(f"nhq-msg: collected {len(taken)} from {host}")
+
+    if total and not a.dry_run:
+        print(f"nhq-msg: {total} message(s) now in this box's inbox — nhq-msg inbox")
+
+
 def main():
     p = argparse.ArgumentParser(prog="nhq-msg", description="cross-session agent message bus")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -334,6 +473,17 @@ def main():
 
     s = sub.add_parser("whoami"); s.set_defaults(fn=cmd_whoami)
     s.add_argument("--as", dest="as_", default=None)
+
+    s = sub.add_parser("handoff"); s.set_defaults(fn=cmd_handoff)
+    s.add_argument("--to", action="append", default=[], help="recipient id to hand over (repeatable)")
+    s.add_argument("--ack", default=None, help="comma-separated ids to mark forwarded")
+    s.add_argument("--limit", type=int, default=200)
+
+    s = sub.add_parser("pull"); s.set_defaults(fn=cmd_pull)
+    s.add_argument("--host", action="append", default=[], help="ssh target (default: every remote box in the registry)")
+    s.add_argument("--to", dest="target", action="append", default=[], help="collect mail for this id (repeatable)")
+    s.add_argument("--as", dest="as_", default=None)
+    s.add_argument("--dry-run", action="store_true")
 
     a = p.parse_args()
     a.fn(a)
