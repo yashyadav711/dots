@@ -1,0 +1,17 @@
+[Unit]
+Description=Sweep for finished Itihaas artifacts every five minutes
+
+[Timer]
+# Five minutes, not one: nothing here is urgent — a video Yash will watch later does
+# not need to arrive within a minute of being ready — and each sweep costs a few
+# NotebookLM API calls per unfinished run. Runs that are still live are skipped, so
+# the usual sweep does nothing at all.
+OnBootSec=3min
+OnUnitActiveSec=5min
+# A laptop that was asleep should catch up on waking rather than waiting out an
+# interval that elapsed while suspended — that is exactly when a video finishes.
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

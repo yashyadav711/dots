@@ -1,0 +1,22 @@
+[Unit]
+Description=Collect Itihaas artifacts that finished generating after their run ended
+Documentation=man:nhq-itihaas(1)
+# The three artifacts do not finish together. The report lands in about two minutes,
+# the slide deck in ten, the video well past any wait worth holding a process open
+# for — so a run legitimately ends with the video still building. Without this sweep
+# the burden lands on Yash to remember `nhq-itihaas "<naam>" --pull`, and the ask was
+# "sab automatic ban jaye".
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# nhq-* live in ~/.local/bin, which a systemd user unit does not inherit.
+Environment=PATH=%h/.local/bin:/usr/bin:/usr/local/bin
+ExecStart=%h/.local/bin/nhq-itihaas --finish-pending
+# A run still generating, or NotebookLM being slow, is ordinary — not a red unit.
+# The next sweep collects whatever became ready.
+SuccessExitStatus=0 1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nhq-itihaas-finish

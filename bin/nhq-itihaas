@@ -44,6 +44,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -508,6 +509,70 @@ def pull_only(name: str) -> int:
     return 0
 
 
+def run_is_live(name: str) -> bool:
+    """Is a full pipeline still working on this name?
+
+    Matched on the process list rather than only the systemd unit, so a run started
+    from a shell counts too. A live pipeline is doing its own waiting and writing its
+    own state; sweeping it at the same time is how you get two decks.
+    """
+    rc, out = run(["pgrep", "-af", "nhq-itihaas"], timeout=20)
+    for line in out.splitlines():
+        if name in line and "--pull" not in line and "--finish-pending" not in line:
+            return True
+    return False
+
+
+def finish_pending() -> int:
+    """Collect whatever has finished generating since the last sweep.
+
+    This exists because the three artifacts do not finish together. The report lands
+    in about two minutes, the deck in ten, the video well past any wait worth holding
+    a process open for - so the first run legitimately ends incomplete. Yash asked for
+    "sab automatic ban jaye", not "yaad rakhna ki --pull chalana hai", and a timer is
+    the honest way to keep that promise.
+
+    Always exits 0: nothing pending is the normal state, not a failure.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    for f in sorted(STATE_DIR.glob("*.json")):
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+        name = d.get("name")
+        if not name or "done" in (d.get("stages") or {}):
+            continue
+        if run_is_live(name):
+            dim(f"{name}: pipeline abhi chal raha hai — chhod diya")
+            continue
+        step(f"finishing {name}")
+        try:
+            pull_only(name)
+        except Exception as e:
+            bad(f"{name}: {type(e).__name__}: {e}")
+            continue
+        after = State(name).d.get("stages") or {}
+        if "done" in after:
+            notify_done(name, State(name).d)
+    return 0
+
+
+def notify_done(name: str, d: dict) -> None:
+    """Tell Yash on Telegram, once — the `done` stage is what stops a repeat."""
+    bot = shutil.which("nhq-bot")
+    if not bot:
+        return
+    nb = d.get("notebook") or ""
+    run([bot, "notify", "--event", "completed",
+         "--title", f"Itihaas: {name} poora ho gaya",
+         "--body", (f"Report, slide deck aur video — teeno ban gaye aur download ho gaye. "
+                    f"Vault: Projects/Itihaas/{slug(name)}.md · artifacts "
+                    f"Projects/Itihaas/_artifacts/{slug(name)}/ · "
+                    f"notebook https://notebooklm.google.com/notebook/{nb}")],
+        timeout=60)
+
+
 def write_note(name: str, nb: str, n_src: int, made: dict, got: list) -> Path:
     VAULT_NOTES.mkdir(parents=True, exist_ok=True)
     p = VAULT_NOTES / f"{slug(name)}.md"
@@ -609,12 +674,16 @@ def main() -> int:
     p.add_argument("--list", action="store_true", help="every Itihaas notebook")
     p.add_argument("--pull", action="store_true",
                    help="sirf jo ban chuka hai wo download karo (research dobara nahi)")
+    p.add_argument("--finish-pending", action="store_true",
+                   help="jo runs adhoore hain unko sweep karke poora karo (timer ke liye)")
     a = p.parse_args()
 
     if a.list:
         return cmd_list()
     if a.status is not None:
         return cmd_status(a.status or None)
+    if a.finish_pending:
+        return finish_pending()
     if not a.name:
         p.print_help()
         return 2

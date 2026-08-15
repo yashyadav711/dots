@@ -155,6 +155,9 @@ echo "  agy-usage-snapshot (quota timer):   ln -sfn $DOTS/system/agy-usage-snaps
 echo "  nhq-msg-pull (fleet mail, DIRECTOR BOX ONLY):"
 echo "                                      ln -sfn $DOTS/system/nhq-msg-pull.service ~/.config/systemd/user/ && ln -sfn $DOTS/system/nhq-msg-pull.timer ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now nhq-msg-pull.timer"
 echo "                                      (fleet boxes cannot ssh back here, so mail addressed to Director only arrives when this box collects it)"
+echo "  nhq-itihaas-finish (artifact sweep):"
+echo "                                      ln -sfn $DOTS/system/nhq-itihaas-finish.service ~/.config/systemd/user/ && ln -sfn $DOTS/system/nhq-itihaas-finish.timer ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now nhq-itihaas-finish.timer"
+echo "                                      (a NotebookLM video finishes long after its run ends; without this you must remember nhq-itihaas \"<naam>\" --pull)"
 
 cat <<'NOTE'
 
