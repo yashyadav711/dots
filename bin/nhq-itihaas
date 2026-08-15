@@ -564,13 +564,18 @@ def notify_done(name: str, d: dict) -> None:
     if not bot:
         return
     nb = d.get("notebook") or ""
-    run([bot, "notify", "--event", "completed",
-         "--title", f"Itihaas: {name} poora ho gaya",
-         "--body", (f"Report, slide deck aur video — teeno ban gaye aur download ho gaye. "
-                    f"Vault: Projects/Itihaas/{slug(name)}.md · artifacts "
-                    f"Projects/Itihaas/_artifacts/{slug(name)}/ · "
-                    f"notebook https://notebooklm.google.com/notebook/{nb}")],
-        timeout=60)
+    rc, out = run([bot, "notify", "--event", "completed",
+                   "--title", f"Itihaas: {name} poora ho gaya",
+                   "--body", (f"Report, slide deck aur video — teeno ban gaye aur download ho gaye. "
+                              f"Vault: Projects/Itihaas/{slug(name)}.md · artifacts "
+                              f"Projects/Itihaas/_artifacts/{slug(name)}/ · "
+                              f"notebook https://notebooklm.google.com/notebook/{nb}")],
+                  timeout=60)
+    # A swallowed failure here means the sweep silently stops being the thing that
+    # tells him it is done, which is the whole point of the sweep. It goes to the
+    # journal, where the timer's own output already lands.
+    if rc != 0:
+        warn(f"telegram nahi gaya (exit {rc}): {out.splitlines()[-1][:100] if out else '?'}")
 
 
 def write_note(name: str, nb: str, n_src: int, made: dict, got: list) -> Path:
