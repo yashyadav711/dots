@@ -1171,6 +1171,128 @@ PY
     (( DRY )) || run sudo docker restart open-webui
   fi
 
+  # ── Open Terminal: a shell for the model, sandboxed ─────────────────────
+  #
+  # Docker, NOT the bare-metal pip install. Bare metal is the version that gets
+  # pitched ("the AI could run pacman for you") and is exactly wrong on a box that
+  # holds shared credentials and has passwordless sudo: a model reading a hostile
+  # web page is then one step from the account store. In a container it cannot see
+  # those files at all — verified, not assumed.
+  #
+  # Bound to LOOPBACK. The upstream `-p 8000:8000` publishes on 0.0.0.0, which puts
+  # a remote-shell API on the LAN behind a single key. Open WebUI's system-level
+  # connection is proxied by its own backend on this host, so loopback suffices.
+  #
+  # The Docker socket is deliberately not mounted: upstream calls that "effectively
+  # root access on the host machine".
+  local ot_key="$HOME/.config/nhq/open-terminal.key"
+  if [[ ! -s $ot_key ]]; then
+    run mkdir -p "$(dirname "$ot_key")"
+    if (( ! DRY )); then
+      printf 'sk-ot-%s' "$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 40)" > "$ot_key"
+      chmod 600 "$ot_key"
+    fi
+    ok "generated an Open Terminal api key (600)"
+  else
+    ok "Open Terminal api key already present"
+  fi
+
+  if sudo docker inspect open-terminal >/dev/null 2>&1; then
+    ok "open-terminal container already exists"
+  else
+    run sudo docker run -d --name open-terminal --restart unless-stopped \
+      -p 127.0.0.1:8000:8000 \
+      -v open-terminal:/home/user \
+      -e OPEN_TERMINAL_API_KEY="$(cat "$ot_key" 2>/dev/null)" \
+      -e OPEN_TERMINAL_FILE_BROWSER_ROOT=home \
+      ghcr.io/open-webui/open-terminal:latest
+  fi
+
+  # ── Playwright MCP: a real browser for the model ────────────────────────
+  #
+  # Three things the copy-paste instructions get wrong on a headless box:
+  #   * `npx @playwright/mcp@latest` in a unit re-resolves every boot, so the
+  #     version silently drifts. Install once, run the installed file.
+  #   * it defaults to the 'chrome' CHANNEL (/opt/google/chrome/chrome), which does
+  #     not exist here — pass --browser chromium for Playwright's own build.
+  #   * it validates the Host HEADER, so a client dialling 127.0.0.1 is refused
+  #     even when the socket is bound there. Allow both spellings.
+  pkg npm nodejs
+  if [[ ! -f /usr/lib/node_modules/@playwright/mcp/cli.js ]]; then
+    run sudo env PATH=/usr/bin:/usr/local/bin /usr/bin/npm install -g @playwright/mcp
+  else
+    ok "@playwright/mcp already installed globally"
+  fi
+  # The browser build is pinned to the MCP version, so let the package fetch the
+  # one it wants instead of guessing a chromium revision.
+  (( DRY )) || run env PATH=/usr/bin:/usr/local/bin HOME="$HOME" \
+    /usr/bin/node /usr/lib/node_modules/@playwright/mcp/cli.js install-browser chrome-for-testing
+
+  WR_MODE=644 wr "$HOME/.config/systemd/user/playwright-mcp.service" <<EOF
+[Unit]
+Description=Playwright MCP — browser automation for Open WebUI models
+Documentation=https://github.com/microsoft/playwright-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=/usr/bin:/usr/local/bin
+Environment=HOME=%h
+ExecStart=/usr/bin/node /usr/lib/node_modules/@playwright/mcp/cli.js --browser chromium --headless --isolated --host 127.0.0.1 --port 8931 --allowed-hosts localhost:8931,127.0.0.1:8931
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=playwright-mcp
+
+[Install]
+WantedBy=default.target
+EOF
+  run systemctl --user daemon-reload
+  run systemctl --user enable --now playwright-mcp.service
+
+  # Register both with Open WebUI. Same reason as the model connections: env vars
+  # are first-boot seeds, the database decides. `type` MUST be "mcp" for Playwright;
+  # the default is openapi and pointing that at /mcp fails obscurely.
+  if (( DRY )); then
+    say "  ${C_D}[dry] register open-terminal + playwright-mcp in the webui database${C_0}"
+  else
+    sudo docker exec -i -e OT_KEY="$(cat "$ot_key" 2>/dev/null)" open-webui python3 - <<'PY' 2>/dev/null | sed 's/^/  /' || warn "could not register integrations (is the container up?)"
+import json, os, sqlite3
+db = sqlite3.connect("/app/backend/data/webui.db")
+
+def upsert(key, entry, match):
+    row = db.execute("select value from config where key=?", (key,)).fetchone()
+    cur = json.loads(row[0]) if row and row[0] else []
+    cur = [c for c in cur if not match(c)]
+    cur.append(entry)
+    val = json.dumps(cur)
+    if row is None:
+        db.execute("insert into config (key,value,updated_at) values (?,?,datetime('now'))", (key, val))
+    else:
+        db.execute("update config set value=?, updated_at=datetime('now') where key=?", (val, key))
+    return len(cur)
+
+n1 = upsert("terminal_server.connections", {
+    "id": "rig-local", "name": "Rig (sandboxed)", "enabled": True,
+    "url": "http://127.0.0.1:8000", "path": "/openapi.json",
+    "key": os.environ.get("OT_KEY", ""), "auth_type": "bearer",
+    "config": {}, "server_type": None,
+}, lambda c: c.get("id") == "rig-local")
+
+n2 = upsert("tool_server.connections", {
+    "url": "http://localhost:8931", "path": "/mcp", "type": "mcp",
+    "auth_type": "none", "headers": None, "key": "", "config": {"enable": True},
+    "info": {"id": "playwright-rig", "name": "Playwright (rig, headless)",
+             "description": "Real Chromium on rig: open pages, click, read, screenshot."},
+}, lambda c: c.get("url") == "http://localhost:8931" and c.get("path") == "/mcp")
+
+print(f"webui integrations: {n1} terminal, {n2} tool server(s)")
+PY
+    run sudo docker restart open-webui
+  fi
+
   mark_stage ai
 }
 
@@ -1222,6 +1344,57 @@ async def main():
             print(f"FAIL {label}: {type(e).__name__}")
 asyncio.run(main())
 PY
+
+  # ── Open Terminal ───────────────────────────────────────────────────────
+  if sudo docker inspect open-terminal >/dev/null 2>&1; then
+    local otp; otp=$(sudo docker port open-terminal 2>/dev/null | head -1)
+    grep -q '127.0.0.1' <<<"$otp" && ok "open-terminal on loopback only ($otp)" \
+      || bad "open-terminal published to the LAN ($otp) — that is a remote shell on the Wi-Fi"
+    local otk; otk=$(cat "$HOME/.config/nhq/open-terminal.key" 2>/dev/null)
+    if [[ -n $otk ]]; then
+      # A 200 on /docs only proves it booted. Run a command and read the result:
+      # /execute is ASYNC, so the first response is a process id, never the output.
+      local pid out
+      pid=$(curl -s -m 20 -X POST http://127.0.0.1:8000/execute \
+              -H "Authorization: Bearer $otk" -H 'Content-Type: application/json' \
+              -d '{"command":"echo alive; ls /home/"}' 2>/dev/null \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+      sleep 3
+      out=$(curl -s -m 20 "http://127.0.0.1:8000/execute/$pid/status" \
+              -H "Authorization: Bearer $otk" 2>/dev/null \
+            | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print(" ".join((l.get("text") or "") if isinstance(l,dict) else str(l) for l in (d.get("output") or [])))' 2>/dev/null)
+      grep -q 'alive' <<<"$out" && ok "open-terminal runs commands" || bad "open-terminal did not return output"
+      # The sandbox is the whole safety argument, so check it rather than trust it.
+      grep -qv "$(basename "$HOME")" <<<"$out" && ok "sandbox holds — host home not visible from the container" \
+        || bad "the container can see the host home — the credential store is exposed"
+    else
+      warn "no ~/.config/nhq/open-terminal.key — cannot exercise the API"
+    fi
+  else
+    warn "no open-terminal container"
+  fi
+
+  # ── Playwright MCP ──────────────────────────────────────────────────────
+  systemctl --user is-enabled --quiet playwright-mcp 2>/dev/null && ok "playwright-mcp enabled at login" \
+    || warn "playwright-mcp not enabled — the model loses its browser after a reboot"
+  if systemctl --user is-active --quiet playwright-mcp 2>/dev/null; then
+    ok "playwright-mcp active"
+    ss -tlnp 2>/dev/null | grep -q '127.0.0.1:8931' && ok "listening on loopback only" \
+      || bad "8931 is not loopback-bound — browser automation open to the LAN"
+    # A handshake proves the protocol; only a navigate proves Chromium can start,
+    # which is where the 'chrome channel not found' failure hid.
+    local nav
+    nav=$(curl -s -m 30 -X POST http://localhost:8931/mcp \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"verify","version":"1"}}}' 2>/dev/null)
+    grep -q 'protocolVersion' <<<"$nav" && ok "MCP handshake ok" || bad "MCP handshake failed"
+    say "  ${C_D}browser smoke test (needs the webui container): nhq-newbox is not the place for it —${C_0}"
+    say "  ${C_D}  ask the model in Open WebUI to open a page, or run /tmp/pw-browse.sh on this box${C_0}"
+  else
+    bad "playwright-mcp not running"
+  fi
 }
 
 # ─────────────────────────────────────────────────────────── agy (model proxy)
