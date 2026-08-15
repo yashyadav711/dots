@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -172,8 +173,35 @@ def doorbell(db, to_id, from_id, kind):
 # ── commands ────────────────────────────────────────────────────────────────
 
 def cmd_send(a):
-    db = connect()
     frm = resolve_identity(a.sender)
+
+    # A recipient that lives on another box needs its message in THAT box's bus,
+    # or it is stored somewhere the recipient will never look. Push over ssh,
+    # which is the direction that already works: Director's box reaches the fleet,
+    # not the other way round. On arrival the recipient is local, so the remote
+    # copy of this command stores it normally and cannot bounce it onward again.
+    host = remote_host_for(a.to)
+    if host and not getattr(a, "local_only", False):
+        tag = frm if "@" in frm else f"{frm}@{socket.gethostname().split('.')[0]}"
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+               "nhq-msg", "send", shlex.quote(a.to), shlex.quote(a.body),
+               "--kind", a.kind, "--priority", a.priority,
+               "--from", shlex.quote(tag), "--local-only"]
+        if a.thread:
+            cmd += ["--thread", shlex.quote(a.thread)]
+        if a.no_poke:
+            cmd += ["--no-poke"]
+        rc, out = _run(cmd, timeout=25.0)
+        if rc == 0:
+            print(f"nhq-msg: delivered to {a.to} on {host} — {out.strip() or 'stored'}")
+            return
+        # Falling back to a local write would look like success while leaving the
+        # message on the wrong machine, so say plainly that nothing was delivered.
+        print(f"nhq-msg: could not reach {host} for {a.to} — NOT delivered "
+              f"({out.splitlines()[0] if out else 'ssh failed'})")
+        raise SystemExit(1)
+
+    db = connect()
     upsert_agent(db, frm)
     db.execute(
         """INSERT INTO messages(thread,from_id,to_id,kind,body,priority,created_at)
@@ -323,6 +351,24 @@ def registry_agents() -> dict:
         return {}
 
 
+def remote_host_for(recipient: str) -> str | None:
+    """The ssh target hosting `recipient`, or None when it belongs to this box.
+
+    Matches the registry key or any of its aliases, the way every other nhq tool
+    resolves a name, so `gpu` and `box` reach rig just like `rig` does.
+    """
+    want = (recipient or "").lower()
+    here = {socket.gethostname(), socket.gethostname().split(".")[0]}
+    for key, spec in registry_agents().items():
+        spec = spec or {}
+        names = {key.lower(), *(str(x).lower() for x in spec.get("aliases") or [])}
+        if want not in names:
+            continue
+        host = spec.get("host")
+        return host if host and host not in here else None
+    return None
+
+
 def remote_hosts() -> list[str]:
     """ssh targets of fleet boxes other than this one."""
     here = {socket.gethostname(), socket.gethostname().split(".")[0]}
@@ -427,10 +473,17 @@ def cmd_pull(a):
             print(f"nhq-msg: {host} — collected {len(taken)} but ack failed; "
                   "they may arrive twice (harmless, never lost)")
         total += len(taken)
-        print(f"nhq-msg: collected {len(taken)} from {host}")
+        # Name the recipient it was addressed to. Mail collected for "director"
+        # is invisible to `nhq-msg inbox` in a session whose identity resolves to
+        # something else, and silently-delivered-but-unreadable is the worst
+        # outcome of the lot.
+        who = sorted({m["to"] for m in msgs})
+        print(f"nhq-msg: collected {len(taken)} from {host} → addressed to {', '.join(who)}")
+        for w in who:
+            print(f"  read it with: nhq-msg inbox --as {w}")
 
     if total and not a.dry_run:
-        print(f"nhq-msg: {total} message(s) now in this box's inbox — nhq-msg inbox")
+        print(f"nhq-msg: {total} message(s) now durable on this box")
 
 
 def main():
@@ -444,6 +497,9 @@ def main():
     s.add_argument("--from", dest="sender", default=None)
     s.add_argument("--priority", default="normal", choices=["normal", "high"])
     s.add_argument("--no-poke", action="store_true")
+    # Set by the ssh hop so the remote copy stores instead of re-routing.
+    s.add_argument("--local-only", dest="local_only", action="store_true",
+                   help=argparse.SUPPRESS)
 
     for name in ("inbox", "peek"):
         s = sub.add_parser(name); s.set_defaults(fn=cmd_inbox, peek=(name == "peek"))
