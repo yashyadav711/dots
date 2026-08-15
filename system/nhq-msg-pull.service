@@ -1,0 +1,20 @@
+[Unit]
+Description=Collect fleet mail the boxes cannot deliver themselves
+Documentation=man:nhq-msg(1)
+# The bus is one SQLite file per box and delivery is a PULL: Director's box can
+# ssh to every fleet box, the boxes cannot ssh back, and deliberately are not
+# given the means to. So nothing arrives unless this box goes and fetches it.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# nhq-* live in ~/.local/bin, which a systemd user unit does not inherit.
+Environment=PATH=%h/.local/bin:/usr/bin:/usr/local/bin
+ExecStart=%h/.local/bin/nhq-msg pull
+# An unreachable box (asleep, moved, powered off) is ordinary, not a failure worth
+# a red unit — the next run collects whatever piled up.
+SuccessExitStatus=0 1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nhq-msg-pull

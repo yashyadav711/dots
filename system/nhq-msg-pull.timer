@@ -1,0 +1,15 @@
+[Unit]
+Description=Collect fleet mail every couple of minutes
+
+[Timer]
+# Two minutes is the trade: an agent's "I'm done" or "I'm blocked" should feel
+# prompt, and the cost is one ssh per box, which is nothing.
+OnBootSec=90
+OnUnitActiveSec=2min
+# A laptop that was asleep should catch up immediately on waking rather than
+# waiting out the remainder of an interval that elapsed while suspended.
+Persistent=true
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

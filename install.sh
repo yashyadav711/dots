@@ -148,6 +148,9 @@ echo "  faillock (looser sudo lockout):     sudo install -m644 $DOTS/system/fail
 echo "  no-suspend-on-lid:                  sudo install -Dm644 $DOTS/system/logind-lid.conf /etc/systemd/logind.conf.d/10-lid.conf && sudo systemctl reload systemd-logind"
 echo "  pi-antigravity-rotator (user svc):  ln -sfn $DOTS/system/pi-antigravity-rotator.service ~/.config/systemd/user/pi-antigravity-rotator.service && systemctl --user enable pi-antigravity-rotator"
 echo "  agy-usage-snapshot (quota timer):   ln -sfn $DOTS/system/agy-usage-snapshot.service ~/.config/systemd/user/ && ln -sfn $DOTS/system/agy-usage-snapshot.timer ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now agy-usage-snapshot.timer"
+echo "  nhq-msg-pull (fleet mail, DIRECTOR BOX ONLY):"
+echo "                                      ln -sfn $DOTS/system/nhq-msg-pull.service ~/.config/systemd/user/ && ln -sfn $DOTS/system/nhq-msg-pull.timer ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now nhq-msg-pull.timer"
+echo "                                      (fleet boxes cannot ssh back here, so mail addressed to Director only arrives when this box collects it)"
 
 cat <<'NOTE'
 
