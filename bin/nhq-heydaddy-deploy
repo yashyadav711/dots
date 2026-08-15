@@ -137,6 +137,55 @@ rw() { local t="$1"; shift; timeout --kill-after=10 "$t" railway "$@" </dev/null
 # Collapse anything multi-line into one short, printable line.
 oneline() { printf '%s' "${1-}" | tr '\n\t' '  ' | tr -s ' ' | cut -c1-200; }
 
+# ── Branch stamp resolution (#279) ────────────────────────────────────────────
+# `git rev-parse --abbrev-ref HEAD` prints the literal "HEAD" in a DETACHED
+# worktree, and a detached tree is the documented happy path here: promote.sh's
+# deploy_from() rolls a release back from one on purpose, and the runbook tells
+# operators to deploy from a clean detached tree so `railway up` cannot upload
+# the wrong working tree. The old code skipped the branch stamp in that case, so
+# whatever stale value already sat on the service survived forever — after the
+# 2026-08-15 production release of a2d3179b, /version still reported
+# "branch":"tmp-gd", a throwaway branch left over from an aborted 12 Aug run.
+# Resolution order, first hit wins:
+#   1. the checked-out branch, when HEAD is attached (unchanged behaviour);
+#   2. a branch whose tip is EXACTLY this commit — refs/heads before
+#      refs/remotes, `origin/` stripped — with a tie broken toward the branch
+#      this environment ships, so a rollback stamps a branch that really
+#      contains the commit;
+#   3. the branch RW_ENV deploys from (production → main, dev → dev).
+# Prints the resolved name; returns 1 (printing nothing) when none of the three
+# resolves, which is the only case the caller is allowed to skip the stamp on.
+resolve_stamp_branch() {
+  local head_branch points_at env_branch
+  head_branch="$(cd "$HEYDADDY_DIR" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  [[ -n "$head_branch" ]] || return 1          # not a git checkout at all
+  if [[ "$head_branch" != "HEAD" ]]; then
+    printf '%s\n' "$head_branch"
+    return 0
+  fi
+  case "$RW_ENV" in
+    production) env_branch="main" ;;
+    dev)        env_branch="dev" ;;
+    *)          env_branch="" ;;
+  esac
+  # Full refnames, not %(refname:short): git shortens refs/remotes/origin/HEAD to
+  # the bare remote name "origin", which is not a branch and must never be stamped.
+  points_at="$(cd "$HEYDADDY_DIR" 2>/dev/null \
+    && git for-each-ref --points-at HEAD --format='%(refname)' refs/heads refs/remotes 2>/dev/null \
+    | grep -v '/HEAD$' \
+    | sed -e 's#^refs/heads/##' -e 's#^refs/remotes/origin/##' -e 's#^refs/remotes/##' \
+    | awk '!seen[$0]++')"
+  if [[ -n "$env_branch" ]] && grep -qx -- "$env_branch" <<<"$points_at"; then
+    printf '%s\n' "$env_branch"
+  elif [[ -n "$points_at" ]]; then
+    printf '%s\n' "$points_at" | head -1
+  elif [[ -n "$env_branch" ]]; then
+    printf '%s\n' "$env_branch"
+  else
+    return 1
+  fi
+}
+
 # ── Deployment-list reader ────────────────────────────────────────────────────
 # Answers "what is the newest deployment for this service?" and has THREE
 # possible outcomes. Collapsing them into one empty string is half of what broke
@@ -238,7 +287,8 @@ if [[ "$dry_run" == 1 ]]; then
     step "python -m backend.migrate upgrade   — ABORT the whole deploy if it fails"
   fi
   if [[ "$TIER" == "be" ]]; then
-    step "stamp release commit → railway variable set RAILWAY_GIT_COMMIT_SHA=<HEAD> RAILWAY_GIT_BRANCH=<branch> --skip-deploys (no extra deploy; #279)"
+    dry_branch="$(resolve_stamp_branch)"
+    step "stamp release commit → railway variable set RAILWAY_GIT_COMMIT_SHA=<HEAD> RAILWAY_GIT_BRANCH=${dry_branch:-<UNRESOLVED — branch stamp SKIPPED, /version keeps the previous branch value>} --skip-deploys (no extra deploy; #279)"
   fi
   if [[ "$TIER" == "be" ]]; then
     step "cd $HEYDADDY_DIR && railway up --project $PROJECT_ID --environment $RW_ENV --service $SERVICE --detach"
@@ -332,18 +382,21 @@ fi
 # Railway injects these itself, so this is backend-only.
 if [[ "$TIER" == "be" ]]; then
   stamp_sha="$(cd "$HEYDADDY_DIR" 2>/dev/null && git rev-parse HEAD 2>/dev/null)"
-  stamp_branch="$(cd "$HEYDADDY_DIR" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  stamp_branch="$(resolve_stamp_branch)"
   if [[ -n "$stamp_sha" ]]; then
     echo "→ stamping release commit ${stamp_sha:0:8} (branch ${stamp_branch:-unknown}) as a runtime var — no extra deploy…"
     rw "$RW_TIMEOUT" variable set "RAILWAY_GIT_COMMIT_SHA=$stamp_sha" \
        --project "$PROJECT_ID" --service "$SERVICE" --environment "$RW_ENV" --skip-deploys \
        >/dev/null 2>&1 \
       || echo "   ⚠ could not set RAILWAY_GIT_COMMIT_SHA — /health may report 'unknown' (deploy continues)" >&2
-    if [[ -n "$stamp_branch" && "$stamp_branch" != "HEAD" ]]; then
+    if [[ -n "$stamp_branch" ]]; then
       rw "$RW_TIMEOUT" variable set "RAILWAY_GIT_BRANCH=$stamp_branch" \
          --project "$PROJECT_ID" --service "$SERVICE" --environment "$RW_ENV" --skip-deploys \
          >/dev/null 2>&1 \
         || echo "   ⚠ could not set RAILWAY_GIT_BRANCH (deploy continues)" >&2
+    else
+      echo "   ⚠ HEAD is detached, no branch points at it, and RW_ENV='$RW_ENV' implies none —" >&2
+      echo "     branch stamp SKIPPED: /version will keep reporting the previous branch value" >&2
     fi
   else
     echo "   ⚠ $HEYDADDY_DIR is not a git checkout — skipping commit stamp; /health may report 'unknown'" >&2
