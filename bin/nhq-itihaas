@@ -277,6 +277,55 @@ def download(nb: str, st: "State") -> list[str]:
     return got
 
 
+def ensure_artifacts(nb: str, name: str, rules: str) -> dict[str, str]:
+    """Queue only what the notebook does not already have.
+
+    Two reasons this checks the notebook instead of the exit code:
+
+    `nlm <kind> create` raises ReadTimeout while NotebookLM has already accepted the
+    job - on Chandragupta Maurya all three creates "failed" that way and the report
+    then turned up completed anyway. An exit code is not evidence in either
+    direction here; the notebook's own artifact list is.
+
+    And skipping what already exists makes a second run idempotent. Queueing blind
+    is how a notebook ends up with two slide decks - which is exactly what I did to
+    the Shankaracharya notebook by hand while testing.
+    """
+    state = studio_state(nb)
+    plan = [
+        ("report", ["report", "create", nb, "--format", "Create Your Own",
+                    "--prompt", REPORT_PROMPT.format(name=name, rules=rules), "--confirm"]),
+        # --focus carries the Hinglish instruction; --language is deliberately NOT set.
+        # The report proves prompt-only steering returns romanized Hinglish, and a
+        # BCP-47 code risks Devanagari - the "pure Hindi" Yash ruled out. Without this
+        # the deck came out in plain English: the flag does exist, an earlier
+        # help-grep of mine silently matched nothing and I concluded it did not.
+        ("slide_deck", ["slides", "create", nb, "--format", "detailed_deck",
+                        "--focus", SLIDES_FOCUS.format(name=name, rules=rules), "--confirm"]),
+        # heritage suits Indian history without sliding into devotional imagery.
+        # hi-IN + the Hinglish focus prompt was verified by transcribing the finished
+        # video through rig's Hinglish STT: the narration comes back romanized
+        # ("...ek strictly historical lens se dekhenge"). Only the artifact TITLE
+        # comes out in Devanagari, which is cosmetic.
+        ("video", ["video", "create", nb, "--format", "explainer", "--style", "heritage",
+                   "--language", "hi-IN",
+                   "--focus", VIDEO_FOCUS.format(name=name, rules=rules), "--confirm"]),
+    ]
+    for kind, args in plan:
+        if kind in state:
+            ok(f"{kind:<11} pehle se hai ({state[kind]})")
+            continue
+        rc, out = nlm(*args, timeout=420)
+        time.sleep(5)  # the artifact appears in the list a moment after acceptance
+        state = studio_state(nb) or state
+        if kind in state:
+            ok(f"{kind:<11} queued")
+        else:
+            bad(f"{kind:<11} queue nahi hua — {out.splitlines()[-1][:110] if out else '?'}")
+    return state
+
+
+
 def pipeline(name: str, deep: bool, wait_studio: int) -> int:
     st = State(name)
     rules = load_rules()
@@ -326,10 +375,13 @@ def pipeline(name: str, deep: bool, wait_studio: int) -> int:
     # --auto-import waits internally (up to ~15 min) and imports what it found, so the
     # generous timeout here is the point, not an accident.
     rc, out = nlm(*args, timeout=1500)
-    st.stage("research", "done" if rc == 0 else "failed", out[-300:])
+    # Deliberately NOT graded on the exit code. On Chandragupta Maurya the CLI
+    # returned non-zero while its own output said "Status: completed" and 99 sources
+    # had already landed - and the phone then showed a healthy run as "ruk gaya".
+    # The source count below is the fact; this is just the transcript.
     if rc != 0:
-        warn(f"research reported a problem: {out.splitlines()[-1][:160] if out else '?'}")
-        dim("continuing — a notebook with no sources still tells us that clearly")
+        warn(f"research command grumbled: {out.splitlines()[-1][:160] if out else '?'}")
+        dim("sources ginke faisla karenge, exit code se nahi")
     else:
         ok("research finished")
 
@@ -348,31 +400,13 @@ def pipeline(name: str, deep: bool, wait_studio: int) -> int:
         bad("no sources landed — the artifacts below would be built on nothing")
         st.stage("sources", "empty")
         return 1
+    st.stage("research", "done", f"{n_src} sources")
     st.stage("sources", "done", f"{n_src} sources")
 
     step("4/6  report · slides · video (Hinglish)")
-    made = {}
-
-    rc, out = nlm("report", "create", nb, "--format", "Create Your Own",
-                  "--prompt", REPORT_PROMPT.format(name=name, rules=rules),
-                  "--confirm", timeout=300)
-    made["report"] = rc == 0
-    (ok if rc == 0 else bad)(f"report {'queued' if rc == 0 else out[:160]}")
-
-    rc, out = nlm("slides", "create", nb, "--format", "detailed_deck",
-                  "--confirm", timeout=300)
-    made["slides"] = rc == 0
-    (ok if rc == 0 else bad)(f"slides {'queued' if rc == 0 else out[:160]}")
-
-    # heritage style suits Indian history without sliding into devotional imagery;
-    # hi-IN steers narration towards Hindi, and the focus prompt pins it to Hinglish.
-    rc, out = nlm("video", "create", nb, "--format", "explainer", "--style", "heritage",
-                  "--language", "hi-IN",
-                  "--focus", VIDEO_FOCUS.format(name=name, rules=rules),
-                  "--confirm", timeout=300)
-    made["video"] = rc == 0
-    (ok if rc == 0 else bad)(f"video {'queued' if rc == 0 else out[:160]}")
-    st.stage("artifacts", "queued", json.dumps(made))
+    st.stage("artifacts", "running")
+    state = ensure_artifacts(nb, name, rules)
+    st.stage("artifacts", "queued", json.dumps(state))
 
     step(f"5/6  waiting for NotebookLM to finish generating (up to {wait_studio//60} min)")
     st.stage("generation", "running")
@@ -398,10 +432,19 @@ def pipeline(name: str, deep: bool, wait_studio: int) -> int:
 
     got = download(nb, st)
 
+    # What the note claims comes from the notebook's final state, not from what we
+    # asked for earlier - the same rule as everything else in this file.
+    final = studio_state(nb)
+    made = {"report": final.get("report") == "completed",
+            "slides": final.get("slide_deck") == "completed",
+            "video": final.get("video") == "completed"}
     note = write_note(name, nb, n_src, made, got)
     ok(f"note: {note}")
     st.set(note=str(note), finished=datetime.now().isoformat(timespec="seconds"))
-    st.stage("done", "done")
+    if all(made.values()):
+        st.stage("done", "done")
+    else:
+        dim(f'baaki lene ke liye baad me:  nhq-itihaas "{name}" --pull')
 
     print()
     ok(f"{C_B}{name}{C_0} — notebook {nb}")
@@ -431,6 +474,12 @@ def pull_only(name: str) -> int:
     for k, v in sorted(state.items()):
         (ok if v == "completed" else dim)(f"{k:<11} {v}")
 
+    # A create call that died on ReadTimeout leaves its type absent entirely, and no
+    # amount of waiting produces it. Queue exactly those, nothing that already exists.
+    if not {"report", "slide_deck", "video"} <= set(state):
+        step("jo kabhi queue nahi hua, wo queue karo")
+        state = ensure_artifacts(nb, name, load_rules())
+
     made = {"report": state.get("report") == "completed",
             "slides": state.get("slide_deck") == "completed",
             "video": state.get("video") == "completed"}
@@ -443,6 +492,13 @@ def pull_only(name: str) -> int:
             n_src = int(json.loads(out).get("source_count") or 0)
         except Exception:
             n_src = 0
+
+    # Repair labels an earlier run got wrong. Chandragupta Maurya's state said
+    # research FAILED while 99 sources sat in the notebook, and the phone dutifully
+    # showed "ruk gaya" for a healthy run. Reality is the source count, so say so.
+    if n_src:
+        st.stage("research", "done", f"{n_src} sources")
+        st.stage("sources", "done", f"{n_src} sources")
 
     note = write_note(name, nb, n_src, made, got)
     ok(f"note: {note}")

@@ -884,11 +884,20 @@ def serve() -> None:
         Read straight off the state files the tool writes, so this stays correct
         even for runs started from the laptop's shell rather than this page.
         """
-        labels = {
-            "auth": "auth", "notebook": "notebook bana",
-            "research": "deep research", "sources": "sources aa gaye",
-            "artifacts": "report/slides/video queue me", "generation": "ban rahe hain",
-            "download": "download", "done": "poora ho gaya",
+        # Two maps, not one label plus a glued-on suffix: that produced
+        # "ban rahe hain chal raha hai". A stage in progress and the same stage
+        # finished are different sentences in Hinglish, so they are written out.
+        RUNNING = {
+            "auth": "auth ho raha hai", "notebook": "notebook ban raha hai",
+            "research": "deep research chal rahi hai",
+            "artifacts": "report/slides/video queue ho rahe hain",
+            "generation": "NotebookLM bana raha hai", "download": "download ho raha hai",
+        }
+        REACHED = {
+            "auth": "auth ho gaya", "notebook": "notebook ban gaya",
+            "research": "research ho gayi", "sources": "sources aa gaye",
+            "artifacts": "queue ho gaye", "generation": "ban gaye",
+            "download": "download ho gaya", "done": "poora ho gaya",
         }
         runs = []
         for f in sorted(ITIHAAS_STATE.glob("*.json"),
@@ -898,17 +907,17 @@ def serve() -> None:
             except Exception:
                 continue
             stages = d.get("stages") or {}
-            last, why = "shuru ho raha hai", ""
+            stage = "shuru ho raha hai"
             for k, v in stages.items():
                 s = v.get("status")
                 if s == "failed":
-                    last, why = labels.get(k, k), " — ruk gaya"
+                    stage = f"{REACHED.get(k, k)} — ruk gaya"
                     break
-                last, why = labels.get(k, k), (" chal raha hai" if s == "running" else "")
+                stage = RUNNING.get(k, k) if s == "running" else REACHED.get(k, k)
             if "done" in stages:
-                last, why = "poora ho gaya", ""
+                stage = "poora ho gaya"
             runs.append({"name": d.get("name") or f.stem,
-                         "stage": last + why,
+                         "stage": stage,
                          "notebook": d.get("notebook") or ""})
         return JSONResponse({"runs": runs})
 
