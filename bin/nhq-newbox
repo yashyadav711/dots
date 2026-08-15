@@ -1392,12 +1392,14 @@ PY
               -H "Authorization: Bearer $otk" -H 'Content-Type: application/json' \
               -d '{"command":"echo alive; ls /home/"}' 2>/dev/null \
             | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
-      sleep 3
-      out=$(curl -s -m 20 "http://127.0.0.1:8000/execute/$pid/status" \
+      # ?wait= blocks until the process finishes, so there is no sleep to guess at, and
+      # the output entries carry their text in "data" — reading "text" returns an empty
+      # array and makes a working terminal look broken. Both cost time to find.
+      out=$(curl -s -m 40 "http://127.0.0.1:8000/execute/$pid/status?wait=25&tail=50" \
               -H "Authorization: Bearer $otk" 2>/dev/null \
             | python3 -c 'import json,sys
 d=json.load(sys.stdin)
-print(" ".join((l.get("text") or "") if isinstance(l,dict) else str(l) for l in (d.get("output") or [])))' 2>/dev/null)
+print(" ".join(((l.get("data") or l.get("text") or "").strip()) if isinstance(l,dict) else str(l) for l in (d.get("output") or [])))' 2>/dev/null)
       grep -q 'alive' <<<"$out" && ok "open-terminal runs commands" || bad "open-terminal did not return output"
       # The sandbox is the whole safety argument, so check it rather than trust it.
       grep -qv "$(basename "$HOME")" <<<"$out" && ok "sandbox holds — host home not visible from the container" \
