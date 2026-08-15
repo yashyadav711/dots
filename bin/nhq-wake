@@ -78,23 +78,33 @@ def learn(agent: str, host: str) -> str | None:
     """Ask the box itself, while it can still answer."""
     # The interface holding the default route is the one that will listen for the
     # magic packet; a box with several NICs would otherwise hand back the wrong one.
+    # sudo for ethtool: as an ordinary user it prints nothing for Wake-on, which
+    # looks exactly like "this NIC has no WoL" and hid that rig's was disabled.
     rc, out = run([
         "ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", host,
         "bash -lc 'nic=$(ip -o route get 1.1.1.1 2>/dev/null | grep -oP \"dev \\K\\S+\"); "
-        "cat /sys/class/net/$nic/address; ethtool $nic 2>/dev/null | grep -i \"^\\s*Wake-on\"'",
+        "cat /sys/class/net/$nic/address; sudo -n ethtool $nic 2>/dev/null | grep -i \"^\\s*Wake-on\"'",
     ])
-    if rc != 0:
-        return None
+    # Do NOT gate on the exit code. The chain ends in a grep for the Wake-on line,
+    # and that grep exits 1 whenever ethtool is absent or the box has WoL disabled —
+    # which reported a perfectly reachable machine as "unreachable" while the MAC was
+    # sitting right there in the output. Judge on whether a MAC came back.
     m = MAC_RE.search(out)
     if not m:
         return None
     mac = m.group(1).lower()
-    wol = "g" if re.search(r"Wake-on:\s*g", out) else None
     c = load_cache()
     entry = c.get(agent, {})
     entry.update({"host": host, "mac": mac, "learned": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
-    if wol:
+    # Record what the NIC actually says rather than assuming provisioning armed it:
+    # on rig the wol@ unit had never been created and the NIC read "Wake-on: d".
+    wol = re.search(r"Wake-on:\s*(\w+)", out)
+    if wol is None:
+        entry["wol"] = "unknown (ethtool said nothing)"
+    elif wol.group(1) == "g":
         entry["wol"] = "armed (g)"
+    else:
+        entry["wol"] = f"NOT armed (Wake-on: {wol.group(1)})"
     c[agent] = entry
     save_cache(c)
     return mac
@@ -123,14 +133,19 @@ def send(mac: str) -> int:
 
 
 def up(host: str) -> bool:
-    ip = load_cache().get(host, {}).get("ip") or host
-    for target in {ip, host}:
-        try:
-            with socket.create_connection((target, 22), timeout=3):
-                return True
-        except OSError:
-            continue
-    return False
+    """Is the box answering?
+
+    Asked through ssh, not a raw socket. `rig` is an ssh ALIAS, not a hostname — a
+    socket to ("rig", 22) fails to resolve and reports a perfectly live box as down,
+    which is how this happily sent a magic packet to a machine that was already
+    running. ssh honours ~/.ssh/config, including the pinned-ip include nhq-resolve
+    maintains, so it answers the question we actually mean.
+    """
+    rc, _ = run([
+        "ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+        "-o", "StrictHostKeyChecking=accept-new", host, "true",
+    ], timeout=10.0)
+    return rc == 0
 
 
 def main() -> int:
