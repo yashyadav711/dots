@@ -1288,7 +1288,32 @@ n2 = upsert("tool_server.connections", {
              "description": "Real Chromium on rig: open pages, click, read, screenshot."},
 }, lambda c: c.get("url") == "http://localhost:8931" and c.get("path") == "/mcp")
 
-print(f"webui integrations: {n1} terminal, {n2} tool server(s)")
+# Make them default-ON for every model, which is the difference between "installed"
+# and "usable". MCP tools only reach a model when the request carries tool_ids
+# (middleware.py), and that list is seeded from the model's meta — so without this,
+# the browser has to be hunted for in a menu on every single chat.
+#
+# models.default_metadata is deep-copied onto EVERY model (utils/models.py: "Apply
+# global model defaults to all models"), and per-model settings still win, so one row
+# covers the whole dropdown instead of needing a preset per model.
+#   toolIds           browser attached
+#   defaultFeatureIds web search armed on a new chat
+#   capabilities      a feature must be capable before it can be default
+#   terminalId        the sandboxed terminal already chosen
+db.execute("delete from config where key='models.default_metadata'")
+db.execute("insert into config (key,value,updated_at) values (?,?,datetime('now'))",
+           ("models.default_metadata", json.dumps({
+               "toolIds": ["server:mcp:playwright-rig"],
+               "defaultFeatureIds": ["web_search"],
+               "capabilities": {"web_search": True, "terminal": True},
+               "terminalId": "rig-local",
+           })))
+
+# Without this the whole block is a no-op that prints success: sqlite3 opens a
+# transaction implicitly and discards it when the connection closes.
+db.commit()
+
+print(f"webui integrations: {n1} terminal, {n2} tool server(s), defaults applied to all models")
 PY
     run sudo docker restart open-webui
   fi
