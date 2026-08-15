@@ -1343,8 +1343,14 @@ verify_ai() {
 
   command -v docker >/dev/null || { warn "docker missing — skipping Open WebUI checks"; return 0; }
   sudo docker inspect open-webui >/dev/null 2>&1 || { bad "no open-webui container"; return 1; }
-  [[ $(sudo docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' open-webui 2>/dev/null) == unless-stopped ]] \
-    && ok "container restarts after a reboot" || bad "container has no restart policy — it will stay down after a power cut"
+  # `always`, not `unless-stopped`: rig-off stops the writers on purpose, and
+  # unless-stopped means "do not restart what was stopped deliberately" — which is
+  # how the box came back from a power cut with no chat UI at all.
+  case $(sudo docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' open-webui 2>/dev/null) in
+    always)         ok "container restart=always (survives rig-off + boot)" ;;
+    unless-stopped) warn "restart=unless-stopped — survives a crash but NOT a deliberate rig-off; docker update --restart always open-webui" ;;
+    *)              bad "no restart policy — it will stay down after a power cut" ;;
+  esac
   local code; code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 http://127.0.0.1:8080/ 2>/dev/null)
   [[ $code == 200 ]] && ok "WebUI answering on 8080" || bad "WebUI HTTP $code on 8080"
 
@@ -1698,7 +1704,10 @@ verify_dashboard() {
   code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 http://rig.local:8080/ 2>/dev/null)
   [[ $code == 200 ]] && ok "chat answers on http://rig.local:8080" || bad "webui HTTP $code"
   code=$(curl -sk -o /dev/null -w '%{http_code}' -m 10 https://rig.local:9443/ 2>/dev/null)
-  [[ $code == 200 ]] && ok "portainer answers on https://rig.local:9443" || bad "portainer HTTP $code"
+  # Portainer redirects / to its admin-init route, so a 30x here is health, not
+  # failure — insisting on 200 reported a working service as broken.
+  [[ $code =~ ^(200|30[12378])$ ]] && ok "portainer answers on https://rig.local:9443 (HTTP $code)" \
+    || bad "portainer HTTP $code"
 
   # A dashboard full of dead links is worse than no dashboard, so check every href it
   # actually publishes.
