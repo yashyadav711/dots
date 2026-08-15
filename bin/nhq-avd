@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# nhq-avd — run the Android emulator on a box with no screen.
+#
+#   nhq-avd start [name]    boot it headless and WAIT until Android is actually up
+#   nhq-avd stop            shut it down the way that does not corrupt the images
+#   nhq-avd status          is it up, which API, is adb attached
+#   nhq-avd logs [n]        tail the emulator log
+#   nhq-avd list            available AVDs
+#
+# Two things this encodes, both learned the hard way:
+#
+#   `adb devices` showing "device" does NOT mean Android has booted — the daemon
+#   attaches long before the system is up, and an install will fail in between.
+#   sys.boot_completed is the property that means ready, so `start` waits on that.
+#
+#   `stop` uses `adb emu kill` and waits. The emulator holds multi-GB qcow2 images
+#   open; killing it with the machine (or with -9) is how an AVD becomes unbootable.
+#   A power cut already forced this once.
+set -uo pipefail
+
+[[ -r $HOME/.android-env.sh ]] && . "$HOME/.android-env.sh"
+SDK="${ANDROID_HOME:-$HOME/Android/sdk}"
+ADB="$SDK/platform-tools/adb"
+EMU="$SDK/emulator/emulator"
+DEFAULT_AVD=rig-api36
+LOGDIR="$HOME/.android"
+
+c_g=$'\e[32m'; c_r=$'\e[31m'; c_y=$'\e[33m'; c_d=$'\e[2m'; c_0=$'\e[0m'
+ok()   { printf '  %s✓%s %s\n' "$c_g" "$c_0" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$c_r" "$c_0" "$*" >&2; }
+warn() { printf '  %s!%s %s\n' "$c_y" "$c_0" "$*"; }
+
+[[ -x $EMU ]] || { bad "no emulator at $EMU — is the SDK installed?"; exit 1; }
+
+running() { pgrep -f "qemu-system.*-avd" >/dev/null 2>&1; }
+booted()  { [[ $("$ADB" -e shell getprop sys.boot_completed 2>/dev/null | tr -d '\r') == 1 ]]; }
+
+case "${1:-status}" in
+  start)
+    avd=${2:-$DEFAULT_AVD}
+    "$EMU" -list-avds 2>/dev/null | grep -qx "$avd" || { bad "no such AVD: $avd (nhq-avd list)"; exit 1; }
+    if running; then ok "already running"; else
+      mkdir -p "$LOGDIR"
+      # -no-snapshot-save: never write a snapshot on exit. On a box that loses power
+      # a half-written snapshot is worse than a cold boot, which only costs a minute.
+      nohup "$EMU" -avd "$avd" \
+        -no-window -no-audio -no-boot-anim -no-snapshot-save \
+        -gpu swiftshader_indirect \
+        >"$LOGDIR/emulator-$avd.log" 2>&1 &
+      ok "launched $avd  ${c_d}(log: ~/.android/emulator-$avd.log)${c_0}"
+    fi
+    "$ADB" start-server >/dev/null 2>&1
+    for i in $(seq 1 90); do
+      booted && { ok "Android up after ~$((i*5))s"; break; }
+      sleep 5
+    done
+    if booted; then
+      printf '  %-14s api %s (Android %s), %s\n' "ready:" \
+        "$("$ADB" -e shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r')" \
+        "$("$ADB" -e shell getprop ro.build.version.release 2>/dev/null | tr -d '\r')" \
+        "$("$ADB" -e shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')"
+    else
+      bad "did not reach sys.boot_completed — see ~/.android/emulator-$avd.log"
+      exit 1
+    fi
+    ;;
+
+  stop)
+    running || { ok "not running"; exit 0; }
+    "$ADB" emu kill >/dev/null 2>&1 || true
+    for _ in $(seq 1 15); do running || break; sleep 1; done
+    if running; then
+      warn "did not exit on request — sending TERM (still not KILL: the images are open)"
+      pkill -TERM -f "qemu-system.*-avd" 2>/dev/null || true
+      for _ in $(seq 1 10); do running || break; sleep 1; done
+    fi
+    running && { bad "still running — investigate before forcing"; exit 1; } || ok "stopped cleanly"
+    sync
+    ;;
+
+  status)
+    if running; then
+      ok "emulator process up"
+      booted && ok "Android booted (api $("$ADB" -e shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r'))" \
+             || warn "process up but Android has NOT finished booting — an install now would fail"
+    else
+      printf '  %semulator not running%s\n' "$c_d" "$c_0"
+    fi
+    "$ADB" devices 2>/dev/null | grep -vE '^\s*$' | sed 's/^/  /'
+    [[ -e /dev/kvm ]] && ok "kvm present (hardware-accelerated)" || warn "no /dev/kvm — it will crawl"
+    ;;
+
+  logs) tail -n "${2:-40}" "$LOGDIR/emulator-$DEFAULT_AVD.log" 2>/dev/null | sed 's/^/  /' ;;
+  list) "$EMU" -list-avds 2>/dev/null | sed 's/^/  /' ;;
+  *)    sed -n '3,12p' "$0" | sed 's/^# \?//' ;;
+esac

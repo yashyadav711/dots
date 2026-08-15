@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""nhq-wake — power a fleet box on from the laptop.
+
+    nhq-wake rig            send the magic packet
+    nhq-wake rig --wait     ...and wait until ssh answers
+    nhq-wake --learn        record the MAC of every box that is currently up
+    nhq-wake --list         what MACs are known
+
+Why this exists: the power went out mid-session, rig shut down cleanly, and then
+nobody could turn it back on without walking to the room. Wake-on-LAN was already
+armed by nhq-newbox's power stage (`ethtool -s <nic> wol g`) — the missing piece was
+knowing the box's MAC, and by the time you need it the box is off and its ARP entry
+has expired. So the MAC is learned while the box is UP and cached.
+
+It learns on every successful run against a live box, which means the cache repairs
+itself after a NIC swap without anyone remembering to re-run anything.
+
+The cache is ~/.nhq/wake.json, deliberately NOT the fleet registry: that file lives
+in a public repo and a MAC address is a small piece of hardware fingerprint that does
+not need publishing.
+
+No wakeonlan/etherwake package needed — a magic packet is 102 bytes on a UDP
+broadcast, so this sends it directly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CACHE = Path(os.path.expanduser("~/.nhq/wake.json"))
+REGISTRY = Path(__file__).resolve().parent / "fleet-registry.json"
+# Port 9 is the conventional discard port for WoL; 7 (echo) is what some NICs watch
+# instead, and sending both costs nothing.
+PORTS = (9, 7)
+
+
+def load_cache() -> dict:
+    try:
+        return json.loads(CACHE.read_text())
+    except Exception:
+        return {}
+
+
+def save_cache(d: dict) -> None:
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE.write_text(json.dumps(d, indent=2, sort_keys=True) + "\n")
+
+
+def fleet_hosts() -> dict[str, str]:
+    """agent -> ssh host, for boxes that are real machines."""
+    try:
+        agents = json.loads(REGISTRY.read_text()).get("agents", {})
+    except Exception:
+        return {}
+    return {k: v["host"] for k, v in agents.items() if isinstance(v, dict) and v.get("host")}
+
+
+def run(cmd: list[str], timeout: float = 12.0) -> tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except Exception as e:
+        return 1, str(e)
+
+
+MAC_RE = re.compile(r"\b([0-9a-f]{2}(?::[0-9a-f]{2}){5})\b", re.I)
+
+
+def learn(agent: str, host: str) -> str | None:
+    """Ask the box itself, while it can still answer."""
+    # The interface holding the default route is the one that will listen for the
+    # magic packet; a box with several NICs would otherwise hand back the wrong one.
+    rc, out = run([
+        "ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", host,
+        "bash -lc 'nic=$(ip -o route get 1.1.1.1 2>/dev/null | grep -oP \"dev \\K\\S+\"); "
+        "cat /sys/class/net/$nic/address; ethtool $nic 2>/dev/null | grep -i \"^\\s*Wake-on\"'",
+    ])
+    if rc != 0:
+        return None
+    m = MAC_RE.search(out)
+    if not m:
+        return None
+    mac = m.group(1).lower()
+    wol = "g" if re.search(r"Wake-on:\s*g", out) else None
+    c = load_cache()
+    entry = c.get(agent, {})
+    entry.update({"host": host, "mac": mac, "learned": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    if wol:
+        entry["wol"] = "armed (g)"
+    c[agent] = entry
+    save_cache(c)
+    return mac
+
+
+def magic(mac: str) -> bytes:
+    raw = bytes.fromhex(mac.replace(":", "").replace("-", ""))
+    if len(raw) != 6:
+        raise ValueError(f"not a MAC: {mac}")
+    return b"\xff" * 6 + raw * 16
+
+
+def send(mac: str) -> int:
+    pkt = magic(mac)
+    sent = 0
+    for port in PORTS:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(pkt, ("255.255.255.255", port))
+            s.close()
+            sent += 1
+        except OSError:
+            pass
+    return sent
+
+
+def up(host: str) -> bool:
+    ip = load_cache().get(host, {}).get("ip") or host
+    for target in {ip, host}:
+        try:
+            with socket.create_connection((target, 22), timeout=3):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="nhq-wake", description="power a fleet box on")
+    p.add_argument("agent", nargs="?", help="agent name from the fleet registry")
+    p.add_argument("--wait", action="store_true", help="block until ssh answers")
+    p.add_argument("--timeout", type=int, default=120, help="seconds to wait (default 120)")
+    p.add_argument("--learn", action="store_true", help="record the MAC of every box that is up")
+    p.add_argument("--list", action="store_true", help="show known MACs")
+    a = p.parse_args()
+
+    hosts = fleet_hosts()
+
+    if a.list:
+        c = load_cache()
+        if not c:
+            print("  nothing learned yet — run nhq-wake --learn while a box is up")
+        for k, v in sorted(c.items()):
+            print(f"  {k:<10} {v.get('mac','?')}  host={v.get('host','?')}  "
+                  f"{v.get('wol','wol unknown')}  learned {v.get('learned','?')}")
+        return 0
+
+    if a.learn:
+        if not hosts:
+            print("  no fleet boxes in the registry", file=sys.stderr)
+            return 1
+        for agent, host in hosts.items():
+            mac = learn(agent, host)
+            print(f"  {agent:<10} {mac if mac else 'unreachable — cannot learn while it is off'}")
+        return 0
+
+    if not a.agent:
+        p.print_help()
+        return 2
+
+    agent = a.agent
+    host = hosts.get(agent, agent)
+    c = load_cache()
+    mac = (c.get(agent) or {}).get("mac")
+
+    if not mac:
+        # Be specific about the fix rather than just failing.
+        print(f"  no MAC known for '{agent}'.", file=sys.stderr)
+        print("  It can only be learned while the box is UP:", file=sys.stderr)
+        print("      nhq-wake --learn        # once, any time it is running", file=sys.stderr)
+        print("  Until then it has to be powered on by hand.", file=sys.stderr)
+        return 1
+
+    if up(host):
+        print(f"  {agent} is already up")
+        return 0
+
+    n = send(mac)
+    if not n:
+        print("  could not send on any port", file=sys.stderr)
+        return 1
+    print(f"  magic packet sent to {mac} ({n} port(s))")
+
+    if not a.wait:
+        print(f"  give it ~30-60s, then: rig --status   (or nhq-wake {agent} --wait)")
+        return 0
+
+    for i in range(a.timeout // 5):
+        time.sleep(5)
+        if up(host):
+            print(f"  {agent} answered ssh after ~{(i + 1) * 5}s")
+            # It is up: refresh what we know, so a NIC change fixes itself.
+            learn(agent, host)
+            return 0
+    print(f"  no answer after {a.timeout}s — WoL may not be armed, or the PSU is off "
+          f"at the wall (WoL needs standby power)", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

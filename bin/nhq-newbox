@@ -50,7 +50,7 @@ C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[1m'; C_D=$'\e[2m'; C_0=$'\
 
 # agy sits before fleet: the fleet stage starts this box's omp session, and that
 # session needs a working model lane the moment it comes up.
-STAGES=(base ssh shell gpu docker storage dirs agy ai fleet share power)
+STAGES=(base ssh shell gpu docker storage dirs agy ai android fleet share power)
 
 say()  { printf '%s\n' "$*"; }
 head1() { printf '\n%s══ %s %s\n' "$C_B" "$*" "$C_0"; }
@@ -1419,6 +1419,142 @@ print(" ".join((l.get("text") or "") if isinstance(l,dict) else str(l) for l in 
     say "  ${C_D}  ask the model in Open WebUI to open a page, or run /tmp/pw-browse.sh on this box${C_0}"
   else
     bad "playwright-mcp not running"
+  fi
+}
+
+# ─────────────────────────────────────────────────────── android (build + test)
+
+# Write Android code anywhere, build and test it HERE. The box has KVM and a spare
+# GPU, so an x86_64 emulator runs at native speed while the laptop stays free.
+stage_android() {
+  head1 "android — JDK, SDK, and an emulator that boots without a screen"
+
+  # JDK 21, not 25. AGP 8/9 support 17 and 21, and 21 is the LTS that Android Studio
+  # itself ships (JBR 21) — the version projects are actually tested against. 25 is in
+  # the repos and would buy toolchain errors that have nothing to do with the code.
+  # jdk17-openjdk stays installable for older projects.
+  pkg jdk21-openjdk gradle unzip
+  run sudo archlinux-java set java-21-openjdk 2>/dev/null || true
+  ok "java $(java -version 2>&1 | head -1 | grep -oE '"[0-9._]+"' | tr -d '"')  gradle $(gradle --version 2>/dev/null | awk '/^Gradle/{print $2}')"
+
+  local sdk="$HOME/Android/sdk"          # the Android Studio default, so ANDROID_HOME is where tools expect
+  export ANDROID_HOME="$sdk" ANDROID_SDK_ROOT="$sdk"
+
+  # Google's cmdline-tools zip, not the AUR android-sdk split packages: those drift
+  # out of step with each other and sdkmanager then fights whatever they installed.
+  # One zip, one SDK root, sdkmanager owns everything under it.
+  if [[ -x $sdk/cmdline-tools/latest/bin/sdkmanager ]]; then
+    ok "cmdline-tools present"
+  else
+    run mkdir -p "$sdk/cmdline-tools"
+    local tmp; tmp=$(mktemp -d)
+    # -f so a 404 fails loudly instead of unzipping an HTML error page.
+    run curl -fL -o "$tmp/cmdline.zip" \
+      "https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip" \
+      && run unzip -q -d "$tmp" "$tmp/cmdline.zip" \
+      && run mv "$tmp/cmdline-tools" "$sdk/cmdline-tools/latest"
+    # It MUST sit at <sdk>/cmdline-tools/latest or sdkmanager computes the wrong SDK
+    # root and installs into the wrong tree. Nothing was installed in a dry run, so
+    # reporting a failure there would be a lie.
+    if (( ! DRY )); then
+      [[ -x $sdk/cmdline-tools/latest/bin/sdkmanager ]] && ok "cmdline-tools installed" \
+        || bad "cmdline-tools missing after install"
+    fi
+    rm -rf "$tmp"
+  fi
+  export PATH="$sdk/cmdline-tools/latest/bin:$sdk/platform-tools:$sdk/emulator:$PATH"
+
+  # Env for BOTH shells: fish is the login shell here, so a bash-only export is
+  # invisible in normal use. Drop-ins, not edits to files dots owns.
+  run mkdir -p "$HOME/.config/fish/conf.d"
+  wr "$HOME/.config/fish/conf.d/android.fish" <<'EOF'
+# Android SDK — build + test toolchain.
+set -gx ANDROID_HOME     $HOME/Android/sdk
+set -gx ANDROID_SDK_ROOT $HOME/Android/sdk
+set -gx JAVA_HOME        /usr/lib/jvm/java-21-openjdk
+fish_add_path -g $ANDROID_HOME/cmdline-tools/latest/bin $ANDROID_HOME/platform-tools $ANDROID_HOME/emulator
+EOF
+  wr "$HOME/.android-env.sh" <<'EOF'
+# Android SDK — sourced by ~/.bashrc, and usable by scripts and systemd units.
+export ANDROID_HOME="$HOME/Android/sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+EOF
+  grep -q 'android-env.sh' "$HOME/.bashrc" 2>/dev/null \
+    || printf '\n[ -r "$HOME/.android-env.sh" ] && . "$HOME/.android-env.sh"\n' >> "$HOME/.bashrc"
+
+  # Piping yes is the documented way; without it every install below waits forever on
+  # a prompt a non-interactive shell never answers.
+  (( DRY )) || yes 2>/dev/null | sdkmanager --licenses >/dev/null 2>&1
+
+  # API 36, not 37. Google lists platforms;android-37 but the package is unavailable
+  # and there is no bootable system image above 36 — compiling against something you
+  # cannot run leaves tests nowhere to go.
+  #
+  # google_apis, not google_apis_playstore: the Play image forbids `adb root`, which
+  # instrumented tests and debugging want, and a CI box needs no Play Store.
+  local p
+  for p in "platform-tools" "platforms;android-36" "build-tools;36.0.0" \
+           "emulator" "system-images;android-36;google_apis;x86_64"; do
+    if (( DRY )); then say "  ${C_D}[dry] sdkmanager --install $p${C_0}"; continue; fi
+    sdkmanager --install "$p" >/dev/null 2>&1 && ok "$p" || bad "$p failed"
+  done
+
+  # KVM or it crawls. /dev/kvm is 0666 on this distro so it works immediately; group
+  # membership is for correctness and for whenever that permission tightens.
+  [[ -e /dev/kvm ]] && ok "kvm present" || warn "no /dev/kvm — enable VT-x in BIOS or the emulator is unusable"
+  id -nG | tr ' ' '\n' | grep -qx kvm && ok "in kvm group" || run sudo usermod -aG kvm "$USER"
+
+  local avd=rig-api36
+  if avdmanager list avd 2>/dev/null | grep -q "Name: $avd"; then
+    ok "AVD $avd exists"
+  elif (( ! DRY )); then
+    echo no | avdmanager create avd -n "$avd" \
+      -k "system-images;android-36;google_apis;x86_64" -d pixel_6 --force >/dev/null 2>&1
+    local cfg="$HOME/.android/avd/$avd.avd/config.ini"
+    # 4 GB / 4 cores of 16 GB / 6 threads: room for an app under test while the box
+    # stays usable. Software GL because there is no display — `-gpu host` needs an EGL
+    # display and fails in ways that look like the emulator hanging.
+    if [[ -f $cfg ]]; then
+      printf 'hw.ramSize=4096\nhw.cpu.ncore=4\ndisk.dataPartition.size=6G\nhw.keyboard=yes\nhw.gpu.enabled=yes\nhw.gpu.mode=swiftshader_indirect\n' >> "$cfg"
+      ok "AVD $avd created and tuned"
+    else
+      bad "AVD config not found after create"
+    fi
+  fi
+
+  say "  ${C_D}emulator lifecycle: nhq-avd start | stop | status${C_0}"
+  mark_stage android
+}
+
+verify_android() {
+  head1 "verify: android"
+  local sdk="$HOME/Android/sdk"
+  command -v java >/dev/null && ok "java $(java -version 2>&1 | head -1 | grep -oE '"[0-9._]+"' | tr -d '"')" || { bad "no java"; return 1; }
+  [[ $(java -version 2>&1 | head -1) == *'"21'* ]] && ok "JDK 21 (what AGP expects)" \
+    || warn "not JDK 21 — AGP 8/9 want 17 or 21; archlinux-java set java-21-openjdk"
+  [[ -x $sdk/platform-tools/adb ]] && ok "adb $("$sdk/platform-tools/adb" --version 2>/dev/null | head -1 | awk '{print $5}')" || bad "no adb"
+  [[ -d $sdk/platforms/android-36 ]] && ok "platform 36" || bad "platform 36 missing"
+  [[ -d $sdk/build-tools ]] && ok "build-tools $(ls "$sdk/build-tools" 2>/dev/null | tr '\n' ' ')" || bad "no build-tools"
+  [[ -d $sdk/system-images/android-36 ]] && ok "system image for the test target" || bad "no system image — nothing to test on"
+  [[ -e /dev/kvm ]] && ok "kvm" || bad "no kvm"
+  "$sdk/emulator/emulator" -list-avds 2>/dev/null | grep -q . && ok "AVD(s): $("$sdk/emulator/emulator" -list-avds 2>/dev/null | tr '\n' ' ')" || bad "no AVD"
+
+  # The real check is a build. Anything less just confirms files exist — and the
+  # failures here were toolchain DISAGREEMENTS (AGP refusing the standalone Kotlin
+  # plugin, the wrapper's URL probe), which only a build surfaces.
+  local lab="$HOME/Github/rig/labs/android-hello"
+  if [[ -x $lab/gradlew ]]; then
+    say "  ${C_D}proving it end to end (build + unit test, ~1 min):${C_0}"
+    if ( cd "$lab" && ./gradlew --no-daemon -q assembleDebug testDebugUnitTest >/tmp/agradle.log 2>&1 ); then
+      ok "sample project builds and its unit test passes"
+      say "  ${C_D}  on-device test needs the emulator: nhq-avd start && (cd $lab && ./gradlew connectedDebugAndroidTest)${C_0}"
+    else
+      bad "sample build FAILED — see /tmp/agradle.log"; tail -4 /tmp/agradle.log | sed 's/^/      /'
+    fi
+  else
+    warn "no sample project at ~/Github/rig/labs/android-hello — cannot prove the toolchain agrees"
   fi
 }
 
