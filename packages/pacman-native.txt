@@ -149,6 +149,7 @@ logrotate
 lsb-release
 lsd
 lsscsi
+luakit
 lvm2
 man-db
 man-pages
@@ -233,12 +234,12 @@ snapper
 sof-firmware
 starship
 sublime-text-4
-sudo
 subversion
+sudo
 syncthing
 sysfsutils
-texinfo
 termdown
+texinfo
 thunar
 thunar-archive-plugin
 thunar-media-tags-plugin

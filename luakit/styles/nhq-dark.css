@@ -1,0 +1,68 @@
+/*
+ * nhq-dark.css — dark for the sites that never got one.
+ *
+ * Read this before adding to it, because the obvious version of this file is a
+ * trap: `html { filter: invert(1) hue-rotate(180deg) }` applied everywhere. That
+ * looks like it works for ten minutes and then you notice every photo is a
+ * negative, every logo is the wrong colour, and every site that ALREADY had a dark
+ * mode is now blinding white.
+ *
+ * So this file is scoped per domain and only lists sites that genuinely ship
+ * light-only. Anything with its own dark mode is left alone: this machine sets
+ * gtk-application-prefer-dark-theme=1, WebKit turns that into
+ * `prefers-color-scheme: dark`, and such sites switch themselves.
+ *
+ * Adding a site:
+ *   1. Confirm it is actually light-only — most things aren't any more.
+ *   2. Add a @-moz-document domain(...) block below.
+ *   3. In luakit:  :styles-reload    then    :styles-list
+ *
+ * Palette matches the browser chrome and the terminal (ember on coal):
+ *   bg #121419   surface #1a1e25   fg #d4d8e4   dim #9ca3b5   link #e8734a
+ */
+
+/* ── man pages: plain HTML, white background, no dark mode anywhere ───────── */
+@-moz-document domain(man7.org), domain(linux.die.net), domain(die.net) {
+    html, body {
+        background: #121419 !important;
+        color: #d4d8e4 !important;
+    }
+    /* These sites use <pre> for the entire page body, so it carries the text. */
+    pre, tt, code, table, td, th, div, p, span, dl, dd, dt, li {
+        background: transparent !important;
+        color: #d4d8e4 !important;
+    }
+    h1, h2, h3, h4, b, strong { color: #e8734a !important; }
+    a, a:visited { color: #e89c4a !important; }
+    a:hover { color: #f2b705 !important; }
+    hr { border-color: #3d4555 !important; }
+}
+
+/* ── GNU / plain-HTML documentation ───────────────────────────────────────── */
+@-moz-document domain(gnu.org), domain(tldp.org), domain(catb.org) {
+    html, body {
+        background: #121419 !important;
+        color: #d4d8e4 !important;
+    }
+    pre, code, blockquote {
+        background: #1a1e25 !important;
+        color: #d4d8e4 !important;
+        border-color: #3d4555 !important;
+    }
+    h1, h2, h3, h4 { color: #e8734a !important; }
+    a, a:visited { color: #e89c4a !important; }
+    table, td, th { border-color: #3d4555 !important; }
+}
+
+/*
+ * ── A last-resort invert, deliberately left OFF ───────────────────────────
+ * Uncomment the domain line for one specific stubborn site — never for `*`. The
+ * second filter un-inverts media, which is the part a bare invert gets wrong.
+ *
+ * @-moz-document domain(example.com) {
+ *     html { filter: invert(1) hue-rotate(180deg) !important; background: #fff !important; }
+ *     img, video, canvas, svg, picture, iframe, [style*="background-image"] {
+ *         filter: invert(1) hue-rotate(180deg) !important;
+ *     }
+ * }
+ */

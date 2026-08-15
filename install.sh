@@ -47,6 +47,10 @@ link dunst/notify-sound.sh              "$HOME/.config/dunst/notify-sound.sh"
 link dunst/service-login.wav            "$HOME/.config/dunst/service-login.wav"
 link vim/vimrc                        "$HOME/.vimrc"
 link nvim                             "$HOME/.config/nvim"   # AstroNvim (full IDE); vim/vi stay minimal
+link luakit/theme.lua                 "$HOME/.config/luakit/theme.lua"
+link luakit/userconf.lua              "$HOME/.config/luakit/userconf.lua"
+# The styles module reads stylesheets from luakit's DATA dir, not its config dir.
+link luakit/styles/nhq-dark.css       "$HOME/.local/share/luakit/styles/nhq-dark.css"
 link rofi/spotlight.rasi                "$HOME/.config/rofi/spotlight.rasi"
 link yazi/theme.toml                    "$HOME/.config/yazi/theme.toml"
 link yazi/yazi.toml                     "$HOME/.config/yazi/yazi.toml"
@@ -165,6 +169,13 @@ cat <<'NOTE'
         mkdir -p ~/.claude && ln -sfn ~/Github/nHQ/envy/store ~/.claude/envy
   • AppImages (~/Applications/): see packages/appimage.txt — download each and chmod +x.
         Desktop entries live in dots/appimage/ — link: ln -sfn $DOTS/appimage/kun.desktop ~/.local/share/applications/kun.desktop
+  • luakit adblock filter lists — the module is loaded by default but blocks
+    NOTHING without a list, and the lists are ~4 MB of churn that does not belong
+    in git. Fetch them once:
+        mkdir -p ~/.local/share/luakit/adblock && cd ~/.local/share/luakit/adblock
+        for l in easylist easyprivacy; do curl -fLO "https://easylist.to/easylist/$l.txt"; done
+        curl -fL -o indianlist.txt https://easylist-downloads.adblockplus.org/indianlist.txt
+    Then check inside luakit with  :adblock-list
   • Log out / reboot to apply Hyprland + shell changes.
 ───────────────────────────────────────────────────────────────
 NOTE
