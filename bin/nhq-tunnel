@@ -50,6 +50,7 @@ die()  { bad "$*"; exit 1; }
 #   name        remote  local  scheme
 SERVICES="
 webui         8080    8080   http
+stt           8128    8128   http
 dashboard     80      8081   http
 portainer     9443    9443   https
 rotator       51200   51200  http

@@ -1,0 +1,23 @@
+[Unit]
+Description=Hinglish speech-to-text on the GPU (faster-whisper, Apex)
+Documentation=https://huggingface.co/Oriserve/Whisper-Hindi2Hinglish-Apex
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The venv's python, and its nvidia wheels on the loader path: CTranslate2 links
+# cuBLAS/cuDNN at runtime and they live in the venv, not /usr/lib. Without this the
+# first request dies with "libcublas.so.12 is not found".
+Environment=LD_LIBRARY_PATH=%h/ai/labs/stt-hinglish/.venv/lib/python3.12/site-packages/nvidia/cublas/lib:%h/ai/labs/stt-hinglish/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib
+Environment=HF_HOME=%h/ai/huggingface
+# --preload so the first dictation of the day is not the one that pays the load cost.
+ExecStart=%h/ai/labs/stt-hinglish/.venv/bin/python %h/.local/bin/nhq-stt-server --preload
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nhq-stt
+
+[Install]
+WantedBy=default.target
