@@ -50,7 +50,7 @@ C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[1m'; C_D=$'\e[2m'; C_0=$'\
 
 # agy sits before fleet: the fleet stage starts this box's omp session, and that
 # session needs a working model lane the moment it comes up.
-STAGES=(base ssh shell gpu docker storage dirs agy ai android dashboard fleet share power)
+STAGES=(base ssh shell gpu docker storage dirs agy ai android stt dashboard fleet share power)
 
 say()  { printf '%s\n' "$*"; }
 head1() { printf '\n%s══ %s %s\n' "$C_B" "$*" "$C_0"; }
@@ -1565,6 +1565,91 @@ verify_android() {
     fi
   else
     warn "no sample project at ~/Github/rig/labs/android-hello — cannot prove the toolchain agrees"
+  fi
+}
+
+# ─────────────────────────────────────────────────────── stt (speech to text)
+
+# The laptop has no GPU. This box does, and it is idle most of the day — so dictation
+# happens here and the laptop falls back to its own small model only when this box is
+# asleep. Measured on Yash's own recordings: the laptop's 74M model dropped four whole
+# sentences from a 52 s clip; the 809M Hinglish finetune here recovered them and scored
+# 0.000 WER on the one segment with known ground truth, at 25x realtime in 1.2 GB.
+stage_stt() {
+  head1 "stt — Hinglish speech-to-text on the GPU"
+  local lab="$HOME/ai/labs/stt-hinglish"
+  run mkdir -p "$lab"
+
+  # Python 3.12 via uv: the system Python is 3.14 and the ML wheels have no cp314
+  # builds, so this would otherwise try to compile ctranslate2 from source.
+  command -v uv >/dev/null || { bad "uv missing — the shell stage installs it"; return 1; }
+  if [[ -x $lab/.venv/bin/python ]]; then
+    ok "venv present ($("$lab/.venv/bin/python" --version 2>&1))"
+  else
+    ( cd "$lab" && run uv python install 3.12 && run uv venv --python 3.12 .venv )
+  fi
+
+  # faster-whisper (CTranslate2), not transformers+torch-cuda: a C++ engine with int8
+  # kernels, ~200 MB instead of ~3 GB. The nvidia wheels are NOT optional — ctranslate2
+  # links cuBLAS/cuDNN at runtime and the first request dies with
+  # "libcublas.so.12 is not found" without them. torch is CPU-only and used solely to
+  # READ the source weights during conversion.
+  ( cd "$lab" && run "$lab/.venv/bin/python" -m pip -q install --upgrade pip )
+  ( cd "$lab" && VIRTUAL_ENV="$lab/.venv" run uv pip install -q faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12 )
+  ( cd "$lab" && VIRTUAL_ENV="$lab/.venv" run uv pip install -q --index-url https://download.pytorch.org/whl/cpu torch )
+  ( cd "$lab" && VIRTUAL_ENV="$lab/.venv" run uv pip install -q transformers )
+
+  local site="$lab/.venv/lib/python3.12/site-packages"
+  wr "$lab/env.sh" <<EOF
+# Source before running anything here: ctranslate2 needs cuBLAS/cuDNN on the loader
+# path, and they live in the venv's nvidia wheels rather than in /usr/lib.
+. "$lab/.venv/bin/activate"
+export LD_LIBRARY_PATH="$site/nvidia/cublas/lib:$site/nvidia/cudnn/lib:\${LD_LIBRARY_PATH:-}"
+EOF
+
+  # Apex (809M, a large-v3-turbo finetune), not Prime (1.55B). Both scored 0.000 on the
+  # segment with real ground truth, but Apex is half the latency, 60% of the VRAM and
+  # 5x faster to load — and on dictation latency is the product. Prime is one
+  # ct2-transformers-converter away if it is ever wanted.
+  if [[ -f $lab/ct2/Apex-int8f16/model.bin ]]; then
+    ok "Apex already converted ($(du -sh "$lab/ct2/Apex-int8f16" | cut -f1))"
+  elif (( ! DRY )); then
+    say "  ${C_D}downloading + converting Apex (~1.6 GB, several minutes)${C_0}"
+    ( cd "$lab" && HF_HOME="$HOME/ai/huggingface" ./.venv/bin/ct2-transformers-converter \
+        --model Oriserve/Whisper-Hindi2Hinglish-Apex \
+        --output_dir ct2/Apex-int8f16 --copy_files tokenizer.json preprocessor_config.json \
+        --quantization int8_float16 >/tmp/ct2-apex.log 2>&1 ) \
+      && ok "Apex converted" || { bad "conversion failed — /tmp/ct2-apex.log"; tail -3 /tmp/ct2-apex.log | sed 's/^/      /'; }
+  fi
+
+  run systemctl --user daemon-reload
+  run systemctl --user enable --now nhq-stt.service
+  mark_stage stt
+}
+
+verify_stt() {
+  head1 "verify: stt"
+  local lab="$HOME/ai/labs/stt-hinglish"
+  [[ -f $lab/ct2/Apex-int8f16/model.bin ]] && ok "Apex model on disk ($(du -sh "$lab/ct2/Apex-int8f16" | cut -f1))" \
+    || { bad "no converted model — dictation has nothing to run"; return 1; }
+  systemctl --user is-enabled --quiet nhq-stt 2>/dev/null && ok "enabled at login" || bad "NOT enabled"
+  systemctl --user is-active  --quiet nhq-stt 2>/dev/null && ok "active" || { bad "not running"; return 1; }
+
+  local h; h=$(curl -s -m 8 http://127.0.0.1:8128/health 2>/dev/null)
+  grep -q '"ok": true' <<<"$h" && ok "health ok — $(sed -n 's/.*"model": "\([^"]*\)".*/\1/p' <<<"$h")" || bad "health said: ${h:-nothing}"
+
+  # A health check only proves the process is up. Transcribing real audio is the claim.
+  local clip="$lab/audio/20260813-084439.wav"
+  if [[ -f $clip ]]; then
+    local out; out=$(curl -s -m 60 -X POST --data-binary "@$clip" \
+      -H 'Content-Type: audio/wav' "http://127.0.0.1:8128/transcribe?lang=en" 2>/dev/null)
+    if grep -qi 'helmet' <<<"$out"; then
+      ok "transcribed a real clip (rtf $(sed -n 's/.*"rtf": \([0-9.]*\).*/\1/p' <<<"$out"))"
+    else
+      bad "transcribe returned: ${out:0:120}"
+    fi
+  else
+    warn "no sample audio at $clip — cannot prove it transcribes"
   fi
 }
 
