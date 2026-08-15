@@ -115,7 +115,10 @@ DEFAULTS: dict = {
     "copy_to_clipboard": True,
     "overlay": True,
     "partial_window_sec": 12.0,    # only re-decode this much tail, to bound CPU
-    "engine": "whisper",
+    # rig-first: the GPU box's 809M Hinglish model when it is up, this laptop's
+    # 74M one when it is not. The fallback is automatic and measured at ~0.6 s of
+    # probe, so there is no reason to prefer the weaker model by default.
+    "engine": "rig",
     "type_delay_ms": 0,
     "type_chunk_chars": 300,
     "type_chunk_pause_ms": 120,
@@ -123,6 +126,10 @@ DEFAULTS: dict = {
     "whisper_model": str(SHARE_DIR / "models/ggml-hinglish-q5_0.bin"),
     "whisper_lang": "en",
     "whisper_port": 8127,
+    # rig-first STT. Addressed by NAME: the box's DHCP address moves, the name does not.
+    "rig_stt_host": "rig.local",
+    "rig_stt_port": 8128,
+    "rig_stt_lang": "en",   # en makes Whisper render Hindi in LATIN script
     "vad_model": str(SHARE_DIR / "models/silero_vad.onnx"),
     "vad_threshold": 0.4,
     # Second pass — see class Polish for the measurements behind these numbers.
@@ -928,7 +935,140 @@ class WhisperServerEngine:
         return max(192, math.ceil((duration + margin) * 50 / 32) * 32)
 
 
-ENGINES = {"parakeet": ParakeetEngine, "whisper": WhisperServerEngine}
+
+class RigEngine:
+    """The GPU box first, this laptop second.
+
+    The laptop has no GPU, so its local model is whisper-BASE class (74M, 52 MB
+    q5_0). Measured on Yash's own recordings, that model silently swallowed four
+    sentences of a 52 s clip — collapsing them into "Sir ji." — and scored 0.045 WER
+    on a segment with known ground truth. rig runs an 809M Hinglish finetune that
+    recovered every sentence and scored 0.000, at 25x realtime in 1.2 GB of VRAM.
+
+    Both return ROMANIZED Hinglish, so nothing downstream changes: the vocabulary
+    fixes, the polish pass and the literal replacements all still apply.
+
+    Two things this must never do:
+
+      Never make dictation WAIT for a box that is off. rig is powered down most of
+      the day. A 2 s connect timeout on every push-to-talk would be worse than the
+      accuracy is worth, so health is probed once and remembered for HEALTH_TTL; a
+      miss costs one short probe, not one probe per utterance.
+
+      Never lose audio. Any failure — off, mid-request, garbage response — falls
+      through to the local engine with the same samples. The user gets a transcript
+      either way; the only difference is which model produced it.
+    """
+
+    name = "rig"               # the daemon logs and reports engine.name
+    HEALTH_TTL = 30.0          # seconds to trust a health answer, good or bad
+    PROBE_TIMEOUT = 0.6        # a LAN box answers /health in single-digit ms
+    XCRIBE_TIMEOUT = 60.0      # generous: 52 s of audio takes ~1.2 s end to end
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.host = cfg.get("rig_stt_host", "rig.local")
+        self.port = int(cfg.get("rig_stt_port", 8128))
+        self.lang = cfg.get("rig_stt_lang", "en")
+        # The fallback is the ordinary local engine, constructed but NOT loaded —
+        # it pays for a model only if it is actually used.
+        self.local = WhisperServerEngine(cfg)
+        self._healthy_until = 0.0
+        self._healthy = False
+        self.last_source = "?"     # which engine served the last transcript
+
+    def available(self) -> tuple[bool, str]:
+        """Available whenever the FALLBACK is, because it always yields a transcript.
+
+        Returning False when rig happens to be off would make the daemon warn on every
+        start about a design that is working exactly as intended. What actually matters
+        is whether the local engine can carry the load when the GPU is asleep — if that
+        is broken, dictation is broken.
+        """
+        ok, why = self.local.available()
+        if not ok:
+            return False, f"local fallback unavailable: {why}"
+        return True, ("rig up" if self._healthy_now() else "rig down — local model will serve")
+
+    @property
+    def loaded(self) -> bool:
+        """Whether anything on THIS machine is holding a model.
+
+        The idle timer uses this to decide what to free. rig's model is not ours to
+        unload, so only the local fallback counts — claiming loaded=True because a
+        remote GPU has weights in memory would keep the laptop's unload timer awake
+        for nothing.
+        """
+        return self.local.loaded
+
+    # `load`/`unload` exist because the daemon calls them on every engine it holds.
+    # Nothing to load here: the model lives on rig. The local fallback loads itself.
+    def load(self):
+        return
+
+    def unload(self):
+        self.local.unload()
+
+    def _healthy_now(self) -> bool:
+        now = time.time()
+        if now < self._healthy_until:
+            return self._healthy
+        import urllib.request  # noqa: PLC0415
+        ok = False
+        try:
+            req = urllib.request.Request(f"http://{self.host}:{self.port}/health")
+            with urllib.request.urlopen(req, timeout=self.PROBE_TIMEOUT) as r:
+                ok = json.loads(r.read()).get("ok") is True
+        except Exception:
+            ok = False
+        self._healthy, self._healthy_until = ok, now + self.HEALTH_TTL
+        if not ok:
+            log("rig stt not answering — using the local model")
+        return ok
+
+    def transcribe(self, samples, sample_rate: int = SAMPLE_RATE) -> str:
+        if not self._healthy_now():
+            self.last_source = "local"
+            return self.local.transcribe(samples, sample_rate)
+
+        import io  # noqa: PLC0415
+        import urllib.request  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sample_rate)
+            w.writeframes((np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes())
+
+        try:
+            req = urllib.request.Request(
+                f"http://{self.host}:{self.port}/transcribe?lang={self.lang}",
+                data=buf.getvalue(), headers={"Content-Type": "audio/wav"})
+            t0 = time.time()
+            with urllib.request.urlopen(req, timeout=self.XCRIBE_TIMEOUT) as r:
+                got = json.loads(r.read())
+            text = (got.get("text") or "").strip()
+            if not text:
+                raise ValueError("empty transcript")
+            self.last_source = "rig"
+            log(f"rig stt: {got.get('audio_seconds')}s audio in "
+                f"{time.time() - t0:.2f}s wall ({got.get('model')})")
+            return text
+        except Exception as e:
+            # One failure should not condemn rig for the next half hour, but it also
+            # must not be retried on this utterance — the user is waiting.
+            self._healthy_until = 0.0
+            log(f"rig stt failed ({type(e).__name__}: {e}) — falling back to local")
+            self.last_source = "local"
+            return self.local.transcribe(samples, sample_rate)
+
+# "rig" is the GPU-first engine: it uses the 809M Hinglish model on rig when that
+# box is up and silently falls back to the local whisper-base finetune when it is
+# not. "whisper" stays available for a laptop-only run.
+ENGINES = {"parakeet": ParakeetEngine, "whisper": WhisperServerEngine,
+           "rig": RigEngine}
 
 
 # ── the on-screen overlay ─────────────────────────────────────────────────────
