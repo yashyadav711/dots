@@ -12,7 +12,7 @@
 # second is the box's, in both directions. Only the direction of travel changes.
 #
 # Examples:
-#   nhq-tunnel rig webui              # rig's :80    -> http://localhost:8080
+#   nhq-tunnel rig webui              # rig's :8080  -> http://localhost:8080
 #   nhq-tunnel rig ollama             # rig's :11434 as if ollama ran here
 #   nhq-tunnel rig 9000:3000          # my 9000      -> rig's 3000
 #   nhq-tunnel rig 51200:51999 -R     # my rotator on :51200 -> rig's :51999
@@ -49,7 +49,9 @@ die()  { bad "$*"; exit 1; }
 # that hardcode the default port).
 #   name        remote  local  scheme
 SERVICES="
-webui         80      8080   http
+webui         8080    8080   http
+dashboard     80      8081   http
+portainer     9443    9443   https
 rotator       51200   51200  http
 ollama        11434   11434  http
 oauth         54545   54545  http

@@ -23,12 +23,18 @@ anything that wants to run somewhere other than the laptop.
 |---|---|---|
 | ollama | system service | `qwen3:8b`, `qwen3:4b`; models in `/var/lib/ollama`, **not** `~/ai/ollama` — the daemon has its own user |
 | agy rotator | user service, `:51200` | keyless OpenAI-compatible proxy over 13 Google accounts → Gemini + Claude at zero Anthropic quota |
-| Open WebUI | container, `:80` | the chat UI Yash opens from his tablet at `http://192.168.31.171` |
+| homepage | container, `:80` | the dashboard — front door at `http://rig.local` |
+| Open WebUI | container, `:8080` | the chat UI — `http://rig.local:8080` |
+| Portainer | container, `:9443` | container management — `https://rig.local:9443` |
 | Open Terminal | container, `127.0.0.1:8000` | a **sandboxed** shell for the WebUI model — it cannot see this host's files |
 | Playwright MCP | user service, `127.0.0.1:8931` | headless Chromium the WebUI model drives |
 | omp session | `omp-rig` tmux, systemd user service | what `rig` from the laptop attaches to |
 
 `nhq-newbox verify` checks every layer. `nhq-newbox verify ai` / `verify agy` narrow it.
+
+Address this box by NAME, never by IP: `rig.local` resolves over mDNS and is what
+every link and config uses. A DHCP lease moves the address; the name does not.
+There is no Tailscale here — the fleet is LAN-only by decision.
 
 ## Things that will bite you
 

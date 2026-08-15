@@ -94,7 +94,8 @@ local quick = {
     r = { "https://www.reddit.com",             "Reddit" },
     w = { "https://wiki.archlinux.org",         "Arch Wiki" },
     c = { "https://chatgpt.com",                "Chat AI" },
-    l = { "http://192.168.31.171",              "Rig — Open WebUI (local models)" },
+    l = { "http://rig.local",                   "Rig — dashboard (homepage)" },
+    o = { "http://rig.local:8080",              "Rig — Open WebUI (local models)" },
 }
 local quick_binds = {}
 for key, site in pairs(quick) do
@@ -149,7 +150,7 @@ local qm_seeded = luakit.data_dir .. "/.nhq-quickmarks-seeded"
 if not lfs.attributes(qm_seeded) then
     local quickmarks = require "quickmarks"
     quickmarks.set("a", { "https://aur.archlinux.org", "https://archlinux.org/packages" })
-    quickmarks.set("h", { "http://192.168.31.171" })              -- rig: Open WebUI
+    quickmarks.set("h", { "http://rig.local", "http://rig.local:8080" })  -- rig: dashboard, chat
     quickmarks.set("k", { "https://github.com/yashyadav711" })
     quickmarks.set("n", { "https://news.ycombinator.com" })
     local f = io.open(qm_seeded, "w")

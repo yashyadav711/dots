@@ -50,7 +50,7 @@ C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[1m'; C_D=$'\e[2m'; C_0=$'\
 
 # agy sits before fleet: the fleet stage starts this box's omp session, and that
 # session needs a working model lane the moment it comes up.
-STAGES=(base ssh shell gpu docker storage dirs agy ai android fleet share power)
+STAGES=(base ssh shell gpu docker storage dirs agy ai android dashboard fleet share power)
 
 say()  { printf '%s\n' "$*"; }
 head1() { printf '\n%s══ %s %s\n' "$C_B" "$*" "$C_0"; }
@@ -1107,15 +1107,17 @@ EOF
 
   command -v docker >/dev/null || { warn "docker missing — run the docker stage first, then re-run 'ai'"; return 1; }
 
-  # --network=host + PORT=80 so the LAN reaches it as a bare http://<box>/ with no
-  # port to remember, and so the container can talk to ollama and the rotator on
-  # loopback. Loopback is deliberate: OLLAMA_HOST stays on 127.0.0.1 rather than
-  # exposing an unauthenticated model API to the whole network.
+  # --network=host so the container reaches ollama and the rotator on loopback.
+  # Loopback is deliberate: OLLAMA_HOST stays on 127.0.0.1 rather than exposing an
+  # unauthenticated model API to the whole network.
+  #
+  # PORT=8080, not 80: port 80 belongs to the homepage dashboard, which is the
+  # front door. Reach the chat at http://rig.local:8080.
   if sudo docker inspect open-webui >/dev/null 2>&1; then
     ok "open-webui container already exists (leaving it; config is reconciled below)"
   else
     run sudo docker run -d --name open-webui --network=host \
-      -e PORT=80 \
+      -e PORT=8080 \
       -e OLLAMA_BASE_URL=http://127.0.0.1:11434 \
       -e OPENAI_API_BASE_URL=http://127.0.0.1:51200/v1 \
       -e OPENAI_API_KEY=local \
@@ -1343,8 +1345,8 @@ verify_ai() {
   sudo docker inspect open-webui >/dev/null 2>&1 || { bad "no open-webui container"; return 1; }
   [[ $(sudo docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' open-webui 2>/dev/null) == unless-stopped ]] \
     && ok "container restarts after a reboot" || bad "container has no restart policy — it will stay down after a power cut"
-  local code; code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 http://127.0.0.1/ 2>/dev/null)
-  [[ $code == 200 ]] && ok "WebUI answering on port 80" || bad "WebUI HTTP $code"
+  local code; code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 http://127.0.0.1:8080/ 2>/dev/null)
+  [[ $code == 200 ]] && ok "WebUI answering on 8080" || bad "WebUI HTTP $code on 8080"
 
   # The decisive check: not that the endpoints are up, but that the WebUI's own
   # model-fetching code returns both sources. Env vars can look perfect while the
@@ -1558,6 +1560,157 @@ verify_android() {
   fi
 }
 
+# ───────────────────────────────────────────── dashboard (front door + portainer)
+
+# Port 80 is the front door: one page listing everything on the box, so nobody has to
+# remember which service sits on which port. Open WebUI therefore lives on 8080.
+#
+# Everything is addressed as rig.local, never an IP. A DHCP lease moves the address —
+# which already broke `ssh rig` once — and a name does not.
+stage_dashboard() {
+  head1 "dashboard — homepage on :80, portainer for the containers"
+  command -v docker >/dev/null || { warn "docker missing — run the docker stage first"; return 1; }
+
+  local cfg="$HOME/homepage-config"
+  run mkdir -p "$cfg"
+
+  wr "$cfg/settings.yaml" <<'EOF'
+title: rig
+description: GPU box — models, tools, containers
+theme: dark
+color: slate
+headerStyle: clean
+layout:
+  AI: { style: row, columns: 3 }
+  Machine: { style: row, columns: 3 }
+  Fleet: { style: row, columns: 2 }
+EOF
+
+  # Read-only socket: the dashboard needs container STATE, not control. Control is
+  # Portainer's job, deliberately behind its own password.
+  wr "$cfg/docker.yaml" <<'EOF'
+local:
+  socket: /var/run/docker.sock
+EOF
+
+  # Loopback-only services get NO href on purpose. ollama, the rotator, Open Terminal
+  # and Playwright all bind 127.0.0.1 so they are not on the Wi-Fi; a tile linking to
+  # them would be a tile that always fails. siteMonitor still shows them as up,
+  # because homepage probes from inside the container's network namespace.
+  wr "$cfg/services.yaml" <<'EOF'
+- AI:
+    - Open WebUI:
+        href: http://rig.local:8080
+        description: Chat — local GPU models + hosted Gemini/Claude, browser + terminal attached
+        icon: open-webui
+        container: open-webui
+        server: local
+    - Ollama:
+        description: "Local inference on the GPU · loopback only (:11434)"
+        icon: ollama
+        siteMonitor: http://127.0.0.1:11434
+    - agy rotator:
+        description: "Gemini + Claude at zero Anthropic quota · loopback only (:51200)"
+        icon: si-googlegemini
+        siteMonitor: http://127.0.0.1:51200/v1/models
+
+- Machine:
+    - Portainer:
+        href: https://rig.local:9443
+        description: Containers — start, stop, logs, shell. Set the admin password on first open.
+        icon: portainer
+        container: portainer
+        server: local
+    - Open Terminal:
+        description: "Sandboxed shell for the WebUI model · loopback only (:8000)"
+        icon: si-gnometerminal
+        container: open-terminal
+        server: local
+    - Syncthing:
+        description: "File sync · loopback only (:8384) — its GUI binds 127.0.0.1 by default"
+        icon: syncthing
+        siteMonitor: http://127.0.0.1:8384
+
+- Fleet:
+    - Android lab:
+        description: "JDK 21 · SDK 36 · emulator rig-api36 — nhq-avd start|stop|status"
+        icon: android
+    - Playwright MCP:
+        description: "Headless Chromium for the model · loopback only (:8931)"
+        icon: si-playwright
+EOF
+
+  wr "$cfg/widgets.yaml" <<'EOF'
+- resources: { cpu: true, memory: true, disk: /, cputemp: true, uptime: true }
+- search: { provider: duckduckgo, target: _blank }
+EOF
+  (( DRY )) || { : > "$cfg/custom.css"; : > "$cfg/custom.js"; }
+
+  # HOMEPAGE_ALLOWED_HOSTS is required since 0.10. Without it homepage serves
+  # localhost and answers every other Host header with a 400 — which looks exactly
+  # like a broken container.
+  if sudo docker inspect homepage >/dev/null 2>&1; then
+    ok "homepage container exists"
+  else
+    run sudo docker run -d --name homepage --restart always \
+      -p 80:3000 \
+      -e HOMEPAGE_ALLOWED_HOSTS="rig.local,rig.local:80,rig,rig:80,localhost,localhost:80" \
+      -e PUID="$(id -u)" -e PGID="$(id -g)" \
+      -v "$cfg:/app/config" \
+      -v /var/run/docker.sock:/var/run/docker.sock:ro \
+      ghcr.io/gethomepage/homepage:latest
+  fi
+
+  # Portainer holds the WRITEABLE docker socket, which is root on the host by proxy.
+  # It is on the LAN because that is the point of it, so the admin password set on
+  # first login is the only thing standing in front of it — Portainer locks itself if
+  # that is not done within a few minutes of first start, which is the safe default.
+  if sudo docker inspect portainer >/dev/null 2>&1; then
+    ok "portainer container exists"
+  else
+    run sudo docker volume create portainer_data
+    run sudo docker run -d --name portainer --restart always \
+      -p 9000:9000 -p 9443:9443 \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -v portainer_data:/data \
+      portainer/portainer-ce:latest
+    warn "open https://rig.local:9443 NOW and set the admin password — it is root on this host"
+  fi
+  mark_stage dashboard
+}
+
+verify_dashboard() {
+  head1 "verify: dashboard"
+  command -v docker >/dev/null || { warn "docker missing"; return 0; }
+  local c
+  for c in homepage portainer; do
+    sudo docker inspect "$c" >/dev/null 2>&1 || { bad "no $c container"; continue; }
+    [[ $(sudo docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$c") == always ]] \
+      && ok "$c restart=always" \
+      || bad "$c is not restart=always — rig-off stops containers deliberately, and 'unless-stopped' then keeps them down through the next boot"
+  done
+
+  # By NAME, not 127.0.0.1: the name is what every link and every device uses, and
+  # mDNS resolving is part of what is being checked.
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 http://rig.local/ 2>/dev/null)
+  [[ $code == 200 ]] && ok "dashboard answers on http://rig.local" || bad "dashboard HTTP $code by name"
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 http://rig.local:8080/ 2>/dev/null)
+  [[ $code == 200 ]] && ok "chat answers on http://rig.local:8080" || bad "webui HTTP $code"
+  code=$(curl -sk -o /dev/null -w '%{http_code}' -m 10 https://rig.local:9443/ 2>/dev/null)
+  [[ $code == 200 ]] && ok "portainer answers on https://rig.local:9443" || bad "portainer HTTP $code"
+
+  # A dashboard full of dead links is worse than no dashboard, so check every href it
+  # actually publishes.
+  local dead=0 u
+  while read -r u; do
+    [[ -z $u ]] && continue
+    code=$(curl -sk -o /dev/null -w '%{http_code}' -m 8 "$u" 2>/dev/null)
+    [[ $code =~ ^(200|30[12378])$ ]] || { bad "dead link on the dashboard: $u (HTTP $code)"; dead=1; }
+  done < <(grep -oE 'href: \S+' "$HOME/homepage-config/services.yaml" 2>/dev/null | awk '{print $2}')
+  (( dead )) || ok "every published link resolves"
+}
+
 # ─────────────────────────────────────────────────────────── agy (model proxy)
 
 # The rotator is what gives a GPU box working frontier models without an API
@@ -1697,7 +1850,10 @@ verify_agy() {
 
 stage_share() {
   head1 "share — NFS (fast LAN), Syncthing (resilient), Tailscale (naming)"
-  pkg nfs-utils syncthing tailscale avahi nss-mdns rsync rclone sshfs
+  # No tailscale: Yash keeps this fleet LAN-only, and rig.local (avahi + nss-mdns)
+  # already gives every device a name. An idle VPN daemon with zero peers is just
+  # another listener and another thing to keep updated.
+  pkg nfs-utils syncthing avahi nss-mdns rsync rclone sshfs
 
   local subnet; subnet=$(ip -4 -o addr show scope global | awk '{print $4}' | head -1 \
     | awk -F/ '{split($1,a,"."); print a[1]"."a[2]"."a[3]".0/"$2}')
