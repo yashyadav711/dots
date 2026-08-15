@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# nhq-git-main — put the repo in the working directory onto its main branch, but
+# only when that is safe.
+#
+# This exists because it used to be an inline blob inside `rig`, sent over ssh as
+# one long string. The remote login shell on a fleet box is FISH, which does not
+# speak `main=$(…)`, so landing on rig printed a wall of
+#   fish: Unsupported use of '='
+# and dropped the connection. Quoting it for both shells at once is a losing game —
+# the block contains single quotes of its own (sed, tr) — so it lives in a file and
+# callers just run the file.
+#
+# Safe by design: a branch is only switched when the tree is CLEAN. Silently moving
+# off a branch that has uncommitted work is a good way to lose it.
+set -uo pipefail
+
+git rev-parse --git-dir >/dev/null 2>&1 || exit 0   # not a repo: nothing to do
+
+main=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+[[ -n $main ]] || main=$(git branch --list main master | head -1 | tr -d ' *')
+[[ -n $main ]] || exit 0                            # no main/master to go to
+
+cur=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+[[ -n $cur && $cur != "$main" ]] || exit 0          # already there
+
+if [[ -z $(git status --porcelain) ]]; then
+  git checkout -q "$main" && printf 'switched to %s\n' "$main"
+else
+  printf 'staying on %s — uncommitted changes, not switching to %s\n' "$cur" "$main"
+fi

@@ -85,22 +85,14 @@ case "${1:-}" in
     # Plain shell, in the repo, on its main branch. -t for a real pty so the
     # remote login shell (fish) behaves normally.
     #
-    # The branch is only switched when the tree is CLEAN: silently moving off a
-    # branch with uncommitted work would be a good way to lose it.
-    exec ssh -t "$HOST" "cd $REPO 2>/dev/null || cd \$HOME; \
-      if git rev-parse --git-dir >/dev/null 2>&1; then \
-        main=\$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||'); \
-        [ -n \"\$main\" ] || main=\$(git branch --list main master | head -1 | tr -d ' *'); \
-        cur=\$(git rev-parse --abbrev-ref HEAD); \
-        if [ -n \"\$main\" ] && [ \"\$cur\" != \"\$main\" ]; then \
-          if [ -z \"\$(git status --porcelain)\" ]; then \
-            git checkout -q \"\$main\" && echo \"switched to \$main\"; \
-          else \
-            echo \"staying on \$cur — uncommitted changes, not switching to \$main\"; \
-          fi; \
-        fi; \
-      fi; \
-      exec \$SHELL -l"
+    # The remote login shell IS fish, and it does not speak `main=$(…)`. This used
+    # to send the branch logic inline, so landing on rig printed a wall of
+    # "fish: Unsupported use of '='" and dropped the connection. Two fixes, both
+    # needed: run the command under bash explicitly, and keep the logic in
+    # nhq-git-main rather than escaping a block that contains its own quotes.
+    # The final `exec $SHELL -l` still hands Yash his fish prompt.
+    # shellcheck disable=SC2029
+    exec ssh -t "$HOST" "bash -lc 'cd $REPO 2>/dev/null || cd \$HOME; nhq-git-main; exec \$SHELL -l'"
     ;;
 
   --resume|--continue|-*)
