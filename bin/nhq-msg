@@ -193,6 +193,22 @@ def cmd_send(a):
             cmd += ["--no-poke"]
         rc, out = _run(cmd, timeout=25.0)
         if rc == 0:
+            # Keep a Sent copy. A pushed message lives only in the RECIPIENT's bus,
+            # so without this the sender's own half of a conversation is invisible
+            # on the sender's box — nhq-inter-comms rendered a thread that looked
+            # entirely one-sided. forwarded_at is stamped so this copy is never
+            # handed off to anyone; it is a record, not mail in transit. It also
+            # stays out of the local inbox, which only matches messages addressed
+            # TO this box.
+            db = connect()
+            ensure_forwarded_column(db)
+            upsert_agent(db, frm)
+            db.execute(
+                """INSERT INTO messages(thread,from_id,to_id,kind,body,priority,created_at,forwarded_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (a.thread, frm, a.to, a.kind, a.body, a.priority, now(), now()),
+            )
+            db.commit()
             print(f"nhq-msg: delivered to {a.to} on {host} — {out.strip() or 'stored'}")
             return
         # Falling back to a local write would look like success while leaving the
