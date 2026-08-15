@@ -79,6 +79,9 @@ CLAIM = "inbox"
 UNIT = "nhq-inbox.service"
 UNIT_PATH = HOME / ".config/systemd/user" / UNIT
 MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB per file — video from the phone fits
+# Written by nhq-itihaas, read by this page. Shared path, not a shared process:
+# runs started from the laptop's shell show up here too.
+ITIHAAS_STATE = HOME / ".nhq/itihaas"
 
 SAFE = re.compile(r"[^A-Za-z0-9._ -]")
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".avif"}
@@ -450,6 +453,23 @@ PAGE = r"""<!doctype html>
     <button id="tpull" class="ghost">Pull the laptop's clipboard</button>
   </div>
 
+  <!-- Itihaas. A second card on a page whose whole point was merging three panels
+       into one needs a reason, so: this one does not send anything anywhere. It
+       starts a 15-25 minute pipeline from a single name and then has state to
+       report. Folding it into the composer would mean one Send button whose
+       meaning depends on which box you typed in - exactly the confusion the
+       merge removed. -->
+  <h2><span>Itihaas — kisi ke baare me research</span></h2>
+  <p class="sub">Naam daalo. NotebookLM me notebook banega, deep web research chalegi, phir
+     <b>detailed report</b>, <b>slide deck</b> aur <b>video overview</b> — teeno Hinglish me,
+     facts + sources ke saath, judgement ke bina. 15-25 min lagta hai; page band kar sakte ho.</p>
+  <div class="row">
+    <input id="iname" type="text" autocomplete="off" placeholder="naam — jaise Adi Shankaracharya">
+    <button id="igo">Research</button>
+  </div>
+  <div id="ilog"></div>
+  <div id="iruns"></div>
+
   <h2><span>Files</span><span id="count"></span></h2>
   <div id="recent"></div>
   <div class="row" style="margin-top:4px">
@@ -661,6 +681,40 @@ list();
 // The agent writes into this folder too, so poll — a file that appears while the
 // page is open should just show up.
 setInterval(()=>{ if(document.visibilityState==='visible') list(); }, 5000);
+
+// ── itihaas ──────────────────────────────────────────────────────────────────
+// Fire and forget: the pipeline runs for 15-25 minutes, so the POST only starts it
+// and the run list is polled. Holding the request open would mean the phone
+// screen locking could look like a failure.
+const iname=$('iname'), igo=$('igo'), ilog=$('ilog'), iruns=$('iruns');
+const isaid=(t,good)=>{ ilog.innerHTML=`<div class="f"><span class="${good?'ok':''}">${esc(t)}</span></div>`; };
+igo.onclick=async()=>{
+  const n=iname.value.trim(); if(!n) return;
+  igo.disabled=true;
+  try{
+    const j=await (await fetch('/itihaas',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:n, k:key})})).json();
+    isaid(j.ok?`Chalu — ${n}. Notebook ban raha hai, yahin niche progress dikhega.`
+              :(j.error||'Failed'), j.ok);
+    if(j.ok) iname.value='';
+  }catch(e){ isaid('Failed', false); }
+  igo.disabled=false; iruns_refresh();
+};
+iname.addEventListener('keydown', e=>{ if(e.key==='Enter') igo.click(); });
+async function iruns_refresh(){
+  try{
+    const j=await (await fetch('/itihaas')).json();
+    const rs=j.runs||[];
+    iruns.innerHTML = rs.map(r=>
+      `<div class="f"><div class="meta"><span class="nm">${esc(r.name)}</span>`
+      +`<span class="sz">${esc(r.stage)}`
+      +(r.notebook?` · <a href="https://notebooklm.google.com/notebook/${encodeURIComponent(r.notebook)}" target="_blank" rel="noopener">notebook</a>`:'')
+      +`</span></div></div>`).join('');
+  }catch(e){}
+}
+iruns_refresh();
+setInterval(()=>{ if(document.visibilityState==='visible') iruns_refresh(); }, 15000);
 </script></body></html>"""
 
 
@@ -787,6 +841,76 @@ def serve() -> None:
         if not ok:
             return JSONResponse({"ok": False, "error": detail}, status_code=409)
         return JSONResponse({"ok": True, "session": session})
+
+    @app.post("/itihaas")
+    async def itihaas_start(request: Request) -> JSONResponse:
+        """Start `nhq-itihaas <name>` for one person, detached.
+
+        Keyed like /prompt and for the same reason: this starts work on the laptop.
+        The name is passed as argv, never through a shell, so a name with quotes in
+        it is a name and not a command.
+
+        Detached on purpose. The pipeline runs 15-25 minutes; a phone that locks its
+        screen mid-request must not look like a failed run, and the answer the page
+        needs ("kahan tak pahuncha") comes from the state files instead.
+        """
+        body = await request.json() or {}
+        if not open_mode() and not secrets.compare_digest(str(body.get("k") or ""), token()):
+            return JSONResponse({"ok": False, "error": "locked — scan the QR on the laptop"},
+                                status_code=403)
+        name = re.sub(r"\s+", " ", str(body.get("name") or "")).strip()
+        if not (2 <= len(name) <= 80):
+            return JSONResponse({"ok": False, "error": "naam daalo (2-80 characters)"},
+                                status_code=400)
+
+        tool = shutil.which("nhq-itihaas")
+        if not tool:
+            return JSONResponse({"ok": False, "error": "nhq-itihaas not on PATH"},
+                                status_code=500)
+        ITIHAAS_STATE.mkdir(parents=True, exist_ok=True)
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "unnamed"
+        log = ITIHAAS_STATE / f"{slug}.log"
+        with log.open("ab") as fh:
+            fh.write(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S} {name} ===\n".encode())
+            subprocess.Popen([tool, name, "--deep"], stdout=fh, stderr=fh,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        print(f"[{datetime.now():%H:%M:%S}] itihaas -> {name}", flush=True)
+        return JSONResponse({"ok": True, "name": name})
+
+    @app.get("/itihaas")
+    async def itihaas_runs() -> JSONResponse:
+        """Every run and the stage it is on, newest first.
+
+        Read straight off the state files the tool writes, so this stays correct
+        even for runs started from the laptop's shell rather than this page.
+        """
+        labels = {
+            "auth": "auth", "notebook": "notebook bana",
+            "research": "deep research", "sources": "sources aa gaye",
+            "artifacts": "report/slides/video queue me", "generation": "ban rahe hain",
+            "download": "download", "done": "poora ho gaya",
+        }
+        runs = []
+        for f in sorted(ITIHAAS_STATE.glob("*.json"),
+                        key=lambda p: p.stat().st_mtime, reverse=True)[:8]:
+            try:
+                d = json.loads(f.read_text())
+            except Exception:
+                continue
+            stages = d.get("stages") or {}
+            last, why = "shuru ho raha hai", ""
+            for k, v in stages.items():
+                s = v.get("status")
+                if s == "failed":
+                    last, why = labels.get(k, k), " — ruk gaya"
+                    break
+                last, why = labels.get(k, k), (" chal raha hai" if s == "running" else "")
+            if "done" in stages:
+                last, why = "poora ho gaya", ""
+            runs.append({"name": d.get("name") or f.stem,
+                         "stage": last + why,
+                         "notebook": d.get("notebook") or ""})
+        return JSONResponse({"runs": runs})
 
     @app.post("/rm")
     async def rm(request: Request) -> JSONResponse:

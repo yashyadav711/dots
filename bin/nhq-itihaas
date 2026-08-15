@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""nhq-itihaas — ek naam do, poori research pipeline chal jaati hai.
+
+    nhq-itihaas "Chandragupta Maurya"        research + report + slides + video
+    nhq-itihaas "Adi Shankaracharya" --deep  deep web research (~5-15 min)
+    nhq-itihaas --status                     what every run is doing
+    nhq-itihaas --status "<name>"            one run in detail
+    nhq-itihaas --list                       every notebook this tool has made
+
+Kya banata hai (NotebookLM ke andar):
+    1. Ek notebook us naam ka
+    2. Deep web research -> saare sources notebook me import
+    3. Detailed REPORT   — Hinglish, facts + dates + sources, disputes alag
+    4. SLIDE DECK        — Hinglish, detailed_deck
+    5. VIDEO overview    — Hinglish narration, heritage visual style
+    6. Ek local summary note, Obsidian vault me
+
+Design notes worth keeping:
+
+  FACTS, NOT VERDICTS. Yash ka rule hai: "agar kuch galat hua hai to wo batao, judge
+  karna mera kaam hai." So every prompt here demands dates, named primary sources, and
+  an explicit split between what is settled, what is disputed, and what is later
+  tradition — and forbids softening or moralising. An uncomfortable fact with a source
+  is the deliverable; a tactful summary is a failure.
+
+  HINGLISH, deliberately. Roman script, Hindi grammar, English technical words left in
+  English. Not pure Hindi (unreadable for him at speed), not pure English (loses the
+  way he actually talks). The video narration and slides follow the same rule so the
+  three artifacts sound like one thing.
+
+  PROMPTS LIVE IN THE VAULT. ~/Obsidian/nHQ/Prompts/03 Research & Writing/ holds the
+  editable copy (the "L" prompt). This file carries the same text as a fallback so the
+  tool still works if the vault is not mounted — but the vault wins when present, so
+  editing the prompt does not mean editing code.
+
+  STATE ON DISK. Every run writes ~/.nhq/itihaas/<slug>.json as it goes, because the
+  phone button needs to answer "kahan tak pahuncha" without holding an HTTP request
+  open for fifteen minutes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+STATE_DIR = Path(os.path.expanduser("~/.nhq/itihaas"))
+# Vault filenames carry a version and a timestamp (…--v1--2026-08-16-0421.md), so this
+# is a glob and the newest version wins — a v2 does not need a code change.
+PROMPT_DIR = Path(os.path.expanduser("~/Obsidian/nHQ/Prompts/03 Research & Writing"))
+PROMPT_GLOB = "l-itihaas-fact-researcher--v*.md"
+RULES_MARKER = "NON-NEGOTIABLE RULES:"
+VAULT_NOTES = Path(os.path.expanduser("~/Obsidian/nHQ/Projects/Itihaas"))
+DOWNLOADS = Path(os.path.expanduser("~/Obsidian/nHQ/Projects/Itihaas/_artifacts"))
+
+C_G, C_R, C_Y, C_D, C_B, C_0 = (
+    "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[1m", "\033[0m")
+
+
+def ok(m):   print(f"  {C_G}✓{C_0} {m}", flush=True)
+def bad(m):  print(f"  {C_R}✗{C_0} {m}", file=sys.stderr, flush=True)
+def warn(m): print(f"  {C_Y}!{C_0} {m}", flush=True)
+def step(m): print(f"\n{C_B}== {m}{C_0}", flush=True)
+def dim(m):  print(f"  {C_D}{m}{C_0}", flush=True)
+
+
+# ── the prompts ───────────────────────────────────────────────────────────────
+# Written to be handed to a model that has the sources in front of it. Each one
+# repeats the non-negotiables, because these get sent as separate API calls and a
+# rule stated once in an earlier call does not carry.
+
+FACT_RULES = """NON-NEGOTIABLE RULES:
+- Sirf wahi likho jo sources me hai. Har claim ke saath source ka naam aur, jahan ho, date/verse/chapter.
+- Jo cheez DISPUTED hai usko clearly "disputed" likho, aur dono taraf ka evidence do — kaun kehta hai, kis basis pe.
+- Jo cheez baad ki TRADITION ya legend hai (contemporary evidence nahi), usko alag section me rakho: "Baad ki tradition / legend".
+- Agar kuch bura, violent, casteist, ya uncomfortable hua hai to wo LIKHO. Softening, skipping ya "balance" karne ki koshish mat karo.
+- Judgement mat do. Koi "great", "hero", "villain", "unfortunately" nahi. Sirf hua kya, kisne likha, kab likha.
+- Jahan evidence nahi hai wahan saaf likho "iska koi contemporary source nahi hai" — guess mat bharo.
+- Dates ke saath era likho (BCE/CE) aur jahan scholars disagree karte hain wahan range do.
+
+LANGUAGE: Hinglish — Roman script me likho, Hindi grammar, English technical/proper nouns English me hi. Pure Hindi nahi, pure English nahi. Aisa likho jaise kisi ko samjha rahe ho, taaki padhne aur bolne me aasaan lage."""
+
+RESEARCH_QUERY = """{name} — poori, factual research.
+
+Ye sab cover karo:
+1. Kaun tha/thi: exact dates (birth/death, ya jitna evidence deta hai), jagah, family, era.
+2. Contemporary evidence: inscriptions, coins, foreign accounts (Greek, Chinese, Persian, Arab travellers), archaeology — jo unke SAMAY ka hai.
+3. Baad ke sources: kaunse texts unke baare me likhte hain, kitne saal BAAD likhe gaye, aur us gap ka matlab kya hai.
+4. Hindu texts se connection: Vedas, Upanishads, Puranas, Ramayana, Mahabharata, Dharmashastra, Agamas — jo bhi relevant ho. Exact text, chapter/verse jahan possible ho. Ye batao ki text kab compile hua vs jis waqt ki baat kar raha hai.
+5. Religion, philosophy, ya practice me unka actual contribution — aur jo unke naam pe BAAD me joda gaya.
+6. Politics, war, administration, economy — jo kiya, kiske khilaf, kya result.
+7. Controversies aur ugly parts: violence, caste, succession fights, persecution, jo bhi records me hai.
+8. Modern historians ka disagreement: kaun kya kehta hai aur kis evidence pe (Indian aur foreign dono).
+9. Jo popularly maana jaata hai par evidence nahi hai — myths busted, with reasons.
+
+Sources me academic history, archaeology, epigraphy, aur original texts ke translations dono chahiye. Internet articles aur books dono.
+
+{rules}"""
+
+REPORT_PROMPT = """{name} pe detailed factual report banao, Hinglish me.
+
+Structure:
+1. **Ek line me kaun** — aur kis era ka
+2. **Timeline** — dates ke saath, jahan dispute hai wahan range aur "disputed" likha ho
+3. **Contemporary evidence** — inscriptions, coins, foreign accounts. Ye sabse zaroori section hai.
+4. **Hindu texts se link** — kaunsa text, kab ka, kya kehta hai, exact reference
+5. **Kya kiya** — politics, religion, philosophy, war, administration
+6. **Controversies aur uncomfortable facts** — bina softening
+7. **Baad ki tradition / legend** — jo contemporary evidence me nahi hai
+8. **Historians kahan disagree karte hain** — naam ke saath, evidence ke saath
+9. **Myths vs evidence** — popular belief, phir uska evidence status
+10. **Sources** — poori list
+
+{rules}"""
+
+SLIDES_FOCUS = """{name} — factual deck, Hinglish me.
+
+Har slide pe: claim + uska source. Timeline slide, contemporary-evidence slide, Hindu-texts slide, controversies slide, aur ek "disputed / evidence nahi hai" slide zaroor ho. Motivational ya devotional tone nahi — ye history deck hai, poster nahi.
+
+{rules}"""
+
+VIDEO_FOCUS = """{name} ki factual history — Hinglish narration.
+
+Narration Hinglish me ho: Roman script, Hindi grammar, English words jahan natural hain. Aisa jaise koi dost samjha raha ho — par har baat evidence se.
+
+Structure: kaun tha -> uske samay ka evidence (inscriptions, coins, foreign accounts) -> Hindu texts se kya connection hai aur wo texts kab likhe gaye -> kya kiya -> kya disputed hai -> kya sirf legend hai.
+
+Jo disputed hai use "iss pe historians disagree karte hain" bol ke batao. Jo legend hai use legend bol ke batao. Devotional ya nationalist tone bilkul nahi — neutral, factual, par boring bhi nahi.
+
+{rules}"""
+
+
+def load_rules() -> str:
+    """Vault wins when it is there; the embedded copy keeps the tool standalone.
+
+    The note's code block is a complete prompt a human can paste, so only the part
+    from RULES_MARKER down is the reusable rules text. Anything above it is the
+    per-person question, which this tool composes itself.
+    """
+    notes = sorted(PROMPT_DIR.glob(PROMPT_GLOB)) if PROMPT_DIR.is_dir() else []
+    if notes:
+        txt = notes[-1].read_text()
+        m = re.search(r"```(?:text)?\n(.*?)```", txt, re.S)
+        if m:
+            block = m.group(1)
+            i = block.find(RULES_MARKER)
+            if i != -1 and block[i:].strip():
+                return block[i:].strip()
+    return FACT_RULES
+
+
+def slug(name: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return s or "unnamed"
+
+
+def run(args: list[str], timeout: float = 120.0) -> tuple[int, str]:
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s"
+    except FileNotFoundError:
+        return 127, f"{args[0]} not found"
+
+
+def nlm(*args: str, timeout: float = 180.0) -> tuple[int, str]:
+    return run(["nlm", *args], timeout=timeout)
+
+
+class State:
+    """Progress on disk, so the phone can ask without holding a request open."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.path = STATE_DIR / f"{slug(name)}.json"
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.d = {}
+        if self.path.exists():
+            try:
+                self.d = json.loads(self.path.read_text())
+            except Exception:
+                self.d = {}
+        self.d.setdefault("name", name)
+        self.d.setdefault("started", datetime.now().isoformat(timespec="seconds"))
+        self.d.setdefault("stages", {})
+
+    def set(self, **kw):
+        self.d.update(kw)
+        self.save()
+
+    def stage(self, key: str, status: str, detail: str = ""):
+        self.d["stages"][key] = {"status": status, "detail": detail,
+                                 "at": datetime.now().isoformat(timespec="seconds")}
+        self.save()
+
+    def save(self):
+        self.d["updated"] = datetime.now().isoformat(timespec="seconds")
+        self.path.write_text(json.dumps(self.d, indent=2, ensure_ascii=False))
+
+
+def find_notebook(name: str) -> str | None:
+    rc, out = nlm("notebook", "list", "--json")
+    if rc != 0:
+        return None
+    try:
+        items = json.loads(out)
+    except Exception:
+        return None
+    if isinstance(items, dict):
+        items = items.get("notebooks") or items.get("data") or []
+    want = f"Itihaas: {name}".lower()
+    for it in items:
+        if str(it.get("title", "")).lower() == want:
+            return it.get("id") or it.get("notebook_id")
+    return None
+
+
+def studio_state(nb: str) -> dict[str, str]:
+    """artifact type -> status, straight from the API.
+
+    The vocabulary is `completed` and `unknown`, and `unknown` means STILL BUILDING.
+    An earlier version of the wait loop grepped for words like "generating" that this
+    API never prints, so it decided everything was finished on its first poll.
+    """
+    rc, out = nlm("studio", "status", nb, "--json", timeout=120)
+    if rc != 0:
+        return {}
+    try:
+        items = json.loads(out)
+    except Exception:
+        return {}
+    if isinstance(items, dict):
+        items = items.get("artifacts") or []
+    return {str(a.get("type")): str(a.get("status")) for a in items if a.get("type")}
+
+
+def download(nb: str, st: "State") -> list[str]:
+    """Pull whatever is completed, then report what is ACTUALLY on disk.
+
+    This used to read nlm's prose and call it success — but "report", "slide" and
+    "video" also appear in its `- skipped ... not completed` lines, so a run that
+    downloaded nothing cheerfully claimed all three. The filesystem is the only
+    honest answer to "mere paas kya hai".
+
+    Each person gets their own output directory so the scan below needs no path
+    parsing: whatever is under it belongs to this run.
+    """
+    step("6/6  pull the artifacts down + write the note")
+    st.stage("download", "running")
+    out_dir = DOWNLOADS / slug(st.name)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rc, out = nlm("download", "all", nb, "--output-dir", str(out_dir),
+                  "--types", "report,slide_deck,video", "--skip-existing",
+                  "--no-progress", timeout=1800)
+    if rc != 0:
+        warn(f"download command failed: {out.splitlines()[-1][:140] if out else '?'}")
+
+    kinds = {".md": "report", ".pdf": "slides", ".pptx": "slides", ".mp4": "video"}
+    files = sorted(p for p in out_dir.rglob("*") if p.is_file())
+    got: list[str] = []
+    for p in files:
+        k = kinds.get(p.suffix.lower())
+        if k and k not in got:
+            got.append(k)
+        n = p.stat().st_size
+        ok(f"{p.name}  ({n/1048576:.1f} MB)" if n >= 1048576 else f"{p.name}  ({n/1024:.0f} KB)")
+    if not files:
+        warn("disk pe kuch nahi aaya — NotebookLM me abhi ban rahe hain")
+    st.stage("download", "done", ",".join(got) or "none")
+    return got
+
+
+def pipeline(name: str, deep: bool, wait_studio: int) -> int:
+    st = State(name)
+    rules = load_rules()
+
+    step(f"1/6  auth")
+    rc, out = nlm("login", "--check", timeout=90)
+    if rc != 0:
+        bad(f"NotebookLM auth failed — run `nlm login` once in a browser session")
+        dim(out.splitlines()[0] if out else "")
+        st.stage("auth", "failed", out[:200])
+        return 1
+    ok(out.splitlines()[0][:90] if out else "authenticated")
+    st.stage("auth", "done")
+
+    step(f"2/6  notebook")
+    nb = st.d.get("notebook") or find_notebook(name)
+    if nb:
+        ok(f"reusing existing notebook {nb}")
+    else:
+        rc, out = nlm("notebook", "create", f"Itihaas: {name}", "--json", timeout=120)
+        if rc != 0:
+            bad(f"could not create the notebook: {out[:200]}")
+            st.stage("notebook", "failed", out[:200])
+            return 1
+        try:
+            nb = (json.loads(out).get("id") or json.loads(out).get("notebook_id"))
+        except Exception:
+            nb = None
+        if not nb:
+            nb = find_notebook(name)
+        if not nb:
+            bad("notebook created but no id came back")
+            st.stage("notebook", "failed", out[:200])
+            return 1
+        ok(f"created {nb}")
+    st.set(notebook=nb)
+    st.stage("notebook", "done", nb)
+
+    step(f"3/6  research ({'deep' if deep else 'fast'} web) — sources import ho rahe hain")
+    # Written before the call, not after: this is the stage that takes ten minutes,
+    # and the phone asking "kahan tak pahuncha" during it must not be told "notebook".
+    st.stage("research", "running")
+    query = RESEARCH_QUERY.format(name=name, rules=rules)
+    args = ["research", "start", query, "--notebook-id", nb, "--auto-import"]
+    if deep:
+        args += ["--mode", "deep"]
+    # --auto-import waits internally (up to ~15 min) and imports what it found, so the
+    # generous timeout here is the point, not an accident.
+    rc, out = nlm(*args, timeout=1500)
+    st.stage("research", "done" if rc == 0 else "failed", out[-300:])
+    if rc != 0:
+        warn(f"research reported a problem: {out.splitlines()[-1][:160] if out else '?'}")
+        dim("continuing — a notebook with no sources still tells us that clearly")
+    else:
+        ok("research finished")
+
+    # source_count from the API, not a line count of `source list` — a header or a
+    # wrapped title would otherwise read as a source and let the run continue on nothing.
+    n_src = 0
+    rc, out = nlm("notebook", "get", nb, "--json", timeout=120)
+    if rc == 0:
+        try:
+            n_src = int(json.loads(out).get("source_count") or 0)
+        except Exception:
+            n_src = 0
+    if n_src:
+        ok(f"{n_src} source(s) in the notebook")
+    else:
+        bad("no sources landed — the artifacts below would be built on nothing")
+        st.stage("sources", "empty")
+        return 1
+    st.stage("sources", "done", f"{n_src} sources")
+
+    step("4/6  report · slides · video (Hinglish)")
+    made = {}
+
+    rc, out = nlm("report", "create", nb, "--format", "Create Your Own",
+                  "--prompt", REPORT_PROMPT.format(name=name, rules=rules),
+                  "--confirm", timeout=300)
+    made["report"] = rc == 0
+    (ok if rc == 0 else bad)(f"report {'queued' if rc == 0 else out[:160]}")
+
+    rc, out = nlm("slides", "create", nb, "--format", "detailed_deck",
+                  "--confirm", timeout=300)
+    made["slides"] = rc == 0
+    (ok if rc == 0 else bad)(f"slides {'queued' if rc == 0 else out[:160]}")
+
+    # heritage style suits Indian history without sliding into devotional imagery;
+    # hi-IN steers narration towards Hindi, and the focus prompt pins it to Hinglish.
+    rc, out = nlm("video", "create", nb, "--format", "explainer", "--style", "heritage",
+                  "--language", "hi-IN",
+                  "--focus", VIDEO_FOCUS.format(name=name, rules=rules),
+                  "--confirm", timeout=300)
+    made["video"] = rc == 0
+    (ok if rc == 0 else bad)(f"video {'queued' if rc == 0 else out[:160]}")
+    st.stage("artifacts", "queued", json.dumps(made))
+
+    step(f"5/6  waiting for NotebookLM to finish generating (up to {wait_studio//60} min)")
+    st.stage("generation", "running")
+    want = {"report", "slide_deck", "video"}
+    deadline = time.time() + wait_studio
+    seen = {}
+    while True:
+        state = studio_state(nb)
+        for k, v in sorted(state.items()):
+            if seen.get(k) != v:
+                dim(f"{k:<11} {v}")
+                seen[k] = v
+        pending = {k for k in want if state.get(k) != "completed"}
+        if not pending:
+            ok("sab generate ho gaye")
+            break
+        if time.time() >= deadline:
+            warn(f"still generating: {', '.join(sorted(pending))} — NotebookLM me bante rahenge")
+            dim(f'baad me sirf pull karo:  nhq-itihaas "{name}" --pull')
+            break
+        time.sleep(30)
+    st.stage("generation", "done")
+
+    got = download(nb, st)
+
+    note = write_note(name, nb, n_src, made, got)
+    ok(f"note: {note}")
+    st.set(note=str(note), finished=datetime.now().isoformat(timespec="seconds"))
+    st.stage("done", "done")
+
+    print()
+    ok(f"{C_B}{name}{C_0} — notebook {nb}")
+    dim(f"open: https://notebooklm.google.com/notebook/{nb}")
+    return 0
+
+
+def pull_only(name: str) -> int:
+    """Fetch what has finished since the last run — no research, no re-generation.
+
+    Video takes noticeably longer than the report, so a first run legitimately ends
+    with the video still building. Re-running the whole pipeline to collect it would
+    repeat a ten-minute deep research and queue a second copy of everything.
+    """
+    st = State(name)
+    nb = st.d.get("notebook") or find_notebook(name)
+    if not nb:
+        bad(f'"{name}" ka koi notebook nahi hai — pehle: nhq-itihaas "{name}"')
+        return 1
+    st.set(notebook=nb)
+
+    step("studio status")
+    state = studio_state(nb)
+    if not state:
+        bad("studio status nahi mila")
+        return 1
+    for k, v in sorted(state.items()):
+        (ok if v == "completed" else dim)(f"{k:<11} {v}")
+
+    made = {"report": state.get("report") == "completed",
+            "slides": state.get("slide_deck") == "completed",
+            "video": state.get("video") == "completed"}
+    got = download(nb, st)
+
+    n_src = 0
+    rc, out = nlm("notebook", "get", nb, "--json", timeout=120)
+    if rc == 0:
+        try:
+            n_src = int(json.loads(out).get("source_count") or 0)
+        except Exception:
+            n_src = 0
+
+    note = write_note(name, nb, n_src, made, got)
+    ok(f"note: {note}")
+    st.set(note=str(note))
+    if all(made.values()):
+        st.stage("done", "done")
+    return 0
+
+
+def write_note(name: str, nb: str, n_src: int, made: dict, got: list) -> Path:
+    VAULT_NOTES.mkdir(parents=True, exist_ok=True)
+    p = VAULT_NOTES / f"{slug(name)}.md"
+    now = datetime.now()
+    lines = [
+        "---",
+        f"tags: [itihaas, research, notebooklm]",
+        f"date: {now:%Y-%m-%d}",
+        f"created: {now:%Y-%m-%d %H:%M}",
+        "status: current",
+        f'summary: "Factual research on {name} — NotebookLM notebook, report, slides and video, all Hinglish."',
+        "---",
+        "",
+        f"# {name}",
+        "",
+        "> [!info] Ye kya hai",
+        f"> `nhq-itihaas` ne banaya. Facts + sources, judgement nahi — wo tera kaam hai.",
+        f"> Notebook: [NotebookLM]({f'https://notebooklm.google.com/notebook/{nb}'})",
+        "",
+        "| | |",
+        "|---|---|",
+        f"| Sources imported | {n_src} |",
+        f"| Report | {'✅ banaya' if made.get('report') else '❌ nahi bana'} |",
+        f"| Slide deck | {'✅ banaya' if made.get('slides') else '❌ nahi bana'} |",
+        f"| Video overview | {'✅ banaya' if made.get('video') else '❌ nahi bana'} |",
+        f"| Downloaded | {', '.join(got) if got else 'kuch nahi'} |",
+        "",
+        "## Padhne se pehle",
+        "",
+        "Ye research **facts** deti hai, verdict nahi. Jahan likha hai *disputed*, wahan",
+        "historians sach me disagree karte hain — dono side ka evidence dekh ke khud decide karna.",
+        "Jahan *baad ki tradition* likha hai, wahan us baat ka **contemporary evidence nahi** hai;",
+        "iska matlab galat nahi hai, matlab sirf ye hai ki uske samay ka record nahi mila.",
+        "",
+        "## Artifacts",
+        "",
+        f"Downloads: `{DOWNLOADS}`",
+        "",
+        "## Mere notes",
+        "",
+        "",
+    ]
+    p.write_text("\n".join(lines))
+    return p
+
+
+def cmd_status(name: str | None) -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    files = sorted(STATE_DIR.glob("*.json"))
+    if name:
+        files = [f for f in files if f.stem == slug(name)]
+        if not files:
+            print(f"  no run for '{name}'")
+            return 1
+    if not files:
+        print("  nothing has been researched yet")
+        return 0
+    for f in files:
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+        stages = d.get("stages") or {}
+        done = [k for k, v in stages.items() if v.get("status") == "done"]
+        failed = [k for k, v in stages.items() if v.get("status") == "failed"]
+        state = "done" if "done" in stages else ("failed" if failed else "running")
+        print(f"  {C_B}{d.get('name')}{C_0}  [{state}]  notebook={d.get('notebook') or '-'}")
+        print(f"    {C_D}{len(done)} stage(s) done{(' · failed: ' + ','.join(failed)) if failed else ''}"
+              f" · updated {d.get('updated','?')}{C_0}")
+        if name:
+            for k, v in stages.items():
+                mark = {"done": "✓", "failed": "✗"}.get(v.get("status"), "·")
+                print(f"      {mark} {k:<12} {v.get('detail','')[:80]}")
+    return 0
+
+
+def cmd_list() -> int:
+    rc, out = nlm("notebook", "list", "--title")
+    if rc != 0:
+        bad(out[:200])
+        return 1
+    rows = [l for l in out.splitlines() if "Itihaas:" in l]
+    if not rows:
+        print("  no Itihaas notebooks yet")
+        return 0
+    for r in rows:
+        print(f"  {r.strip()}")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="nhq-itihaas",
+        description="Ek naam do — NotebookLM me factual research, report, slides aur video ban jayega")
+    p.add_argument("name", nargs="?", help="jis bande ke baare me janna hai")
+    p.add_argument("--deep", action="store_true", help="deep web research (slower, better sources)")
+    p.add_argument("--wait", type=int, default=900, help="seconds to wait for generation (default 900)")
+    p.add_argument("--status", nargs="?", const="", help="what runs are doing")
+    p.add_argument("--list", action="store_true", help="every Itihaas notebook")
+    p.add_argument("--pull", action="store_true",
+                   help="sirf jo ban chuka hai wo download karo (research dobara nahi)")
+    a = p.parse_args()
+
+    if a.list:
+        return cmd_list()
+    if a.status is not None:
+        return cmd_status(a.status or None)
+    if not a.name:
+        p.print_help()
+        return 2
+    if a.pull:
+        return pull_only(a.name.strip())
+    return pipeline(a.name.strip(), a.deep, a.wait)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
