@@ -872,8 +872,41 @@ def serve() -> None:
         log = ITIHAAS_STATE / f"{slug}.log"
         with log.open("ab") as fh:
             fh.write(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S} {name} ===\n".encode())
-            subprocess.Popen([tool, name, "--deep"], stdout=fh, stderr=fh,
-                             stdin=subprocess.DEVNULL, start_new_session=True)
+
+        # Its own transient unit, NOT a child of this service. start_new_session was
+        # not enough: setsid does not leave the service's cgroup, so restarting
+        # nhq-inbox killed a live run - the Narendra Modi pipeline died at 04:55:33
+        # mid-generation and the page then showed "bana raha hai" forever.
+        #
+        # StandardOutput=append keeps the log file without putting a shell between us
+        # and a name typed on a phone. The per-name unit is also free protection
+        # against double-tapping Research: systemd refuses a duplicate unit.
+        runner = shutil.which("systemd-run")
+        if runner:
+            unit = f"nhq-itihaas-{slug}.service"
+            # Asked plainly rather than inferred from systemd-run's failure text,
+            # which says "was already loaded or has a fragment file" - true, and
+            # useless to somebody holding a phone.
+            live = subprocess.run(["systemctl", "--user", "is-active", unit],
+                                  capture_output=True, text=True, timeout=15)
+            if live.stdout.strip() in {"active", "activating"}:
+                return JSONResponse({"ok": False,
+                                     "error": f"{name} pehle se chal raha hai"},
+                                    status_code=409)
+            argv = [runner, "--user", "--collect", "--quiet", f"--unit={unit}",
+                    f"--property=StandardOutput=append:{log}",
+                    f"--property=StandardError=append:{log}",
+                    "--", tool, name, "--deep"]
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=25)
+            if p.returncode != 0:
+                err = (p.stderr or p.stdout).strip().splitlines()
+                return JSONResponse({"ok": False,
+                                     "error": err[-1][:140] if err else "systemd-run failed"},
+                                    status_code=500)
+        else:
+            with log.open("ab") as fh:
+                subprocess.Popen([tool, name, "--deep"], stdout=fh, stderr=fh,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
         print(f"[{datetime.now():%H:%M:%S}] itihaas -> {name}", flush=True)
         return JSONResponse({"ok": True, "name": name})
 
