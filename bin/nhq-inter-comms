@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""nhq-inter-comms — the laptop <-> rig conversation, in one file you can read.
+
+    nhq-send-from-rig-to-laptop "message"     run on rig
+    nhq-send-from-laptop-to-rig "message"     run on the laptop
+    nhq-inter-comms view                      refresh ~/nhq-inter-comms.md
+    nhq-inter-comms tail [-n 15]              last few lines, in the terminal
+
+Why this is a VIEW and not a new store
+--------------------------------------
+The obvious build is a fresh nhq-inter-comms.json that both boxes append to. It is
+also the wrong one: the fleet already has a durable message bus with de-duplication,
+two-phase handoff, and doorbells, and a second store would immediately disagree with
+it — the same message present in one place and missing in the other, with no way to
+tell which is right.
+
+So the bus stays the source of truth and this renders it. Same split the calendar
+already uses: JSONL/SQLite underneath, a regenerated document for Yash to read.
+
+Timing, plainly stated
+----------------------
+The boxes cannot ssh into the laptop (deliberately — rig holds shared credentials
+and takes a five-character password, so it gets no key into here). Therefore:
+
+    laptop -> rig    instant; pushed straight into rig's bus
+    rig -> laptop    stored on rig, collected by the laptop within ~2 min
+                     (nhq-msg-pull.timer), or immediately on `view`
+
+`send` says which of those just happened rather than printing a bare "sent".
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+VIEW = Path(os.environ.get("NHQ_COMMS_VIEW", Path.home() / "nhq-inter-comms.md"))
+
+# Who counts as "the laptop" for the purpose of this conversation. The laptop hosts
+# Director; rig is a registry agent with its own host entry.
+LAPTOP_IDS = ("director", "nhq")
+RIG_ID = "rig"
+
+
+def here() -> str:
+    return socket.gethostname().split(".")[0]
+
+
+def on_rig() -> bool:
+    return here() == RIG_ID
+
+
+def run(cmd: list[str], timeout: float = 40.0) -> tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return 1, str(e)
+
+
+def cmd_send(a) -> int:
+    body = " ".join(a.message).strip()
+    if not body:
+        print("nothing to send — give me a message", file=sys.stderr)
+        return 2
+
+    # Direction comes from the box you are standing on, so the same script backs
+    # both named commands and neither can send in the wrong direction by accident.
+    if on_rig():
+        to, sender, hop = "director", RIG_ID, "pull"
+    else:
+        to, sender, hop = RIG_ID, "director", "push"
+
+    if a.direction == "to-laptop" and not on_rig():
+        print(f"you are on {here()}, not rig — use nhq-send-from-laptop-to-rig", file=sys.stderr)
+        return 2
+    if a.direction == "to-rig" and on_rig():
+        print("you are on rig — use nhq-send-from-rig-to-laptop", file=sys.stderr)
+        return 2
+
+    rc, out = run(["nhq-msg", "send", to, body, "--kind", a.kind, "--from", sender])
+    if rc != 0:
+        print(f"NOT delivered: {out}", file=sys.stderr)
+        return 1
+
+    if hop == "push":
+        print(f"delivered to rig now — {out.splitlines()[-1] if out else 'stored'}")
+    else:
+        print("stored on rig. The laptop collects it within ~2 min "
+              "(nhq-msg-pull.timer), or instantly if it runs: nhq-inter-comms view")
+    return 0
+
+
+def conversation(limit: int) -> list[dict]:
+    """Both halves of the laptop<->rig thread, oldest first."""
+    seen: dict[tuple, dict] = {}
+    for who in (RIG_ID, *LAPTOP_IDS):
+        rc, out = run(["nhq-msg", "inbox", "--as", who, "--json", "--limit", str(limit)])
+        if rc != 0:
+            continue
+        try:
+            rows = json.loads(out or "[]")
+        except json.JSONDecodeError:
+            continue
+        for r in rows:
+            frm = (r.get("from") or "").lower()
+            to = (r.get("to") or "").lower()
+            pair = {frm.split("@")[0], to.split("@")[0]}
+            # Only this conversation: one side rig, the other Director's box.
+            if not (RIG_ID in pair and pair & set(LAPTOP_IDS)):
+                continue
+            # The same message can appear under several identities; key on content.
+            seen[(r.get("created_at"), frm, to, r.get("body"))] = r
+    return sorted(seen.values(), key=lambda r: (r.get("created_at") or "", r.get("id") or 0))
+
+
+def render(rows: list[dict]) -> str:
+    def when(ts: str) -> str:
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%d %b %H:%M")
+        except Exception:
+            return ts or "?"
+
+    out = [
+        "# Laptop ⇄ Rig",
+        "",
+        f"*Regenerated {datetime.now().astimezone().strftime('%d %b %Y %H:%M')} — do not edit; "
+        "this is a view of the fleet bus.*",
+        "",
+        "Send a message:",
+        "",
+        "```bash",
+        'nhq-send-from-rig-to-laptop "…"    # on rig',
+        'nhq-send-from-laptop-to-rig "…"    # on the laptop',
+        "```",
+        "",
+        "---",
+        "",
+    ]
+    if not rows:
+        out += ["*No messages yet.*", ""]
+        return "\n".join(out)
+
+    day = None
+    for r in rows:
+        ts = r.get("created_at") or ""
+        d = ts[:10]
+        if d != day:
+            day = d
+            out += [f"## {d}", ""]
+        frm = (r.get("from") or "?").split("@")[0]
+        who = "**Rig**" if frm.lower() == RIG_ID else "**Laptop**"
+        kind = r.get("kind") or "msg"
+        tag = "" if kind == "msg" else f" `{kind}`"
+        body = (r.get("body") or "").strip()
+        out += [f"- `{when(ts)}` {who}{tag} — {body}", ""]
+    return "\n".join(out)
+
+
+def cmd_view(a) -> int:
+    # Collect anything the boxes could not deliver themselves, so the file is
+    # current rather than as-of-the-last-timer-run. Harmless on a fleet box: it
+    # simply has nothing to pull.
+    if not on_rig() and not a.no_pull:
+        rc, out = run(["nhq-msg", "pull", "--no-poke"])
+        for line in (out or "").splitlines():
+            if "collected" in line or "unreachable" in line:
+                print(f"  {line}")
+
+    rows = conversation(a.limit)
+    VIEW.parent.mkdir(parents=True, exist_ok=True)
+    VIEW.write_text(render(rows))
+    print(f"{VIEW}  ({len(rows)} message(s))")
+    return 0
+
+
+def cmd_tail(a) -> int:
+    rows = conversation(200)[-a.count:]
+    if not rows:
+        print("no messages yet")
+        return 0
+    for r in rows:
+        frm = (r.get("from") or "?").split("@")[0]
+        who = "rig   " if frm.lower() == RIG_ID else "laptop"
+        print(f"  {(r.get('created_at') or '')[:16]}  {who}  {(r.get('body') or '').strip()[:100]}")
+    return 0
+
+
+def main() -> int:
+    # The two named commands are symlinks to this script; the link name carries the
+    # intended direction so it can refuse to run on the wrong box.
+    invoked = Path(sys.argv[0]).name
+    implied = None
+    if invoked == "nhq-send-from-rig-to-laptop":
+        implied = "to-laptop"
+    elif invoked == "nhq-send-from-laptop-to-rig":
+        implied = "to-rig"
+
+    p = argparse.ArgumentParser(prog=invoked, description="laptop <-> rig conversation")
+    if implied:
+        p.add_argument("message", nargs="+")
+        p.add_argument("--kind", default="msg", choices=["msg", "ask", "done", "fyi"])
+        p.set_defaults(fn=cmd_send, direction=implied)
+        args = p.parse_args()
+        return args.fn(args)
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("send", help="send to the other box")
+    s.add_argument("message", nargs="+")
+    s.add_argument("--kind", default="msg", choices=["msg", "ask", "done", "fyi"])
+    s.set_defaults(fn=cmd_send, direction="auto")
+
+    s = sub.add_parser("view", help=f"refresh {VIEW}")
+    s.add_argument("--limit", type=int, default=200)
+    s.add_argument("--no-pull", action="store_true")
+    s.set_defaults(fn=cmd_view)
+
+    s = sub.add_parser("tail", help="last few messages here in the terminal")
+    s.add_argument("-n", "--count", type=int, default=15)
+    s.set_defaults(fn=cmd_tail)
+
+    a = p.parse_args()
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
