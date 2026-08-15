@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# nhq-brain-push [agent…] — push the shared brain to a fleet box.
+#
+# omp loads exactly one context file: ~/.claude/CLAUDE.md. Not ~/CLAUDE.md, not the
+# repo's own CLAUDE.md — both of those exist on this laptop and neither is what gets
+# read. Rig had the symlink and the repo file and still started blank, which cost a
+# round of "why does the agent know nothing".
+#
+# So each box needs its own ~/.claude/CLAUDE.md. It is a COPY, which means it drifts
+# the moment the laptop's rules change — hence this command, rather than a one-time
+# scp nobody remembers to repeat.
+#
+# Per-box context is appended from dots/brain/<agent>.md when that file exists, so a
+# box can say what is true about itself (fish login shell, credentials present, the
+# power cap) without forking the shared rules.
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+DOTS="$(dirname "$(dirname "$SELF")")"
+# shellcheck source=/dev/null
+[[ -r "$(dirname "$SELF")/nhq-lib.sh" ]] && source "$(dirname "$SELF")/nhq-lib.sh"
+
+BRAIN="$HOME/.claude/CLAUDE.md"
+c_g=$'\e[32m'; c_r=$'\e[31m'; c_y=$'\e[33m'; c_d=$'\e[2m'; c_0=$'\e[0m'
+ok()   { printf '  %s✓%s %s\n' "$c_g" "$c_0" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$c_r" "$c_0" "$*" >&2; }
+warn() { printf '  %s!%s %s\n' "$c_y" "$c_0" "$*"; }
+
+[[ -r $BRAIN ]] || { bad "no $BRAIN to push"; exit 1; }
+
+# Default to every fleet box with a host entry that is not this machine.
+targets=("$@")
+if (( ${#targets[@]} == 0 )); then
+  mapfile -t targets < <(
+    jq -r '.agents | to_entries[] | select(.value.host) | .key' \
+      "${NHQ_REGISTRY:-$DOTS/bin/fleet-registry.json}" 2>/dev/null
+  )
+fi
+(( ${#targets[@]} )) || { warn "no fleet boxes in the registry"; exit 0; }
+
+for agent in "${targets[@]}"; do
+  host="$agent"
+  if declare -F nhq_agent_host >/dev/null 2>&1; then
+    h="$(nhq_agent_host "$(nhq_agent_canon "$agent" 2>/dev/null)" 2>/dev/null)"
+    [[ -n $h ]] && host="$h"
+  fi
+  [[ $host == "$(hostname -s)" ]] && continue          # never push to ourselves
+
+  extra="$DOTS/brain/$agent.md"
+  tmp=$(mktemp)
+  cat "$BRAIN" > "$tmp"
+  if [[ -r $extra ]]; then
+    printf '\n\n' >> "$tmp"
+    cat "$extra" >> "$tmp"
+  fi
+
+  if ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" 'mkdir -p ~/.claude' 2>/dev/null \
+     && scp -q "$tmp" "$host:.claude/CLAUDE.md" 2>/dev/null; then
+    # Read it back rather than trusting scp's exit code.
+    n=$(ssh -n -o BatchMode=yes "$host" 'wc -c < ~/.claude/CLAUDE.md' 2>/dev/null | tr -d ' ')
+    if [[ ${n:-0} -eq $(wc -c < "$tmp" | tr -d ' ') ]]; then
+      ok "$agent: $n bytes$([[ -r $extra ]] && echo " (shared + $agent section)")"
+    else
+      bad "$agent: wrote $n bytes, expected $(wc -c < "$tmp")"
+    fi
+  else
+    warn "$agent ($host) unreachable — skipped"
+  fi
+  rm -f "$tmp"
+done
