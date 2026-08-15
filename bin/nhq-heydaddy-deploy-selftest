@@ -30,14 +30,20 @@ git -C "$WORK/src" -c user.email=selftest@nhq -c user.name=selftest -c commit.gp
     commit -q --allow-empty -m "selftest fixture"
 
 # ── Fake railway ──────────────────────────────────────────────────────────────
-# STUB picks the scenario. A call counter in $WORK/calls drives the deployment
-# list through the same state sequence Railway would report.
+# STUB picks the scenario. Every invocation appends its subcommand line to
+# $WORK/calls, so assertions can tell a read-only call from a mutating one; the
+# count of `deployment` lines drives the deployment list through the same state
+# sequence Railway would report.
 cat > "$WORK/stub/railway" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
 OLD=aaaaaaaa-0000-0000-0000-000000000000
 NEW=bbbbbbbb-1111-1111-1111-111111111111
 emit() { printf '[{"id":"%s","status":"%s"}]\n' "$1" "$2"; }
+
+# Every call is logged, one subcommand line per invocation ("deployment list",
+# "up --detach", "variable set …"), so a check can classify what was called.
+printf '%s\n' "$*" >> "${CALLS:-/dev/null}"
 
 case "${1:-}" in
   up|redeploy)
@@ -54,7 +60,7 @@ case "${1:-}" in
     printf '%s\n' "$*" >> "${VARSET:-/dev/null}"
     exit 0 ;;
   deployment)
-    n=$(( $(cat "$CALLS" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$CALLS"
+    n=$(grep -c '^deployment' "$CALLS" 2>/dev/null); n=${n:-0}
     case "$STUB" in
       normal)       (( n <= 2 )) && emit "$OLD" SUCCESS || { (( n == 3 )) && emit "$NEW" BUILDING || emit "$NEW" SUCCESS; } ;;
       stuck_build)  (( n <= 1 )) && emit "$OLD" SUCCESS || emit "$NEW" BUILDING ;;
@@ -137,9 +143,15 @@ STUB_HTTP=502 check "health 502 exits non-zero"  dev-be normal 1 30 "returned 50
 echo ""
 echo "(e) CLI surface preserved"
 check "--dry-run touches nothing"            prod-be normal 0 20 "DRY RUN" --dry-run
-check "--dry-run makes no railway call"      dev-be  normal 0 20 "DRY RUN" --dry-run
-[[ ! -s "$CALLS" ]] && { printf '  ✓ %-38s no railway invocation\n' "--dry-run really is inert"; pass=$(( pass + 1 )); } \
-                    || { printf '  ✗ %-38s railway WAS called\n' "--dry-run really is inert"; fail=$(( fail + 1 )); }
+check "--dry-run exits 0 and prints DRY RUN" dev-be  normal 0 20 "DRY RUN" --dry-run
+# A dry run is allowed to READ Railway — it prints a baseline probe of the current
+# deployment id. What it must never do is MUTATE anything. So classify the logged
+# calls instead of counting them, and name the offender when one shows up.
+MUTATING='^(up|redeploy|down|service delete|variable (set|delete))([[:space:]]|$)'
+offenders="$(grep -E "$MUTATING" "$CALLS" 2>/dev/null | paste -sd';' -)"
+[[ -z "$offenders" ]] \
+  && { printf '  ✓ %-38s read-only calls only\n' "--dry-run performs no mutating call"; pass=$(( pass + 1 )); } \
+  || { printf '  ✗ %-38s mutating railway call: %s\n' "--dry-run performs no mutating call" "$offenders"; fail=$(( fail + 1 )); }
 check "bad flag rejected"                    dev-be  normal 2 20 "unknown flag" --nope
 check "prod needs -y or a typed confirm"     prod-be normal 1 20 "aborted"
 "$DISPATCHER" --dry-run >/dev/null 2>&1; [[ $? == 2 ]] \
