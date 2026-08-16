@@ -14,6 +14,9 @@
 #
 # Usage:  ompt              — omp in this directory, wrapped in tmux
 #         ompt -c           — any omp flag is passed straight through
+#         ompt usage        — a subcommand runs bare, in THIS terminal: a tmux
+#                             session dies with its command and would take the
+#                             output with it (2026-08-17)
 set -euo pipefail
 
 # The editor omp gets for Ctrl+E. SET, not inherited — and that distinction is
@@ -54,6 +57,82 @@ export VISUAL EDITOR
 
 # Already inside tmux (or a plain kitty+tmux window)? Nothing to wrap.
 if [[ -n "${TMUX:-}" ]]; then
+	exec omp "$@"
+fi
+
+# ── who actually wants tmux ───────────────────────────────────────────────────
+# Only the chat TUI. A subcommand (`omp usage`, `omp stats`, `omp commit`) or
+# print mode runs, prints, and exits — and a tmux session dies with the command
+# it was created for. So `omp usage` opened a pane, printed the whole quota
+# report into it, and closed to "[exited]" before a line of it could be read.
+# Those invocations belong in the caller's terminal, where their output stays.
+#
+# The command name is looked for in $1 only, because that is where omp itself
+# looks: a first argument starting with `-`, or none at all, is the TUI. The
+# exit-immediately FLAGS are a separate check since they can sit anywhere in
+# the line (`omp -p "..."`, `omp --export ~/session.jsonl`).
+#
+# The list is read out of `omp --help` rather than frozen here, and cached
+# against the binary's mtime, so an omp release that adds a subcommand cannot
+# quietly bring the flash-and-exit back. First run after an upgrade pays ~1s;
+# every run after that reads one small file.
+omp_commands() {
+	local bin stamp cache tmp first
+	bin="$(command -v omp 2>/dev/null)" || return 1
+	stamp="$(stat -c %Y "$bin" 2>/dev/null || echo 0)"
+	cache="${XDG_CACHE_HOME:-$HOME/.cache}/nhq/omp-commands"
+
+	if [[ -s $cache ]]; then
+		read -r first <"$cache" || first=""
+		if [[ $first == "$stamp" ]]; then
+			tail -n +2 "$cache"
+			return 0
+		fi
+	fi
+
+	mkdir -p "${cache%/*}"
+	tmp="$cache.$$"
+	# The COMMANDS block ends at the first blank line. Reading past it picks up
+	# the tool names further down the help text — `read`, `write`, `task` — and
+	# those are not subcommands.
+	{
+		printf '%s\n' "$stamp"
+		omp --help 2>/dev/null |
+			awk '/^COMMANDS$/ {f = 1; next}
+			     f && /^[[:space:]]*$/ {exit}
+			     f && $1 ~ /^[a-z][a-z0-9-]+$/ {print $1}'
+	} >"$tmp" || { rm -f "$tmp"; return 1; }
+
+	# Only the stamp came back: omp answered with nothing usable.
+	if [[ $(wc -l <"$tmp") -lt 2 ]]; then
+		rm -f "$tmp"
+		return 1
+	fi
+	mv -f "$tmp" "$cache"
+	tail -n +2 "$cache"
+}
+
+wants_tmux() {
+	local arg
+	for arg in "$@"; do
+		case "$arg" in
+		-p | --print | -h | --help | --version | --export | --export=* | --alias | --alias=*)
+			return 1
+			;;
+		esac
+	done
+	case "${1:-}" in
+	"" | -*) return 0 ;;
+	esac
+	# Unreadable command list falls through to wrapping, which is what this
+	# script did before the check existed.
+	if omp_commands | grep -qxF -- "$1"; then
+		return 1
+	fi
+	return 0
+}
+
+if ! wants_tmux "$@"; then
 	exec omp "$@"
 fi
 
