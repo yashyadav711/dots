@@ -6,7 +6,7 @@ parked on a real date instead of lost. The overnight run can ask `due` for
 tonight's items.
 
 Store  : ~/.nhq/calendar.jsonl   (source of truth, one JSON per line)
-View   : ~/Obsidian/nHQ/Synced/Calendar.md   (regenerated; Yash reads it in Obsidian)
+View   : ~/Obsidian/nHQ/Calendar.md   (regenerated; Yash reads it in Obsidian)
 
 Usage:
   nhq-calendar add "<title>" [--date YYYY-MM-DD|today|tomorrow|tonight] [--time HH:MM]
