@@ -16,6 +16,7 @@ Local agent-fleet layer around the `claude` CLI. Rides Yash's Claude subscriptio
 | `nhq-kill <session\|agent>` | Retire a session (kill tmux + clean state files). Agent name kills all its sessions. |
 | `nhq-reap [--dry-run]` | RAM-aware reaper: kill DEAD sessions and IDLE-too-long ones. |
 | `nhq-browser <start\|stop\|status\|url\|login\|backup\|unlock\|install>` | The **shared browser**: one Chromium holding one permanent logged-in profile, CDP on `127.0.0.1:9222`. Agents attach; they never launch their own. |
+| `nhq-secret <get\|add\|totp\|login\|list\|rm>` | The **shared vault**: one KeePassXC database, master password sealed to this machine's TPM. Any agent reads it with no prompt. |
 
 `nhq-lib.sh` is a sourced helper (not a command) — single source of truth for the
 state dir, marker/activity paths, and state detection. Scripts source it via
@@ -199,6 +200,59 @@ How to attach, by agent type:
 Full reference, including the threat model and the ops runbook, lives in the vault
 at `~/Obsidian/nHQ/Reference/Agent Browser Automation/`. The tool and its systemd
 unit live in `~/Github/nHQ/envy/browser/`.
+
+## The shared vault (`nhq-secret`)
+
+Credentials for the whole fleet live in one KeePassXC database whose master
+password is sealed to this machine's TPM. **Any agent, spawned by anyone, can read
+it with no password prompt and no setup** — that is the point. If Director spawns a
+fresh agent to work on HeyDaddy, that agent reads the HeyDaddy test account and
+logs in; nobody types anything.
+
+```bash
+nhq-secret list                       # what exists (paths only, never values)
+nhq-secret get machine/openrouter     # one secret, bare, to stdout
+nhq-secret user accounts/heydaddy-test
+nhq-secret totp accounts/heydaddy-test
+nhq-secret login accounts/heydaddy-test   # fills it into the SHARED browser
+```
+
+Use it in a command directly — the value never lands in shell history or in `ps`:
+
+```bash
+curl -H "Authorization: Bearer $(nhq-secret get machine/openrouter)" …
+```
+
+### Storing things
+
+| Command | For |
+|---|---|
+| `printf '%s\n' "$v" \| nhq-secret add machine/<name>` | API keys, tokens (value on stdin, never argv) |
+| `nhq-secret add accounts/<name> -u <user> --url <url>` | a website login |
+| `nhq-secret gen accounts/<name> -u <user> --url <url>` | generate a strong password and store it |
+| `nhq-secret totp-add accounts/<name> <seed>` | a 2FA seed — base32 or a whole `otpauth://` URI |
+| `nhq-secret rm <path>` | purge (two passes — keepassxc's own `rm` only moves it to the Recycle Bin, where it stays readable) |
+
+`machine/` is for machine credentials, `accounts/` is for human logins. The groups
+are not decoration: **a read from `accounts/*` fires a Telegram alert naming the
+agent that did it**, while `machine/*` reads stay quiet. Both land in
+`~/.nhq-secret/audit.log`.
+
+### Two things to know before you rely on it
+
+1. **The tier gate is detection, not prevention.** Every agent runs as the same Unix
+   user, so any of them can call `keepassxc-cli` directly and skip the tool
+   entirely. `accounts/` buys a notification and an audit line — nothing stops a
+   determined read, and the audit log only sees reads that went through
+   `nhq-secret`.
+2. **First read after a reboot costs ~6 s**, because that is what the TPM unseal
+   measures on this laptop. It is then cached in RAM (`$XDG_RUNTIME_DIR`, tmpfs) and
+   subsequent reads are ~200 ms. `nhq-secret lock` forgets it early.
+
+Yash opens the same vault in the KeePassXC GUI with `nhq-secret password` — the
+master password is a 64-char random nobody memorises, so that command is the only
+way in. Design and threat model:
+`envy/docs/superpowers/specs/2026-08-20-nhq-secret-design.md`.
 
 
 ## Tunables (env vars)
