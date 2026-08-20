@@ -159,6 +159,12 @@ Four separate copies of that rule had drifted apart before the fix — `nhq-tell
 `director` at a session called `omp-envy`. If you need to reach an agent, shell
 out to `nhq-tell`. Never build a session map.
 
+**`hub` is not the channel for a tmux seat.** `hub`/subagent messaging only knows
+omp's own spawned subagents; a fleet seat like NV, Director or Builder is a tmux
+session, so `hub send NV …` returns *"Unknown agent NV"*. Reach seats with
+`nhq-tell`. (Confirmed live 2026-08-20: Director hit exactly this on the rule's
+first real use — the rule was right, the reflex to try `hub` was the bug.)
+
 ## The shared browser (`nhq-browser`)
 
 One long-lived headless Chromium owns one permanent profile at
@@ -183,16 +189,35 @@ How to attach, by agent type:
 | Playwright directly | `chromium.connectOverCDP('http://127.0.0.1:9222')` |
 | anything, no library | `curl -X PUT 'http://127.0.0.1:9222/json/new?<url>'` |
 
-**Three rules that are not optional:**
+**Rules that are not optional** (each one has already bitten a real agent):
 
-1. **Attach to `contexts()[0]` and take your own TAB.** That is the persistent
-   context — the one holding the login. A context made with `newContext()` is
-   incognito-like and starts **logged out**. Never close a tab you did not open.
-2. **Never `kill -9` the browser.** Chromium batches cookie writes to disk on a
+1. **One persistent context, your own tab — but mind which API you are in.** The
+   login lives in the browser's persistent (default) context; a context made with
+   `newContext()` is incognito-like and starts **logged out**. How you reach it
+   depends on the client, and this is where Director lost ~$1 on 2026-08-20:
+   - **omp's browser tool is Puppeteer.** Use the `tab` helpers, or
+     `await browser.pages()`. **`browser.contexts()` is Playwright-only** — here it
+     is `undefined` and throws *"not a function"*, which reads like a broken
+     browser rather than wrong code.
+   - **A standalone Playwright script is where `contexts()[0]` is correct** — which
+     is exactly what `nhq-secret login` uses internally, so the tool works while a
+     hand-written Puppeteer call copying that line fails.
+   - Never close a tab you did not open.
+2. **Never select a tab by URL after a fill tool ran.** `nhq-secret login` opens
+   its **own** tab, so there can be TWO tabs on `/login` — and the pre-existing
+   empty one may come first. Attaching by URL substring grabs the empty tab and
+   reads `pwLen 0` while the vault filled the *other* one correctly. That misreads
+   as "the vault fill silently failed" — a false bug report against a working
+   secret path, the worst false positive this component attracts. **Select by the
+   FILLED field:** loop `browser.pages()`, evaluate `input[type=password].value.length`,
+   take the one `> 0`. Then `bringToFront`, arm `waitForNavigation` BEFORE the
+   click, and click the submit matching `/log ?in|sign ?in/i` — the label is
+   "Login", and a naive first-button click hits "Continue with Google" instead.
+3. **Never `kill -9` the browser.** Chromium batches cookie writes to disk on a
    ~30 s timer (measured: a cookie was absent from `Default/Cookies` at t=0 s and
    present at t=35 s). A hard kill destroys a login performed seconds earlier
    while the profile still looks healthy. Use `nhq-browser stop`.
-3. **Treat the profile as credential material.** It is mode `700`, its cookies
+4. **Treat the profile as credential material.** It is mode `700`, its cookies
    are effectively plaintext at rest (`--password-store=basic` uses a key
    hard-coded in Chromium), and it must never live in a synced folder. Do not log
    it into high-value accounts.
@@ -215,6 +240,14 @@ nhq-secret get machine/openrouter     # one secret, bare, to stdout
 nhq-secret user accounts/heydaddy-test
 nhq-secret totp accounts/heydaddy-test
 nhq-secret login accounts/heydaddy-test   # fills it into the SHARED browser
+```
+
+`login` **fills username + password into its own tab and stops there** — it does
+NOT submit, by design. Its entire output is one line,
+`filled username+password on <url> — tab left open, NOT submitted`, and it **never
+echoes the secret**. That no-echo is deliberate; do not "improve" it into logging
+what it filled. To finish the login, read rule 2 in the shared-browser section
+above — select the tab by its FILLED password field, not by URL, then submit.
 ```
 
 Use it in a command directly — the value never lands in shell history or in `ps`:
