@@ -253,12 +253,8 @@ alias envy='cd ~/Github/nHQ/envy && omp'
 alias mirror='cd ~/Github/Work/mirror && omp --continue'
 # jump into Director (nhq-agentic-os) — STAYS on omp until her rules rewrite + jcode trial (use director-j to try jcode)
 alias director='cd ~/Github/nhq-agentic-os && omp --continue'
-# jump into HeyDaddy-Design on omp
-alias heydaddy-design='cd ~/Github/Work/heydaddy-design && omp --continue'
-# jump into Mirror-Design on omp
-alias mirror-design='cd ~/Github/Work/mirror-design && omp --continue'
 # jump into NHQ-Features on omp
-alias nhq-features='cd ~/Github/nhq-features && omp --continue'
+alias nhq-features='cd ~/Github/nHQ/nhq-features && omp --continue'
 
 # ── jcode trial aliases (omp→jcode migration 2026-07-19) — primary envy/heydaddy/mirror now ON jcode.
 # -j = jcode variants (director-j is the Director trial); -omp = omp fallbacks for the flipped three.
@@ -269,9 +265,7 @@ alias envy-j='cd ~/Github/nHQ/envy && jcode'
 alias director-j='cd ~/Github/nhq-agentic-os && jcode'
 alias heydaddy-j='cd ~/Github/Work/heydaddy && jcode'
 alias mirror-j='cd ~/Github/Work/mirror && jcode'
-alias heydaddy-design-j='cd ~/Github/Work/heydaddy-design && jcode'
-alias mirror-design-j='cd ~/Github/Work/mirror-design && jcode'
-alias nhq-features-j='cd ~/Github/nhq-features && jcode'
+alias nhq-features-j='cd ~/Github/nHQ/nhq-features && jcode'
 # typing /exit (slash-command muscle memory) expands to exit
 abbr -a -- /exit exit
 
@@ -373,12 +367,8 @@ function mirror-agy        --description 'Mirror — free Opus';         _agy ~/
 function mirror-agy-resume --description 'Mirror — free Opus, resume'; _agy ~/Github/Work/mirror --continue $argv; end
 function envy-agy        --description 'Envy — free Opus';         _agy ~/Github/nHQ/envy $argv; end
 function envy-agy-resume --description 'Envy — free Opus, resume'; _agy ~/Github/nHQ/envy --continue $argv; end
-function heydaddy-design-agy        --description 'HeyDaddy-Design — free Opus';         _agy ~/Github/Work/heydaddy-design $argv; end
-function heydaddy-design-agy-resume --description 'HeyDaddy-Design — free Opus, resume'; _agy ~/Github/Work/heydaddy-design --continue $argv; end
-function mirror-design-agy        --description 'Mirror-Design — free Opus';         _agy ~/Github/Work/mirror-design $argv; end
-function mirror-design-agy-resume --description 'Mirror-Design — free Opus, resume'; _agy ~/Github/Work/mirror-design --continue $argv; end
-function nhq-features-agy        --description 'NHQ-Features — free Opus';         _agy ~/Github/nhq-features $argv; end
-function nhq-features-agy-resume --description 'NHQ-Features — free Opus, resume'; _agy ~/Github/nhq-features --continue $argv; end
+function nhq-features-agy        --description 'NHQ-Features — free Opus';         _agy ~/Github/nHQ/nhq-features $argv; end
+function nhq-features-agy-resume --description 'NHQ-Features — free Opus, resume'; _agy ~/Github/nHQ/nhq-features --continue $argv; end
 
 # omp-private — ephemeral session: omp's transcript is NOT saved to disk (--no-session).
 # The real "nothing on disk" launcher; pair with the /private or /extra-private posture inside.
