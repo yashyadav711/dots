@@ -17,6 +17,7 @@ Local agent-fleet layer around the `claude` CLI. Rides Yash's Claude subscriptio
 | `nhq-reap [--dry-run]` | RAM-aware reaper: kill DEAD sessions and IDLE-too-long ones. |
 | `nhq-browser <start\|stop\|status\|url\|login\|backup\|unlock\|install>` | The **shared browser**: one Chromium holding one permanent logged-in profile, CDP on `127.0.0.1:9222`. Agents attach; they never launch their own. |
 | `nhq-secret <get\|add\|totp\|login\|list\|rm>` | The **shared vault**: one KeePassXC database, master password sealed to this machine's TPM. Any agent reads it with no prompt. |
+| `nhq-web-on` / `nhq-web-off` / `nhq-web` | The **NetrunnersHQ website** (dashboard, LAN inbox, agent dispatch) on `127.0.0.1:39000`. Unit lives in the netrunnersHQ repo; `nhq-web` prints status. |
 
 `nhq-lib.sh` is a sourced helper (not a command) — single source of truth for the
 state dir, marker/activity paths, and state detection. Scripts source it via
