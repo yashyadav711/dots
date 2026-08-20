@@ -82,24 +82,33 @@ def resolve_identity(explicit: str | None) -> str:
     return "unknown"
 
 
-def live_tmux_sessions() -> list[str]:
-    rc, out = _run(["tmux", "list-sessions", "-F", "#{session_name}"])
-    return out.splitlines() if rc == 0 and out else []
+def resolve_tmux_for(agent: str) -> str | None:
+    """Which live tmux session is this agent sitting in? None when nobody's home.
 
+    Delegates to `nhq-tell --where`, which owns this lookup for the whole fleet:
+    it canonicalises aliases through fleet-registry.json (so `nv`/`NV`/`nn` all
+    reach Envy), knows both naming schemes, and refuses to hand one agent's mail
+    to a session that another agent owns.
 
-def resolve_tmux_for(agent: str, db: sqlite3.Connection) -> str | None:
-    """Prefer the registered tmux session; fall back to a fleet-<agent>-* match."""
-    row = db.execute(
-        "SELECT tmux FROM agents WHERE lower(id)=lower(?)", (agent,)
-    ).fetchone()
-    sessions = live_tmux_sessions()
-    if row and row[0] and row[0] in sessions:
-        return row[0]
-    al = agent.lower()
-    for s in sessions:
-        if s.lower() == al or s.lower().startswith(f"fleet-{al}-") or s.lower() == f"fleet-{al}":
-            return s
-    return None
+    What this replaced, and why: a private lookup over the `agents.tmux` column.
+    That column is a SELF-REGISTRATION LOG, not a routing table — it records
+    whichever session an agent last ran a command from, so it goes stale the
+    moment a seat is restarted under a different name (`Envy` still pointed at a
+    long-dead `omp-envy` on 2026-08-20, which made every doorbell to her vanish).
+    Worse, `id` is a case-sensitive PRIMARY KEY read back with `lower(id)=?`, so
+    `Director` and `director` were two rows answering one query and `.fetchone()`
+    picked a pane at random. It also knew no aliases at all: mail to `NV` was
+    stored and then silently poked nobody. One rule, one implementation — a
+    second copy is how these two drifted apart in the first place.
+    """
+    tell = shutil.which("nhq-tell")
+    if not tell:
+        return None
+    rc, out = _run([tell, "--where", agent], timeout=8.0)
+    if rc != 0:
+        return None
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    return lines[0] if lines else None
 
 
 def connect() -> sqlite3.Connection:
@@ -160,8 +169,11 @@ def doorbell(db, to_id, from_id, kind):
         targets = [to_id]
     poked = []
     for t in targets:
-        sess = resolve_tmux_for(t, db)
-        if not sess:
+        sess = resolve_tmux_for(t)
+        # A broadcast walks the agents table, which holds several names for the
+        # same seat (`Envy` and `nHQ` both resolve to Envy's pane), so without
+        # this the same TUI gets the same doorbell two or three times.
+        if not sess or sess in poked:
             continue
         note = f"📬 nhq-msg from {from_id} ({kind}) — run: nhq-msg inbox"
         _run(["tmux", "send-keys", "-t", sess, "-l", "--", note])
@@ -330,9 +342,16 @@ def cmd_agents(a):
     if not rows:
         print("nhq-msg: no agents registered yet")
         return
+    # `live=` is where a doorbell to this name would land RIGHT NOW, asked of the
+    # same resolver that delivers. The stored `tmux` column only remembers the
+    # session an agent last ran a command from, so printing that as though it
+    # were routing truth is how a five-day-stale `omp-envy` kept reading as
+    # "Envy is reachable there" while every doorbell to her went nowhere.
     print("── registered agents ──")
     for i, t, r, ls in rows:
-        print(f"  {i:<14} tmux={t or '-':<32} last_seen={ls or '-'}")
+        live = resolve_tmux_for(i) or "offline"
+        note = "" if live == t else f"  (last registered from {t or '-'})"
+        print(f"  {i:<14} live={live:<24} last_seen={ls or '-'}{note}")
 
 
 def cmd_whoami(a):

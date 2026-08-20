@@ -41,66 +41,120 @@ fi
 # step with dots/bin/ompt — if that expression changes, this one must too.
 ompt_slug() { basename "$1" | tr -c 'A-Za-z0-9_-' '-' | sed 's/-\+$//'; }
 
-resolve_session() {
-  local tok="$1" key repo slug hit
+# Every string that can name an agent in a window or pane label: its registry
+# key, its aliases, and its repo's BASENAME. The basename earns its place on its
+# own — a pane sitting in Github/nhq-agentic-os is Director's, and
+# "nhq-agentic-os" is neither his key nor one of his aliases.
+AGENT_TOKENS=""
+load_agent_tokens() {
+  [[ -n "$AGENT_TOKENS" ]] && return 0
+  AGENT_TOKENS="$(jq -r '
+    .agents | to_entries[] | .key as $k
+    | ([$k] + (.value.aliases // []) + [ (.value.repo // "") | split("/") | last ])[]
+    | select(. != null and . != "")
+    | "\(ascii_downcase)\t\($k)"
+  ' "$(nhq_registry)" 2>/dev/null)"
+}
 
-  # An exact session name wins, always. Callers that already know the session
-  # must never be second-guessed by a registry lookup.
-  if tmux has-session -t "$tok" 2>/dev/null; then printf '%s' "$tok"; return 0; fi
+# Registry key for a single label token; "" when the token names nobody.
+token_agent() {
+  local t="${1,,}"
+  [[ -z "$t" ]] && { printf ''; return 0; }
+  load_agent_tokens
+  awk -F'\t' -v t="$t" '$1 == t { print $2; exit }' <<<"$AGENT_TOKENS"
+}
+
+# Which agent is sitting in this window/pane, judged by the LABEL Yash reads in
+# the status bar? "" when the labels name nobody.
+#
+# The label is the primary signal on purpose, and the SESSION NAME is deliberately
+# not consulted. A tmux session belongs to the operator, not to the fleet: the
+# envy seat is a window called `envy` inside a hand-made session called `nHQ`,
+# and `nHQ` is DIRECTOR's name — so anything reasoning from the session name
+# hands NV's mail to Director. omp sets the window name from the repo it opened
+# ("envy"), which is clean, and repeats it at the end of the pane title.
+pane_agent() {
+  local win="${1:-}" title="${2:-}" hit
+  hit="$(token_agent "$win")"
+  [[ -n "$hit" ]] && { printf '%s' "$hit"; return 0; }
+  # The title is "<spinner> π - <name>" and, while the agent is working,
+  # "<spinner> π - <task text> - <name>". The name is always the final " - "
+  # segment, so take exactly that instead of scanning every word — a task called
+  # "fix the build" must never resolve to Builder.
+  printf '%s' "$(token_agent "${title##*- }")"
+}
+
+# Where should keys for <token> be typed? Prints a tmux target — a PANE when the
+# labels identify one, otherwise a session name.
+resolve_target() {
+  local tok="$1" key target win title owner slug hit
 
   key="$(nhq_agent_canon "$tok")"
-  [[ -z "$key" ]] && return 1
 
-  repo="$(nhq_agent_repo "$key")"
-  if [[ -n "$repo" ]]; then
-    slug="$(ompt_slug "$repo")"
-    if tmux has-session -t "omp-$slug" 2>/dev/null; then printf 'omp-%s' "$slug"; return 0; fi
+  # A token that names NO agent can only be a literal tmux target, and a caller
+  # that spelled out a session (nhq-spawn's `fleet-…`, `omp-…`) must never be
+  # second-guessed by a registry lookup.
+  #
+  # An AGENT name, though, is never matched against session names — that is the
+  # whole correction. `nHQ` is Director's name AND the name of the hand-made
+  # session the envy seat happens to live in, so treating it as a session typed
+  # Director's mail into NV's pane. An agent resolves to a pane that identifies
+  # itself as that agent, or to nothing.
+  if [[ -z "$key" ]]; then
+    tmux has-session -t "$tok" 2>/dev/null && { printf '%s' "$tok"; return 0; }
+    return 1
   fi
 
-  # Fall back to a spawned task session for the same agent, newest first.
+  # THE PANE'S OWN LABEL DECIDES, and the answer is a PANE rather than a session:
+  # several agents run as separate windows inside one session here, so
+  # `send-keys -t <session>` would land on whichever pane happened to be active.
+  while IFS=$'\t' read -r target win title; do
+    owner="$(pane_agent "$win" "$title")"
+    [[ "$owner" == "$key" ]] && { printf '%s' "$target"; return 0; }
+  done < <(tmux list-panes -a -F \
+      '#{session_name}:#{window_index}.#{pane_index}'$'\t''#{window_name}'$'\t''#{pane_title}' \
+      2>/dev/null)
+
+  # A spawned task session carries the agent in its own name and may still be
+  # showing a bare shell, so there the NAME is the better answer.
   hit="$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
          | grep -m1 -E "^fleet-${key}(-|$)" || true)"
   [[ -n "$hit" ]] && { printf '%s' "$hit"; return 0; }
 
-  # Last resort: ask the sessions where they actually ARE. The slug is derived
-  # from the registry's repo path, so the moment those disagree the agent reads
-  # as offline while sitting right there — which is exactly what happened on
-  # 2026-08-13: the registry said Github/Work/builder, he works in
-  # Github/nHQ/nhq-builder, and `omp-nhq-builder` was live and unreachable.
-  # A pane's own cwd cannot drift from where the agent is, so it is the more
-  # reliable question; the slug stays first because it is exact and free.
-  if [[ -n "$repo" ]]; then
-    while read -r s p; do
-      [[ "$p" == "$repo" || "$p" == "$repo"/* ]] && { printf '%s' "$s"; return 0; }
-    done < <(tmux list-sessions -F '#{session_name} #{pane_current_path}' 2>/dev/null)
+  # Last: the session ompt would have built for this agent's own repo. Exact and
+  # free, and derived from the agent's registry entry rather than guessed.
+  slug="$(ompt_slug "$(nhq_agent_repo "$key")")"
+  if [[ -n "$slug" ]] && tmux has-session -t "omp-$slug" 2>/dev/null; then
+    printf 'omp-%s' "$slug"; return 0
   fi
   return 1
 }
 
-# Remote agents live on another machine's tmux server, so resolve_session here
+# Remote agents live on another machine's tmux server, so resolve_target here
 # could never find them. Dispatch the same command over ssh first. Placed before
 # resolution so we never print a misleading "nothing live for: rig".
 nhq_remote_dispatch "$TARGET" nhq-tell "$@" || true
 
-SESSION="$(resolve_session "$TARGET" || true)"
+DEST="$(resolve_target "$TARGET" || true)"
 
-if [[ -z "$SESSION" ]]; then
+if [[ -z "$DEST" ]]; then
   echo "nhq-tell: nothing live for: $TARGET" >&2
-  echo "  live sessions: $(tmux list-sessions -F '#{session_name}' 2>/dev/null | paste -sd', ' -)" >&2
+  echo "  live panes   : $(tmux list-panes -a -F '#{window_name}' 2>/dev/null | paste -sd', ' -)" >&2
   echo "  known agents : $(jq -r '.agents | keys | join(", ")' "$(nhq_registry)" 2>/dev/null)" >&2
   exit 1
 fi
 
 if [[ "$WHERE" == "1" ]]; then
-  echo "$SESSION"
+  echo "$DEST"
   exit 0
 fi
 
-tmux send-keys -t "$SESSION" -l -- "$MESSAGE"
+tmux send-keys -t "$DEST" -l -- "$MESSAGE"
 sleep 0.3
-tmux send-keys -t "$SESSION" Enter
+tmux send-keys -t "$DEST" Enter
 
-# Talking to a session counts as activity — keep the reaper off its back.
-nhq_touch_activity "$SESSION"
+# Talking to an agent counts as activity — keep the reaper off its back. The
+# marker is per SESSION, so strip the window.pane suffix off a pane target.
+nhq_touch_activity "${DEST%%:*}"
 
-echo "sent to $SESSION: $MESSAGE"
+echo "sent to $DEST: $MESSAGE"
