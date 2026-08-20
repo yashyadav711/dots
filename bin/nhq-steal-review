@@ -17,8 +17,10 @@
 #   nhq-steal-review                       full report (rot + REAL/PAPER)
 #   nhq-steal-review --pending             only the un-decided patterns
 #   nhq-steal-review --json                machine snapshot
-#   nhq-steal-review --decide <q> <adopted|rejected|deferred> "<rationale>"
+#   nhq-steal-review --decide <q> <adopted|rejected|deferred|pruned> "<rationale>"
 #                                          close the pattern matching <q> (substring)
+#                                          `pruned` retires a PAPER pattern — adopted but
+#                                          never invoked, so removed rather than revived.
 #
 # Env: NHQ_OS_REPO (default ~/Github/nhq-agentic-os), NHQ_STEAL_REGISTRY, NHQ_DECISIONS,
 #      NHQ_STEAL_ROT_DAYS (default 7).
@@ -150,13 +152,13 @@ render() {
     "$(jq -r '.summary.adopted' <<<"$s")" "$(jq -r '.summary.paper' <<<"$s")"
   local nr; nr="$(jq -r '.summary.rotting' <<<"$s")"
   local np; np="$(jq -r '.summary.paper' <<<"$s")"
-  [[ "$nr" -gt 0 ]] && echo "  → ROT: decide these via \`nhq-steal-review --decide <q> <adopted|rejected|deferred> \"why\"\`"
-  [[ "$np" -gt 0 ]] && echo "  → PAPER: adopted but no invocation evidence — revive (wire a trigger) or prune"
+  [[ "$nr" -gt 0 ]] && echo "  → ROT: decide these via \`nhq-steal-review --decide <q> <adopted|rejected|deferred|pruned> \"why\"\`"
+  [[ "$np" -gt 0 ]] && echo "  → PAPER: adopted but no invocation evidence — revive (wire a trigger) or prune (--decide <q> pruned \"why\")"
 }
 
 decide() { # $1=query $2=verdict $3=rationale
   local q="$1" verdict="$2" why="${3:-}"
-  case "$verdict" in adopted|rejected|deferred) ;; *) echo "verdict must be adopted|rejected|deferred" >&2; exit 2 ;; esac
+  case "$verdict" in adopted|rejected|deferred|pruned) ;; *) echo "verdict must be adopted|rejected|deferred|pruned" >&2; exit 2 ;; esac
   [[ -z "$why" ]] && { echo "a rationale is required" >&2; exit 2; }
   # find matching resolved pattern(s) by substring across source_id+skill+description
   local matches; matches="$(resolved | jq -c --arg q "$q" \
@@ -191,5 +193,5 @@ case "${1:-}" in
   --pending) render "$(snapshot)" pending ;;
   --decide)  shift; decide "${1:-}" "${2:-}" "${3:-}" ;;
   ""|--report) render "$(snapshot)" ;;
-  *) echo "usage: nhq-steal-review [--pending|--json|--decide <q> <adopted|rejected|deferred> \"why\"]" >&2; exit 2 ;;
+  *) echo "usage: nhq-steal-review [--pending|--json|--decide <q> <adopted|rejected|deferred|pruned> \"why\"]" >&2; exit 2 ;;
 esac
