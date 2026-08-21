@@ -41,7 +41,15 @@ state() {
     local pids; pids=$(pgrep -f -- "$b" 2>/dev/null | paste -sd' ' -)
     [ -n "$pids" ] && { printf '  %-15s pid %s\n' "$b" "$pids"; found=1; }
   done
-  [ "$found" = 0 ] && printf '  processes: none\n'
+  # `[ test ] && printf` as the last statement makes this function's exit status
+  # the TEST's — so it returned 1 exactly when processes WERE found, i.e. when
+  # voice was healthy. `nhq-voice-stop --on` therefore always exited 1 on
+  # success, which any caller checking $? reads as a failure. Found 2026-08-21
+  # when the website's Controls panel painted a working button red.
+  if [ "$found" = 0 ]; then
+    printf '  processes: none\n'
+  fi
+  return 0
 }
 
 case "${1:-stop}" in
