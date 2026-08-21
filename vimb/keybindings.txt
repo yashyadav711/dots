@@ -27,6 +27,8 @@
      *  /  #      search the selected word
 
    DO
+     f  /  F      link hints — this window / new window
+                  (hint keys are the home row: a s d f g h j k l)
      yy           copy the current URL
      kb           this list
      Ctrl+z       pass-through mode — every key goes to the page
@@ -37,10 +39,8 @@
      xx           close the window
      qq           quit
 
-   REMOVED  f F (link hints) · t T · gh · ^ · y p P d · marks m '
-            Ctrl+d Ctrl+u Ctrl+f Ctrl+b · %
-            No link hints means links need the mouse — say the word and
-            f comes back.
+   REMOVED  t T · gh · ^ · y p P d · marks m ' · Ctrl+d Ctrl+u Ctrl+f
+            Ctrl+b · %
 
    NOTE  vimb has no tabs — one window per page — so "close window" and
          "quit" are the same action. Page Up / Page Down cannot be bound:

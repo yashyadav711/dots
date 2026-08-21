@@ -51,10 +51,12 @@ set hint-keys=asdfghjkl
 set spatial-navigation=off
 
 # ── removed defaults ─────────────────────────────────────────────────────────
-# Yash's call, 2026-08-21. Note what this costs: with f and F gone there is no
-# keyboard way to click a link — that needs the mouse now. One line brings it back.
-nunmap f
-nunmap F
+# Yash's call, 2026-08-21.
+#
+# f and F are deliberately NOT in this list. They were unmapped for about ten
+# minutes and put straight back: with them gone there is no keyboard way to click
+# a link, which on a keyboard-driven browser is the one thing you cannot give up.
+# Hint keys are the home row (see hint-keys above).
 nunmap t
 nunmap T
 nunmap gh
