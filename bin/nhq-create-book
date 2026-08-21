@@ -2,10 +2,30 @@
 """nhq-create-book — assemble a vault book: chapters in, one bound document out."""
 import sys
 import os
+import re
 import json
 import subprocess
+from datetime import date
 from pathlib import Path
 from string import Template
+
+
+def book_filename(topic: str) -> str:
+    """Vault-convention filename: 'YYYY-MM-DD Book — <topic>'.
+
+    Was ``topic[:30].replace(" ", "_")``, which cut the topic mid-word and
+    produced unfindable stubs — two real ones sat in the vault for seven weeks:
+    ``How_to_guide_AI_agents_to_buil.md`` and ``best_claude_code_github_reposi.md``.
+    The vault's naming rule (``_System/Research & Vault Organization``) is that
+    the OUTCOME has to be in the filename, because that is the only thing a
+    reader has weeks later. Only filesystem-hostile characters are replaced; the
+    date makes the file sortable and the 90-char cap keeps it inside every
+    filesystem's per-component limit without amputating the meaning.
+    """
+    clean = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "-", topic)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    clean = clean[:90].rstrip(" .-") or "untitled"
+    return f"{date.today():%Y-%m-%d} Book — {clean}"
 
 def run_agy(prompt, model="Gemini 3.1 Pro (High)", stream=False):
     cmd = ["agy", "--model", model, "-p", prompt]
@@ -72,9 +92,8 @@ Write ONLY valid JSON in the exact following format, with no markdown code block
         print(f"\n❌ Failed to parse JSON structure from model:\n{structure_json_str}")
         sys.exit(1)
         
-    # Prepare book file
-    safe_title = topic[:30].replace(" ", "_").replace("/", "_").replace("\\", "_")
-    book_file = get_vault_books_dir() / f"{safe_title}.md"
+    # Prepare book file — name it so it is findable weeks later (see book_filename).
+    book_file = get_vault_books_dir() / f"{book_filename(topic)}.md"
     
     with open(book_file, "w") as f:
         f.write(f"# Book: {topic}\n\n")
