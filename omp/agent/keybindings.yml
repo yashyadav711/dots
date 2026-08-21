@@ -1,0 +1,26 @@
+# omp keybinding overrides — action IDs → chord(s). See `/hotkeys` for the live list.
+# Editor: open the draft in $VISUAL/$EDITOR (vim). Remapped from Ctrl+G → Ctrl+E.
+app.editor.external: Ctrl+E
+
+# Tool activity show/hide. Ctrl+Shift+O is the default but appears not to reach
+# omp through Orca's terminal — Ctrl+Shift+<letter> is frequently not transmitted
+# at all. Alt+O is added as a second chord because Alt chords go through as a
+# plain ESC-prefixed sequence and survive nearly every terminal. 2026-08-16.
+app.tools.toggleVisibility: [Ctrl+Shift+O, Alt+O]
+
+# Same reasoning for tool-output expand/collapse.
+app.tools.expand: [Ctrl+O, Alt+E]
+
+# Thinking-block show/hide. Default is Ctrl+T; Yash asked for Alt+T (2026-08-20).
+# Alt is the reliable modifier in this stack anyway — Alt chords arrive as a plain
+# ESC-prefixed sequence and survive kitty → tmux → omp, which is the same reason
+# the two bindings above needed Alt alternates.
+#
+# Ctrl+T is dropped rather than kept as a second chord: it is a live terminal
+# binding elsewhere (readline transpose-chars), so leaving it mapped would keep the
+# collision this change exists to remove.
+#
+# This is `app.thinking.toggle` ("Toggle thinking block visibility"), NOT
+# `app.thinking.cycle` (Shift+Tab, which changes the thinking LEVEL) — different
+# action, deliberately left alone.
+app.thinking.toggle: Alt+T

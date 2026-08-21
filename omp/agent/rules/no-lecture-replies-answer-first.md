@@ -24,6 +24,8 @@ If he explicitly asked for a report, audit, walkthrough, or `samjhao` — give i
 
 ## Still required
 
-The two-lane close (`👤 Tumhe kya karna hai` / `🤖 Maine kya kiya`) and the `**As Director:**` line stay on every reply — fragments, scannable. Brief never means dropping those.
+The two-lane close (`👤 Tumhe kya karna hai` / `🤖 Maine kya kiya`) and the `**As <you>:**` line stay on every reply — fragments, scannable. Brief never means dropping those.
+
+**Sign as YOURSELF, not as Director.** This rule file is shared by the whole fleet, so a literal `**As Director:**` here made every agent sign with Director's name. Use your own: `**As Envy:**`, `**As Builder:**`, `**As HeyDaddy:**` — `**As Director:**` only if you actually are Director. Your name comes from `nhq-agent-name`, which resolves it from the repo you are working in.
 
 Rewrite: answer, evidence, close. Nothing else.
