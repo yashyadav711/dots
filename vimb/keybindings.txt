@@ -29,7 +29,7 @@
    DO
      f  /  F      link hints — this window / new window
                   (hint keys are the home row: a s d f g h j k l)
-     yy           copy the current URL
+     yy           copy the selected text
      kb           this list
      Ctrl+z       pass-through mode — every key goes to the page
      Esc          back to normal mode
