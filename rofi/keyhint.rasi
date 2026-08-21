@@ -1,0 +1,129 @@
+/* keyhint.rasi — fullscreen keybinding hint for SUPER+/
+ *
+ * WHY A CUSTOM THEME: HyDE's own keybinds_hint.sh only exposes width, height and
+ * line count through the environment. Maximizing it with those got a full-screen
+ * window with everything crammed into the left third and two thirds empty —
+ * bigger, not better. Yash: "bht bekar dikhta h bilkul bhi sexy nhi". Correct.
+ * The data still comes from HyDE's own generator; only the presentation is ours.
+ *
+ * COLOURS ARE NOT HARDCODED. This imports the palette HyDE regenerates from the
+ * current wallpaper, so the hint re-themes itself when the wallpaper changes and
+ * never drifts out of step with the rest of the desktop.
+ */
+
+@import "/home/yash/.config/rofi/theme.rasi"
+
+* {
+    font: "JetBrainsMono Nerd Font 11";
+
+    /* Derived from the imported palette so nothing here is a fixed colour. */
+    bg:          @main-bg;
+    fg:          @main-fg;
+    accent:      @main-br;
+    sel-bg:      @select-bg;
+    sel-fg:      @select-fg;
+
+    background-color: transparent;
+    text-color:       @fg;
+    margin:  0;
+    padding: 0;
+    spacing: 0;
+}
+
+/* The blurred wallpaper HyDE already keeps on disk, as the backdrop. Full-screen
+ * with a translucent panel over it reads as part of the desktop rather than a
+ * dialog dropped on top of it. */
+window {
+    fullscreen:       true;
+    background-image: url("/home/yash/.cache/hyde/wall.blur", width);
+    padding:          3% 4%;
+    children:         [ frame ];
+}
+
+frame {
+    background-color: @bg;
+    border:           2px;
+    border-color:     @accent;
+    border-radius:    18px;
+    padding:          28px 34px;
+    orientation:      vertical;
+    children:         [ topbar, listview ];
+    spacing:          22px;
+}
+
+/* FIXED height. Without it `entry`'s expand grew the topbar to eat ~45% of a
+ * 1080p screen and the list was squeezed into the bottom half. */
+topbar {
+    orientation:  horizontal;
+    children:     [ prompt, entry, counter ];
+    spacing:      18px;
+    padding:      0 4px 16px 4px;
+    border:       0 0 1px 0;
+    border-color: @accent;
+    expand:       false;
+}
+
+prompt {
+    text-color:  @accent;
+    font:        "JetBrainsMono Nerd Font Bold 20";
+    vertical-align: 0.5;
+}
+
+/* The search box carries the weight here: it is the only interactive element, so
+ * it gets the large type rather than a thin line at the bottom of the screen. */
+entry {
+    placeholder:       "search a keybinding…";
+    placeholder-color: @fg;
+    font:              "JetBrainsMono Nerd Font 20";
+    vertical-align:    0.5;
+    expand:            true;
+    cursor:            text;
+}
+
+counter {
+    text-color:     @accent;
+    font:           "JetBrainsMono Nerd Font 12";
+    vertical-align: 0.5;
+    padding:        0 6px;
+}
+
+/* TWO columns, not three. Three fit more rows but truncated nearly every
+ * description to an ellipsis, which defeats a cheat sheet — the descriptions are
+ * the part you are reading. Two columns x 22 lines shows 44 bindings per screen
+ * at full text. */
+listview {
+    columns:      2;
+    lines:        22;
+    flow:         vertical;
+    fixed-height: true;
+    cycle:        true;
+    scrollbar:    false;
+    spacing:      6px;
+}
+
+element {
+    padding:       9px 14px;
+    border-radius: 10px;
+    spacing:       12px;
+    cursor:        pointer;
+}
+
+element normal.normal { text-color: @fg; }
+
+/* Section headers arrive from the generator as entries with no binding, so they
+ * cannot be styled separately — the selection highlight is what carries emphasis
+ * instead, and it is deliberately loud. */
+element selected.normal {
+    background-color: @sel-bg;
+    text-color:       @sel-fg;
+    border:           0 0 0 3px;
+    border-color:     @accent;
+}
+
+element-text {
+    vertical-align: 0.5;
+    text-color:     inherit;
+    /* `highlight` will not take a colour variable — rofi's parser rejects a
+     * Reference here ("unexpected Reference, expecting ';'"). Style only. */
+    highlight:      bold;
+}

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# nhq-keyhint — the SUPER+/ keybinding cheat sheet, full screen and readable.
+#
+# WHY THIS EXISTS RATHER THAN HyDE'S OWN: `hyde-shell keybinds_hint` only lets you
+# change width, height and line count through the environment. Maximizing it that
+# way produced a full-screen window with every binding crammed into the left third
+# and two thirds of the screen empty — bigger without being better. Yash's verdict
+# was blunt and right: "bht bekar dikhta h bilkul bhi sexy nhi".
+#
+# WHAT IS REUSED: the DATA. HyDE's own hint-hyprland.py already parses every bind
+# out of the live Hyprland config, so re-implementing that would be duplicating the
+# one part that is genuinely hard and version-sensitive. Only the presentation is
+# ours (dots/rofi/keyhint.rasi — three columns, blurred wallpaper, wallpaper-derived
+# colours).
+#
+# HyDE regenerates its own configs, so nothing here edits them; the SUPER+/ bind is
+# re-declared in dots/hypr/userprefs.conf, which is our layer.
+set -uo pipefail
+
+GEN="$HOME/HyDE/Configs/.local/lib/hyde/keybinds/hint-hyprland.py"
+THEME="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../rofi/keyhint.rasi"
+
+# Toggle: a second press closes it instead of stacking another instance. Same
+# behaviour as HyDE's bind, kept so muscle memory does not change.
+pkill -x rofi && exit 0
+
+[[ -x "$GEN" ]] || { notify-send "nhq-keyhint" "hint generator missing at $GEN" 2>/dev/null; exit 1; }
+[[ -f "$THEME" ]] || { notify-send "nhq-keyhint" "theme missing at $THEME" 2>/dev/null; exit 1; }
+
+# The generator emits '<display> ::: <dispatcher> ::: <arg> …' per line.
+# -display-columns 1 alone is NOT enough: without -display-column-separator rofi
+# does not know where a column ends, so the raw ':::' leaked into every visible
+# row. HyDE's own script passes both flags — I had copied only one.
+#
+# Selecting an entry does NOT run it — this is a cheat sheet, not a launcher. The
+# output is discarded on purpose, so Enter simply dismisses.
+"$GEN" --format rofi 2>/dev/null | rofi -dmenu \
+    -i \
+    -p "" \
+    -sep $'\n' \
+    -display-columns 1 \
+    -display-column-separator ":::" \
+    -no-custom \
+    -theme "$THEME" \
+    >/dev/null 2>&1 || true
