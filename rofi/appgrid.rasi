@@ -1,0 +1,133 @@
+/* appgrid.rasi — fullscreen GUI application picker for SUPER+SHIFT+D
+ *
+ * A GRID, not a list. SUPER+D already gives a fast spotlight-style list for when
+ * you know the name; this is the other mode — big icons you browse when you do
+ * not. Two different jobs, so both binds stay.
+ *
+ * COLOURS ARE NOT HARDCODED. This imports the palette HyDE regenerates from the
+ * current wallpaper, so the picker re-themes itself whenever the wallpaper changes
+ * instead of drifting out of step with the rest of the desktop.
+ *
+ * Layout lessons carried over from keyhint.rasi, each learned by rendering it:
+ *  - topbar needs expand:false, or `entry`'s expand grows the search bar until it
+ *    eats half the screen and the content is squeezed into what is left.
+ *  - `highlight` will not accept a colour variable; rofi's parser rejects a
+ *    Reference there. Style keywords only.
+ */
+
+@import "/home/yash/.config/rofi/theme.rasi"
+
+* {
+    font: "JetBrainsMono Nerd Font 11";
+
+    bg:     @main-bg;
+    fg:     @main-fg;
+    accent: @main-br;
+    sel-bg: @select-bg;
+    sel-fg: @select-fg;
+
+    background-color: transparent;
+    text-color:       @fg;
+    margin:  0;
+    padding: 0;
+    spacing: 0;
+}
+
+window {
+    fullscreen:       true;
+    background-image: url("/home/yash/.cache/hyde/wall.blur", width);
+    padding:          4% 5%;
+    children:         [ frame ];
+}
+
+frame {
+    background-color: @bg;
+    border:           2px;
+    border-color:     @accent;
+    border-radius:    20px;
+    padding:          30px 36px;
+    orientation:      vertical;
+    children:         [ topbar, listview ];
+    spacing:          26px;
+}
+
+topbar {
+    orientation:  horizontal;
+    children:     [ entry, counter ];
+    spacing:      20px;
+    padding:      0 6px 18px 6px;
+    border:       0 0 1px 0;
+    border-color: @accent;
+    expand:       false;
+}
+
+prompt {
+    text-color:     @accent;
+    font:           "JetBrainsMono Nerd Font Bold 22";
+    vertical-align: 0.5;
+}
+
+entry {
+    placeholder:       "type to filter…";
+    placeholder-color: @fg;
+    font:              "JetBrainsMono Nerd Font 22";
+    vertical-align:    0.5;
+    expand:            true;
+    cursor:            text;
+}
+
+counter {
+    text-color:     @accent;
+    font:           "JetBrainsMono Nerd Font 13";
+    vertical-align: 0.5;
+    padding:        0 8px;
+}
+
+/* 6 x 6 = 36 apps per screen out of ~150 desktop entries. 5 rows still left a visibly
+ * empty band across the bottom; 6 columns is the ceiling before labels like
+ * "CachyOS Package Installer" start truncating. */
+listview {
+    columns:       6;
+    lines:         6;
+    flow:          vertical;
+    fixed-columns: true;
+    fixed-height:  true;
+    cycle:         true;
+    scrollbar:     false;
+    spacing:       10px;
+}
+
+/* orientation: vertical is what turns each cell into an icon-above-label tile
+ * instead of a row. Without it this is just a list with pictures. */
+/* Tile geometry is what actually decides how many rows fit — `lines` only caps it.
+ * At icon 68 + padding 18 rofi fit 5 rows and left a visibly empty band across the
+ * bottom of a 1080p screen; trimming both fits 6 and the grid fills the frame. */
+element {
+    orientation:    vertical;
+    padding:        11px 8px;
+    border-radius:  14px;
+    spacing:        7px;
+    cursor:         pointer;
+}
+
+element-icon {
+    size:             56px;
+    horizontal-align: 0.5;
+    background-color: transparent;
+}
+
+element-text {
+    horizontal-align: 0.5;
+    vertical-align:   0.5;
+    text-color:       inherit;
+    highlight:        bold;
+}
+
+element normal.normal { text-color: @fg; }
+
+element selected.normal {
+    background-color: @sel-bg;
+    text-color:       @sel-fg;
+    border:           2px;
+    border-color:     @accent;
+}

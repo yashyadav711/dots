@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# nhq-appgrid — fullscreen GUI application picker (SUPER+SHIFT+D).
+#
+# WHY A SECOND LAUNCHER: SUPER+D is HyDE's spotlight-style list — fast when you
+# already know the name and are typing it. This is the other half: a grid of big
+# icons for when you are browsing rather than searching. Different job, so SUPER+D
+# is deliberately left untouched.
+#
+# WHY ROFI AND NOT A "NICER" LAUNCHER: rofi is already the house launcher, already
+# reads all ~150 .desktop entries, and needs no new package. That last part matters
+# right now — there are 467 pending upgrades on this box including glibc, and a new
+# install landed a broken epiphany earlier the same day because a leaf package
+# pulled a webkitgtk built against a newer libc. Not the week to add dependencies.
+#
+# Theme: dots/rofi/appgrid.rasi (6x4 icon grid, blurred wallpaper, colours imported
+# from HyDE's generated palette so it follows the wallpaper).
+set -uo pipefail
+
+THEME="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../rofi/appgrid.rasi"
+
+# Toggle, matching how SUPER+D and SUPER+/ behave — a second press dismisses
+# rather than stacking a second copy.
+pkill -x rofi && exit 0
+
+[[ -f "$THEME" ]] || { notify-send "nhq-appgrid" "theme missing at $THEME" 2>/dev/null; exit 1; }
+
+# -show-icons is the whole point; without it the grid is 24 empty tiles.
+# -terminal so entries marked Terminal=true open in kitty rather than failing
+# silently, which is how HyDE's own launcher is configured.
+# -p "" because rofi otherwise prints the mode name ("drun") as the prompt, which
+# reads like debug output sitting in the middle of the design.
+exec rofi -show drun \
+    -p "" \
+    -show-icons \
+    -drun-display-format "{name}" \
+    -terminal "kitty --hold" \
+    -theme "$THEME"
