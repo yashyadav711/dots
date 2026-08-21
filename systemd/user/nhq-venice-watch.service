@@ -1,7 +1,0 @@
-[Unit]
-Description=NHQ — warn before the shared Venice balance silences the bot
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=%h/.local/bin/nhq-venice-watch
