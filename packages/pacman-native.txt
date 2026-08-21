@@ -3,15 +3,16 @@ alacritty
 alsa-firmware
 alsa-plugins
 alsa-utils
+aria2
 ark
 arp-scan
 awesome-terminal-fonts
 awww
+axel
 ayugram-desktop
 base
 base-devel
 bash-completion
-bat
 bind
 blueman
 bluez
@@ -46,8 +47,8 @@ cava
 chafa
 chaotic-keyring
 chaotic-mirrorlist
+chromium
 chwd
-claude-desktop-bin
 cliphist
 code
 cpupower
@@ -71,8 +72,6 @@ efitools
 ethtool
 exfatprogs
 exo
-expac
-eza
 f2fs-tools
 fastfetch
 ffmpegthumbnailer
@@ -93,6 +92,7 @@ glow
 gnome-text-editor
 google-cloud-cli
 gpick
+gradle
 grim
 grub
 grub-btrfs-support
@@ -123,8 +123,10 @@ intel-media-sdk
 intel-ucode
 iptables
 iwd
+jdk17-openjdk
 jfsutils
 kde-cli-tools
+keepassxc
 kitty
 kvantum
 kvantum-qt5
@@ -145,6 +147,7 @@ linux-cachyos-headers
 linux-cachyos-lts
 linux-cachyos-lts-headers
 linux-firmware
+localsend
 logrotate
 lsb-release
 lsd
@@ -156,6 +159,7 @@ man-pages
 mdadm
 meld
 mesa-utils
+meson
 micro
 mkinitcpio
 modemmanager
@@ -170,6 +174,9 @@ networkmanager
 networkmanager-openvpn
 nfs-utils
 nilfs-utils
+ninja
+nmap
+noise-suppression-for-voice
 noto-fonts
 noto-fonts-cjk
 noto-fonts-emoji
@@ -214,7 +221,6 @@ qt5-wayland
 qt5ct
 qt6-wayland
 qt6ct
-rate-mirrors
 rebuild-detector
 reflector
 remmina
@@ -223,6 +229,7 @@ ristretto
 rofi
 rofi-calc
 rofimoji
+rpi-imager
 rsync
 s-nail
 satty
@@ -232,6 +239,7 @@ slurp
 smartmontools
 snapper
 sof-firmware
+sshpass
 starship
 sublime-text-4
 subversion
@@ -260,14 +268,16 @@ usb_modeswitch
 usbutils
 uwsm
 vim
+vimb
 vlc-plugins-all
 vulkan-intel
 walker
 waybar
 wev
+wezterm
 wget
 which
-whisper-cpp-vulkan
+whisper-cpp
 wireless-regdb
 wireplumber
 wl-clip-persist
@@ -305,6 +315,7 @@ xfdesktop
 xfsprogs
 xfwm4
 xl2tpd
+xorg-xhost
 xorg-xwayland
 yazi
 zathura
