@@ -78,16 +78,15 @@ nnoremap gd :open http://192.168.31.70:3900/<CR>
 # gi — the inbox page directly.
 nnoremap gi :open http://192.168.31.70:3900/inbox<CR>
 
-# R — hard reload, bypassing cache. Lowercase r is a normal reload; after a deploy
-# you almost always want the cache skipped, and typing :reload! is friction.
-nnoremap R :reload!<CR>
-
 # Ctrl+q quits. vimb's default quit is :q<CR>, and every other window on this
 # desktop closes with a modifier chord, so this stops the hand from guessing.
 nnoremap <C-q> :quit<CR>
 
-# F12 toggles the inspector on and opens it — one key instead of two commands.
-nnoremap <F12> :set webinspector=on<CR>:inspect<CR>
+# F12 ENABLES devtools. It cannot open them: `webinspector` is only a bool that
+# turns developer tools on, and vimb has no :inspect command — verified, after I
+# first wrote one that did not exist. Once this is on, right-click ▸ Inspect
+# Element works.
+nnoremap <F12> :set webinspector=on<CR>
 
 # y already yanks the URL; Y yanks it and says so, which is the one that matters
 # when pasting a dashboard link into a message to another agent.
