@@ -1,0 +1,97 @@
+# vimb — dedicated lightweight browser for the NetrunnersHQ dashboard.
+#
+# WHY VIMB AND NOT SOMETHING ELSE: measured 2026-08-21. "Lightweight browser" is
+# mostly a myth on this box — qutebrowser and falkon both depend on qt6-webengine,
+# which IS Chromium, so they buy nothing over the Chromium already installed.
+# Epiphany is genuinely lighter (WebKitGTK) but its current build needs GLIBC_2.44
+# against this system's 2.43, so it will not run until a full -Syu. vimb uses
+# webkit2gtk-4.1, which is ALREADY installed and matches the current glibc.
+#
+# HONEST NUMBERS, same page and same measurement method (PSS over the whole
+# process tree): vimb 230 MB / 3 procs vs chromium --app 242 MB / 9 procs. The RAM
+# win is ~5% and not the reason to use it — the reason is 3 processes instead of 9
+# and an interface with no tab bar, no URL bar and no chrome.
+#
+# Ex commands, run at startup. Config lives in the repo and is symlinked to
+# ~/.config/vimb/config, so edits track themselves.
+
+# ── what it opens ────────────────────────────────────────────────────────────
+# Super+N launches this straight at the dashboard (dots/hypr/userprefs.conf), so
+# home-page matters mainly for `gh` once you are already inside.
+set home-page=http://192.168.31.70:3900/
+
+# The dashboard is the LAN inbox too, so downloads belong where the inbox reads
+# from — not in a scratch dir that gets forgotten.
+set download-path=~/Github/nhq-local-downloads
+
+# ── reading and moving ───────────────────────────────────────────────────────
+# Home-row hint keys. The default is numeric, which means looking at the number,
+# then finding it on the row above; letters under the fingers are faster and this
+# is the single biggest usability change in the file.
+set hint-keys=asdfghjkl
+
+# 40 is roughly a third of a screen — enough that j/k covers a dashboard quickly
+# without losing your place. The default 40px crawls.
+set scroll-step=200
+
+set smooth-scrolling=on
+
+# Arrow keys move between focusable elements rather than scrolling. On a dashboard
+# of cards and buttons this is what you actually want.
+set spatial-navigation=on
+
+# ── how it looks ─────────────────────────────────────────────────────────────
+# The dashboard is a dark design already; dark-mode keeps any light-themed page
+# (docs, GitHub) from flashbanging a dark workspace.
+set dark-mode=on
+
+# Hide the input line until it is used, so the window is nothing but page.
+set input-autohide=on
+
+set default-zoom=100
+
+# ── behaviour ────────────────────────────────────────────────────────────────
+# The dashboard is a JS app; without this it is a blank box.
+set scripts=on
+
+# Session cookies keep the dashboard logged in between launches.
+set cookie-accept=always
+
+# Keep video/audio from autoplaying the moment a page loads.
+set media-playback-requires-user-gesture=on
+
+# Useful when the dashboard misbehaves and you want to see why (:set webinspector
+# then F12). Off by default so it never opens by accident.
+set webinspector=off
+
+set history-max-items=500
+
+# ── keybindings ──────────────────────────────────────────────────────────────
+# Deliberately few. vimb's defaults are already vim-like and good — f/F for hints,
+# o/O and t/T to open, d to close, gg/G, /? to search, H/L for history, r to
+# reload. Rebinding those would only make muscle memory wrong somewhere else.
+# What is added below is the handful of things a DASHBOARD browser needs.
+
+# gd — jump straight back to the dashboard from wherever you wandered.
+nnoremap gd :open http://192.168.31.70:3900/<CR>
+
+# gi — the inbox page directly.
+nnoremap gi :open http://192.168.31.70:3900/inbox<CR>
+
+# R — hard reload, bypassing cache. Lowercase r is a normal reload; after a deploy
+# you almost always want the cache skipped, and typing :reload! is friction.
+nnoremap R :reload!<CR>
+
+# Ctrl+q quits. vimb's default quit is :q<CR>, and every other window on this
+# desktop closes with a modifier chord, so this stops the hand from guessing.
+nnoremap <C-q> :quit<CR>
+
+# F12 toggles the inspector on and opens it — one key instead of two commands.
+nnoremap <F12> :set webinspector=on<CR>:inspect<CR>
+
+# y already yanks the URL; Y yanks it and says so, which is the one that matters
+# when pasting a dashboard link into a message to another agent.
+nnoremap Y :shellcmd echo -n $VIMB_URI | wl-copy<CR>
+
+# ZZ — quit without the colon, matching vim.
+nnoremap ZZ :quit<CR>
