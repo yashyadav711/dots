@@ -61,7 +61,6 @@ nunmap t
 nunmap T
 nunmap gh
 nunmap ^
-nunmap y
 nunmap p
 nunmap P
 nunmap d
@@ -110,8 +109,20 @@ nnoremap -- zO
 nnoremap 00 zzzZ
 
 # ── do ───────────────────────────────────────────────────────────────────────
-# yy copies the URL. `y` itself is unmapped above so this is the only yank.
-nnoremap yy :shellcmd echo -n $VIMB_URI | wl-copy<CR>
+# yy = copy the SELECTED TEXT. No URL yank — Yash dropped it.
+#
+# Goes through a helper (dots/bin/nhq-vimb-yank) purely for QUOTING safety: vimb
+# expands $VAR into the command string itself, so a selection containing a quote or
+# a $ would corrupt an inline one-liner. The helper reads the variable from the
+# environment instead, and toasts what it copied so a silent failure cannot look
+# like a working binding.
+#
+# Only ONE y-map exists, and that is a hard vimb constraint: a map that is a strict
+# PREFIX of another never fires. Measured — with both `y` and `yy` defined, a single
+# y did nothing even after 12 s, because vimb waits for the sequence to resolve with
+# no timeout fallback. (Different from rr/RR, where the single key is a built-in
+# default rather than a user map.)
+nnoremap yy :shellcmd! nhq-vimb-yank<CR>
 
 # kb = this keybinding list, as a floating popup. `:sh!` is the ASYNC form, so
 # vimb does not block while it is open. `less` quits on q with no extra binding,

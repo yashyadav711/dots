@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# nhq-vimb-yank — copy vimb's current selection to the Wayland clipboard.
+#
+# WHY A SCRIPT AND NOT AN INLINE MAP: quoting. vimb expands $VAR inside the
+# command string before running it, so an inline
+#
+#     :shellcmd echo -n $VIMB_SELECTION | wl-copy
+#
+# breaks the moment the selected text contains a quote, a $, or a newline — the
+# expanded text becomes part of the command line. Here the variable is only ever
+# read by this shell, out of the environment vimb sets for child processes, so the
+# content cannot influence parsing.
+#
+# CORRECTION, and it was mine: I first claimed `:shellcmd` gives you no shell and
+# that the inline pipe "never worked". Yash said the URL copy had been working, and
+# he was right — the pipe is fine. My two failed tests were a focus/timing race in
+# how I was sending the keypress, and I turned that into a confident wrong
+# diagnosis. Verified after: VIMB_SELECTION is populated
+# (env dump showed the selected string), and yy copies it end to end.
+#
+set -uo pipefail
+
+sel="${VIMB_SELECTION:-}"
+
+if [[ -z "$sel" ]]; then
+  # Silent no-op would be indistinguishable from a broken binding, which is how
+  # the original bug hid for as long as it did.
+  notify-send -t 2000 "vimb" "nothing selected" 2>/dev/null || true
+  exit 0
+fi
+
+printf '%s' "$sel" | wl-copy
+n=${#sel}
+notify-send -t 1500 "vimb" "copied ${n} chars" 2>/dev/null || true
