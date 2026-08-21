@@ -1,96 +1,124 @@
 # vimb — dedicated lightweight browser for the NetrunnersHQ dashboard.
 #
-# WHY VIMB AND NOT SOMETHING ELSE: measured 2026-08-21. "Lightweight browser" is
-# mostly a myth on this box — qutebrowser and falkon both depend on qt6-webengine,
-# which IS Chromium, so they buy nothing over the Chromium already installed.
-# Epiphany is genuinely lighter (WebKitGTK) but its current build needs GLIBC_2.44
-# against this system's 2.43, so it will not run until a full -Syu. vimb uses
-# webkit2gtk-4.1, which is ALREADY installed and matches the current glibc.
+# COMMENTS USE '#'. vimb does NOT accept '"' — it reports every such line as an
+# invalid command. Learned the hard way 2026-08-21.
 #
-# HONEST NUMBERS, same page and same measurement method (PSS over the whole
-# process tree): vimb 230 MB / 3 procs vs chromium --app 242 MB / 9 procs. The RAM
-# win is ~5% and not the reason to use it — the reason is 3 processes instead of 9
-# and an interface with no tab bar, no URL bar and no chrome.
+# WHY VIMB: measured, not assumed. "Lightweight browser" is mostly a label —
+# qutebrowser and falkon both depend on qt6-webengine, which IS Chromium, so they
+# buy nothing over the Chromium already installed. Epiphany is genuinely lighter
+# (WebKitGTK) but its current build needs GLIBC_2.44 against this system's 2.43,
+# so it cannot start until a full -Syu. vimb uses webkit2gtk-4.1, already
+# installed and glibc-compatible. Numbers, same page and same method (PSS across
+# the whole process tree): vimb 230 MB / 3 procs vs chromium --app 242 MB / 9.
+# The RAM win is ~5%; the real win is 3 processes and a chromeless window.
 #
-# Ex commands, run at startup. Config lives in the repo and is symlinked to
-# ~/.config/vimb/config, so edits track themselves.
+# KEY DESIGN: Yash asked for doubled letters (dd ii yy qq …). That works even
+# where the single letter is a vimb default — verified by test: with `r` still
+# bound to reload, a `nnoremap rr` still fired, so vimb waits for the sequence
+# rather than firing the single key immediately. So the doubled maps below do NOT
+# require unmapping their first letter.
 
 # ── what it opens ────────────────────────────────────────────────────────────
-# Super+N launches this straight at the dashboard (dots/hypr/userprefs.conf), so
-# home-page matters mainly for `gh` once you are already inside.
 set home-page=http://192.168.31.70:3900/
 
-# The dashboard is the LAN inbox too, so downloads belong where the inbox reads
-# from — not in a scratch dir that gets forgotten.
+# Downloads land where the LAN inbox reads from, not in a scratch dir.
 set download-path=~/Github/nhq-local-downloads
 
-# ── reading and moving ───────────────────────────────────────────────────────
-# Home-row hint keys. The default is numeric, which means looking at the number,
-# then finding it on the row above; letters under the fingers are faster and this
-# is the single biggest usability change in the file.
-set hint-keys=asdfghjkl
-
-# 40 is roughly a third of a screen — enough that j/k covers a dashboard quickly
-# without losing your place. The default 40px crawls.
-set scroll-step=200
-
-set smooth-scrolling=on
-
-# Arrow keys move between focusable elements rather than scrolling. On a dashboard
-# of cards and buttons this is what you actually want.
-set spatial-navigation=on
-
-# ── how it looks ─────────────────────────────────────────────────────────────
-# The dashboard is a dark design already; dark-mode keeps any light-themed page
-# (docs, GitHub) from flashbanging a dark workspace.
-set dark-mode=on
-
-# Hide the input line until it is used, so the window is nothing but page.
+# ── looks ────────────────────────────────────────────────────────────────────
+# Both bars off: the window is nothing but page. `status-bar` is the bottom-left
+# URL readout — note the name, `statusbar` is silently rejected.
+set status-bar=off
 set input-autohide=on
-
+set dark-mode=on
 set default-zoom=100
 
 # ── behaviour ────────────────────────────────────────────────────────────────
-# The dashboard is a JS app; without this it is a blank box.
+# The JS setting is `scripts`, NOT `javascript` — the latter is silently rejected
+# and on a JS dashboard that means a blank box.
 set scripts=on
-
-# Session cookies keep the dashboard logged in between launches.
 set cookie-accept=always
-
-# Keep video/audio from autoplaying the moment a page loads.
+set smooth-scrolling=on
 set media-playback-requires-user-gesture=on
-
-# Useful when the dashboard misbehaves and you want to see why (:set webinspector
-# then F12). Off by default so it never opens by accident.
 set webinspector=off
-
 set history-max-items=500
 
-# ── keybindings ──────────────────────────────────────────────────────────────
-# Deliberately few. vimb's defaults are already vim-like and good — f/F for hints,
-# o/O and t/T to open, d to close, gg/G, /? to search, H/L for history, r to
-# reload. Rebinding those would only make muscle memory wrong somewhere else.
-# What is added below is the handful of things a DASHBOARD browser needs.
+# Home-row hint keys. Kept even though the f/F hint keys are unmapped below, so
+# that turning hints back on needs one line, not two.
+set hint-keys=asdfghjkl
 
-# gd — jump straight back to the dashboard from wherever you wandered.
-nnoremap gd :open http://192.168.31.70:3900/<CR>
+# Spatial navigation is OFF: it makes the arrow keys move focus between elements,
+# which would fight the arrow-key scrolling Yash asked for.
+set spatial-navigation=off
 
-# gi — the inbox page directly.
-nnoremap gi :open http://192.168.31.70:3900/inbox<CR>
+# ── removed defaults ─────────────────────────────────────────────────────────
+# Yash's call, 2026-08-21. Note what this costs: with f and F gone there is no
+# keyboard way to click a link — that needs the mouse now. One line brings it back.
+nunmap f
+nunmap F
+nunmap t
+nunmap T
+nunmap gh
+nunmap ^
+nunmap y
+nunmap p
+nunmap P
+nunmap d
+nunmap m
+nunmap '
+nunmap <C-d>
+nunmap <C-u>
+nunmap <C-f>
+nunmap <C-b>
+nunmap %
 
-# Ctrl+q quits. vimb's default quit is :q<CR>, and every other window on this
-# desktop closes with a modifier chord, so this stops the hand from guessing.
-nnoremap <C-q> :quit<CR>
+# ── go ───────────────────────────────────────────────────────────────────────
+nnoremap dd :open http://192.168.31.70:3900/<CR>
+nnoremap ii :open http://192.168.31.70:3900/inbox<CR>
 
-# F12 ENABLES devtools. It cannot open them: `webinspector` is only a bool that
-# turns developer tools on, and vimb has no :inspect command — verified, after I
-# first wrote one that did not exist. Once this is on, right-click ▸ Inspect
-# Element works.
-nnoremap <F12> :set webinspector=on<CR>
+# nn = new window with a URL prompt. `:tabopen` is the command that opens one;
+# vimb has no tabs, so "tab" here means a new window.
+nnoremap nn :tabopen<Space>
 
-# y already yanks the URL; Y yanks it and says so, which is the one that matters
-# when pasting a dashboard link into a message to another agent.
-nnoremap Y :shellcmd echo -n $VIMB_URI | wl-copy<CR>
+# History. Mapped to the default H/L keys rather than commands, because vimb has
+# no :back/:forward commands — the whole command list was checked.
+nnoremap kk H
+nnoremap ll L
 
-# ZZ — quit without the colon, matching vim.
-nnoremap ZZ :quit<CR>
+# Reload. Same reason: there is NO :reload command in vimb at all, only these
+# keys. This is what my earlier `:reload!` map got wrong.
+nnoremap rr r
+nnoremap RR R
+
+# ── scroll ───────────────────────────────────────────────────────────────────
+# Arrows delegate to the default j/k/h/l, which stay bound so these have
+# something to delegate TO. Page Up / Page Down are NOT bindable — vimb accepts
+# only Left Up Right Down Tab Esc CR Space BS F1-F12 and Ctrl+A-Z.
+nnoremap <Down> j
+nnoremap <Up> k
+nnoremap <Left> h
+nnoremap <Right> l
+
+# ── zoom ─────────────────────────────────────────────────────────────────────
+nnoremap ++ zi
+nnoremap __ zo
+nnoremap == zI
+nnoremap -- zO
+
+# Reset both zooms in one press. A multi-key rhs is legal and was verified.
+nnoremap 00 zzzZ
+
+# ── do ───────────────────────────────────────────────────────────────────────
+# yy copies the URL. `y` itself is unmapped above so this is the only yank.
+nnoremap yy :shellcmd echo -n $VIMB_URI | wl-copy<CR>
+
+# kb = this keybinding list, as a floating popup. `:sh!` is the ASYNC form, so
+# vimb does not block while it is open. `less` quits on q with no extra binding,
+# which is exactly the behaviour Yash asked for. Floating/centred is handled by a
+# windowrule on class `vimb-keys` in dots/hypr/userprefs.conf.
+nnoremap kb :shellcmd! kitty --class vimb-keys -e less -R ~/Github/dots/vimb/keybindings.txt<CR>
+
+# ── close ────────────────────────────────────────────────────────────────────
+# Both do the same thing, deliberately: vimb has one window per page, so closing
+# the window IS quitting. Yash asked for both names.
+nnoremap xx :quit<CR>
+nnoremap qq :quit<CR>

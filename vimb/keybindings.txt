@@ -1,0 +1,48 @@
+
+   VIMB — NHQ DASHBOARD BROWSER                       press  q  to close
+
+   OPEN / GO
+     Super+N      open the dashboard (focuses it if already open)
+     dd           back to the dashboard
+     ii           the inbox page
+     nn           new window, type a URL
+     kk           back
+     ll           forward
+     rr           reload
+     RR           reload, ignoring cache
+
+   SCROLL
+     Up / Down    scroll up / down
+     Left/Right   scroll left / right
+     gg / G       top / bottom
+
+   ZOOM
+     ++  /  __    text zoom in / out
+     ==  /  --    full-page zoom in / out
+     00           reset zoom
+
+   FIND
+     /  or  ?     search forward / backward
+     n  /  N      next / previous match
+     *  /  #      search the selected word
+
+   DO
+     yy           copy the current URL
+     kb           this list
+     Ctrl+z       pass-through mode — every key goes to the page
+     Esc          back to normal mode
+     :            command mode
+
+   CLOSE
+     xx           close the window
+     qq           quit
+
+   REMOVED  f F (link hints) · t T · gh · ^ · y p P d · marks m '
+            Ctrl+d Ctrl+u Ctrl+f Ctrl+b · %
+            No link hints means links need the mouse — say the word and
+            f comes back.
+
+   NOTE  vimb has no tabs — one window per page — so "close window" and
+         "quit" are the same action. Page Up / Page Down cannot be bound:
+         vimb only accepts Left Up Right Down Tab Esc CR Space BS F1-F12
+         and Ctrl+A-Z as special keys.
